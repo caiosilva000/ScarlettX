@@ -60,6 +60,24 @@ if(WIN32)
     endif()
 endif()
 
+# Native macOS host tools. Windows guest DLLs require the Windows SDK and
+# cannot be substituted with ARM64 Mach-O shared libraries.
+if(APPLE)
+    target_compile_definitions(scarlettx_core PUBLIC SCARLETTX_PLATFORM_MACOS=1)
+    add_executable(scarlettx src/main.cpp)
+    target_link_libraries(scarlettx PRIVATE scarlettx_core)
+    foreach(name game_config kernel_hle rt_pipeline)
+        add_executable(test_${name} tests/test_${name}.cpp)
+        target_link_libraries(test_${name} PRIVATE scarlettx_core)
+        target_include_directories(test_${name} PRIVATE tests)
+        target_compile_definitions(test_${name} PRIVATE
+            SCARLETTX_BINARY_DIR="${CMAKE_BINARY_DIR}"
+            SCARLETTX_SOURCE_DIR="${CMAKE_CURRENT_SOURCE_DIR}")
+        add_test(NAME test_${name} COMMAND test_${name})
+    endforeach()
+    return()
+endif()
+
 # ---------------------------------------------------------------------------
 # Scarlett HLE System DLL Shims
 # ---------------------------------------------------------------------------
