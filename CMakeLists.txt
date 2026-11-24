@@ -340,6 +340,11 @@ set_tests_properties(test_d3d12_list_layout PROPERTIES ENVIRONMENT "SCARLETTX_RE
 scarlettx_add_test(test_d3d12_present_window tests/test_d3d12_present_window.cpp)
 target_link_libraries(test_d3d12_present_window PRIVATE d3d12_xs)
 set_tests_properties(test_d3d12_present_window PROPERTIES ENVIRONMENT "SCARLETTX_REAL_TITLE=1")
+# Presents two distinct frames, resizes the window once and presents again; prints one line per
+# stage so a screen capture can be matched against what was presented.
+scarlettx_add_test(test_d3d12_present_frames tests/test_d3d12_present_frames.cpp)
+target_link_libraries(test_d3d12_present_frames PRIVATE d3d12_xs)
+set_tests_properties(test_d3d12_present_frames PROPERTIES ENVIRONMENT "SCARLETTX_REAL_TITLE=1")
 scarlettx_add_test(test_d3d12_frame_pacing tests/test_d3d12_frame_pacing.cpp)
 target_link_libraries(test_d3d12_frame_pacing PRIVATE d3d12_xs)
 set_tests_properties(test_d3d12_frame_pacing PROPERTIES ENVIRONMENT "SCARLETTX_REAL_TITLE=1")
