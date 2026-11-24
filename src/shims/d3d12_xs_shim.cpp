@@ -4099,9 +4099,39 @@ int32_t SCARLETTX_GDK_CALLBACK D3D12XboxCreateDevice(
     }
 
     IDXGIAdapter1* adapter = nullptr;
+    bool use_hardware = !prefer_warp;
     if (prefer_warp) {
+        // A WARP request that cannot be met falls back to a hardware adapter, as
+        // D3D12Backend::Initialize does. Some hosts hand out a WARP adapter object that no device
+        // can be created on (CrossOver's D3DMetal: unnamed adapter, D3D12CreateDevice fails).
         hr = factory->EnumWarpAdapter(__uuidof(IDXGIAdapter1), reinterpret_cast<void**>(&adapter));
-    } else {
+        bool usable = SUCCEEDED(hr) && adapter != nullptr;
+        if (usable) {
+            ID3D12Device* probe = nullptr;
+            HRESULT probe_hr = CallSystemD3D12CreateDevice(adapter, D3D_FEATURE_LEVEL_12_0, __uuidof(ID3D12Device),
+                                                           reinterpret_cast<void**>(&probe));
+            if (FAILED(probe_hr)) {
+                probe_hr = CallSystemD3D12CreateDevice(adapter, D3D_FEATURE_LEVEL_11_0, __uuidof(ID3D12Device),
+                                                       reinterpret_cast<void**>(&probe));
+            }
+            usable = SUCCEEDED(probe_hr) && probe != nullptr;
+            if (probe) probe->Release();
+            if (!usable) {
+                std::fprintf(stderr,
+                             "[ScarlettX][d3d12] WARP adapter cannot create a device (hr=0x%08x); "
+                             "falling back to hardware\n",
+                             static_cast<unsigned>(probe_hr));
+                std::fflush(stderr);
+            }
+        }
+        if (!usable) {
+            if (adapter) adapter->Release();
+            adapter = nullptr;
+            hr = S_OK;
+            use_hardware = true;
+        }
+    }
+    if (use_hardware) {
         if (pAdapter) {
             adapter = static_cast<IDXGIAdapter1*>(pAdapter);
             adapter->AddRef();
