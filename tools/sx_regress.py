@@ -1,0 +1,769 @@
+#!/usr/bin/env python3
+"""ScarlettX boot-and-render regression runner.
+
+Runs a Windows x64 ScarlettX build tree and reports every check as PASS, FAIL, SKIP or BLOCKED.
+On macOS the build runs in a CrossOver bottle; on Windows it runs directly.
+
+  regress    every entry of a CTest inventory (``ctest --show-only=json-v1``), then the offscreen
+             clear and indexed-draw probes with their exact-pixel requirements, then windowed
+             presentation checked against captures of the test window.
+  boot-diag  one bounded, traced boot of a package the user supplies. The package is never
+             written to: the boot uses a copy-on-write clone where the file system allows it,
+             and the original is compared before and after. Diagnostics go to --out only.
+
+Examples (macOS, build unpacked inside the bottle's drive_c):
+
+  tools/sx_regress.py regress --build "$BOTTLE/drive_c/sxreg/build" \\
+      --inventory ctest-inventory.json --out out/regress
+  tools/sx_regress.py boot-diag --build "$BOTTLE/drive_c/sxreg/build" \\
+      --package "$BOTTLE/drive_c/sxreg/build/packages/hello_scarlett" --out out/boot-hello
+
+Python 3.9+, standard library only. Pillow is needed for the on-screen presentation check and for
+PNG copies of dumped frames; without it those parts report BLOCKED or are left out.
+"""
+from __future__ import annotations
+
+import argparse
+import hashlib
+import json
+import os
+import platform
+import re
+import shutil
+import subprocess
+import sys
+import time
+from pathlib import Path
+
+PASS, FAIL, SKIP, BLOCKED = "PASS", "FAIL", "SKIP", "BLOCKED"
+IS_WINDOWS = os.name == "nt"
+CROSSOVER_WINE = "/Applications/CrossOver.app/Contents/SharedSupport/CrossOver/bin/wine"
+WINDOW_TITLE = "ScarlettX - Xbox"
+
+# Tests that create a D3D12 device; everything else in an inventory counts as CPU/loader.
+GPU_TESTS = {
+    "test_d3d12_warp", "test_rt_pipeline", "test_shader_pipeline", "test_d3d12_xs_abi", "test_d3d12_guest_texture",
+    "test_d3d12_list_layout", "test_d3d12_frame_pacing", "test_d3d12_present_window", "test_d3d12_present_frames",
+    "test_d3d12_offscreen_probe", "test_d3d12_offscreen_clear", "test_d3d12_offscreen_indexed",
+}
+PRESENT_TEST = "test_d3d12_present_frames"
+# Frame colours of tests/test_d3d12_present_frames.cpp, left and right half.
+PRESENT_COLOURS = {"red": (230, 30, 30), "green": (30, 200, 30), "blue": (30, 60, 230), "yellow": (240, 220, 30)}
+PRESENT_FRAMES = {"A": ("red", "green"), "B": ("blue", "yellow")}
+
+ADAPTER_RE = re.compile(r"\[ScarlettX\]\[d3d12\] Adapter: (.*?) \((hardware|WARP/software)\)")
+CRASH_RE = re.compile(r"Unhandled page fault|Unhandled exception|Assertion failed|unimplemented function|"
+                      r"failed assertion|check failed|FAILED:")
+
+
+# --------------------------------------------------------------------------------------------
+# Host: how to run a Windows executable and how host paths look from inside it
+# --------------------------------------------------------------------------------------------
+class Host:
+    def __init__(self, bottle: str, wine: str):
+        self.bottle = bottle
+        self.wine = wine
+        self.bottle_dir = Path.home() / "Library/Application Support/CrossOver/Bottles" / bottle
+        self.blocked = None
+        if IS_WINDOWS:
+            self.kind = "windows"
+        else:
+            self.kind = "crossover"
+            if not os.path.exists(wine):
+                self.blocked = f"CrossOver's wine not found at {wine}"
+            elif not self.bottle_dir.is_dir():
+                self.blocked = f"CrossOver bottle '{bottle}' not found"
+
+    def win_path(self, host_path) -> str:
+        """Path of a host file as the Windows side sees it."""
+        p = Path(host_path).resolve()
+        if IS_WINDOWS:
+            return str(p)
+        drive_c = (self.bottle_dir / "drive_c").resolve()
+        try:
+            return "C:\\" + str(p.relative_to(drive_c)).replace("/", "\\")
+        except ValueError:
+            return "Z:" + str(p).replace("/", "\\")  # CrossOver bottles map Z: to /
+
+    def command(self, exe_host_path, args):
+        if IS_WINDOWS:
+            return [str(exe_host_path)] + list(args)
+        return [self.wine, "--bottle", self.bottle, "--wait-children", self.win_path(exe_host_path)] + list(args)
+
+    def describe(self) -> dict:
+        info = {"kind": self.kind, "os": platform.platform(), "machine": platform.machine()}
+        if self.kind == "crossover":
+            info["bottle"] = self.bottle
+            try:
+                out = subprocess.run([self.wine, "--bottle", self.bottle, "--version"], capture_output=True,
+                                     text=True, timeout=60)
+                info["wine_version"] = (out.stdout or out.stderr).strip().splitlines()[-1]
+            except Exception as exc:  # noqa: BLE001 - recorded, not fatal
+                info["wine_version"] = f"unknown ({exc})"
+            plist = "/Applications/CrossOver.app/Contents/Info.plist"
+            try:
+                info["crossover_version"] = subprocess.run(
+                    ["defaults", "read", plist, "CFBundleShortVersionString"], capture_output=True, text=True,
+                    timeout=20).stdout.strip()
+            except Exception:  # noqa: BLE001
+                pass
+            reg = self.bottle_dir / "user.reg"
+            if reg.exists():
+                text = reg.read_text(errors="replace")
+                m = re.search(r"\[Software\\\\Wine\\\\DllOverrides\][^\[]*", text)
+                info["dll_overrides"] = dict(re.findall(r'"([^"]+)"="([^"]*)"', m.group(0))) if m else {}
+        return info
+
+    def cleanup_after_timeout(self, exe_name: str):
+        if IS_WINDOWS:
+            subprocess.run(["taskkill", "/F", "/IM", exe_name], capture_output=True, check=False)
+        else:
+            for pattern in ("winedbg", exe_name):
+                subprocess.run(["pkill", "-f", pattern], capture_output=True, check=False)
+
+
+def run_logged(host: Host, exe: Path, args, env_extra: dict, cwd: Path, out_dir: Path, name: str, timeout: int,
+               while_running=None) -> dict:
+    """Runs one executable with a timeout; stdout and stderr go to <name>.stdout / <name>.stderr."""
+    out_dir.mkdir(parents=True, exist_ok=True)
+    env = dict(os.environ)
+    env.setdefault("WINEDEBUG", "fixme-all")
+    env.update(env_extra)
+    cmd = host.command(exe, args)
+    so_path, se_path = out_dir / f"{name}.stdout", out_dir / f"{name}.stderr"
+    start = time.time()
+    with open(so_path, "wb") as so, open(se_path, "wb") as se:
+        proc = subprocess.Popen(cmd, cwd=str(cwd), env=env, stdout=so, stderr=se)
+        timed_out = False
+        while proc.poll() is None:
+            if time.time() - start > timeout:
+                timed_out = True
+                proc.kill()
+                proc.wait()
+                host.cleanup_after_timeout(exe.name)
+                break
+            if while_running:
+                while_running()
+            else:
+                time.sleep(0.05)
+    stdout = so_path.read_text(errors="replace")
+    stderr = se_path.read_text(errors="replace")
+    return {
+        "command": [exe.name] + list(args),
+        "environment": env_extra,
+        "exit_code": None if timed_out else proc.returncode,
+        "timed_out": timed_out,
+        "seconds": round(time.time() - start, 1),
+        "stdout_log": str(so_path),
+        "stderr_log": str(se_path),
+        "stdout": stdout,
+        "stderr": stderr,
+    }
+
+
+def adapters_in(text: str):
+    return [{"name": n, "kind": "software" if k.startswith("WARP") else "hardware"} for n, k in ADAPTER_RE.findall(text)]
+
+
+def first_match(regex, *texts):
+    for text in texts:
+        for line in text.splitlines():
+            if regex.search(line) and "fixme:" not in line:
+                return line.strip()[:400]
+    return None
+
+
+def strip_logs(result: dict) -> dict:
+    return {k: v for k, v in result.items() if k not in ("stdout", "stderr")}
+
+
+# --------------------------------------------------------------------------------------------
+# Window capture (macOS): the presentation check needs to see the window, not just Present's HRESULT
+# --------------------------------------------------------------------------------------------
+class WindowCapture:
+    def __init__(self, work_dir: Path):
+        self.blocked = None
+        self.helper = None
+        self.shots = []      # (t0_ms, t1_ms, path)
+        self.windows = []
+        if IS_WINDOWS or sys.platform != "darwin":
+            self.blocked = "window capture is implemented for macOS only"
+            return
+        src = Path(__file__).with_name("sx_winlist.swift")
+        helper = work_dir / "sx_winlist"
+        if not helper.exists():
+            if not shutil.which("swiftc"):
+                self.blocked = "swiftc not found (needed to build the window-list helper)"
+                return
+            built = subprocess.run(["swiftc", "-O", str(src), "-o", str(helper)], capture_output=True, text=True)
+            if built.returncode != 0:
+                self.blocked = "could not build the window-list helper: " + built.stderr.strip()[:200]
+                return
+        self.helper = helper
+        probe = work_dir / "capture-probe.png"
+        subprocess.run(["screencapture", "-x", "-t", "png", str(probe)], capture_output=True, check=False)
+        if not probe.exists():
+            self.blocked = "screencapture produced no image (grant Screen Recording to the app running this script)"
+        else:
+            probe.unlink()
+
+    def grab(self, into: Path):
+        """One capture of the ScarlettX output window, by window id. Returns quickly when it is not there."""
+        into.mkdir(parents=True, exist_ok=True)
+        t0 = int(time.time() * 1000)
+        listed = subprocess.run([str(self.helper), WINDOW_TITLE], capture_output=True, text=True).stdout.strip()
+        if not listed:
+            time.sleep(0.1)
+            return
+        wid, owner, _title, bounds, onscreen = listed.splitlines()[0].split("\t")
+        path = into / f"{t0}.png"
+        subprocess.run(["screencapture", "-x", "-o", "-l", wid, "-t", "png", str(path)], capture_output=True,
+                       check=False)
+        if path.exists():
+            self.shots.append((t0, int(time.time() * 1000), path))
+            self.windows.append({"t_ms": t0, "window_id": int(wid), "owner": owner, "bounds": bounds,
+                                 "onscreen": onscreen})
+        time.sleep(0.25)
+
+
+def colour_regions(path: Path, colours: dict, tolerance: int = 72):
+    """Pixel count and bounding box of each named colour. The tolerance allows for the display's
+    colour space: a capture is in Display P3, where sRGB (30,200,30) reads about (95,197,66)."""
+    from PIL import Image
+    im = Image.open(path).convert("RGB")
+    step = 2
+    small = im.resize((im.width // step, im.height // step), Image.NEAREST)
+    px = small.load()
+    found = {}
+    for name, (r, g, b) in colours.items():
+        x0, y0, x1, y1, n = small.width, small.height, -1, -1, 0
+        for y in range(small.height):
+            for x in range(small.width):
+                p = px[x, y]
+                if abs(p[0] - r) < tolerance and abs(p[1] - g) < tolerance and abs(p[2] - b) < tolerance:
+                    n += 1
+                    x0, y0, x1, y1 = min(x0, x), min(y0, y), max(x1, x), max(y1, y)
+        if n:
+            found[name] = {"pixels": n * step * step, "box": [x0 * step, y0 * step, (x1 + 1) * step, (y1 + 1) * step]}
+    return found, list(im.size)
+
+
+# --------------------------------------------------------------------------------------------
+# regress
+# --------------------------------------------------------------------------------------------
+def load_inventory(path: Path):
+    tests = json.loads(path.read_text(encoding="utf-8-sig"))["tests"]
+    build_root = os.path.dirname(tests[0]["command"][0].replace("\\", "/"))
+    entries = []
+    for t in tests:
+        env = {}
+        for prop in t.get("properties", []):
+            if prop["name"] == "ENVIRONMENT":
+                for kv in prop["value"]:
+                    k, v = kv.split("=", 1)
+                    env[k] = v
+        entries.append({"name": t["name"], "exe": os.path.basename(t["command"][0].replace("\\", "/")),
+                        "args": t["command"][1:], "env": env})
+    return entries, build_root
+
+
+def check_offscreen(stdout: str, mode: str) -> dict:
+    """The exact-pixel requirements of one offscreen probe mode, read from its output."""
+    fence = re.search(rf"\[offscreen:{mode}\] fence signaled=(\d+) completed=(\d+) wait_result=(\d+) index_count=(\d+)",
+                      stdout)
+    pixels = re.search(rf"\[offscreen:{mode}\] pixels exact (\d+)/(\d+)", stdout)
+    backend = re.search(r'\[offscreen\] backend=(\S+) adapter="([^"]*)" vendor=(\S+) device=(\S+) warp=(\S+)', stdout)
+    failed = re.search(rf"\[offscreen:{mode}\] FAILED api=(.*?) hr=(0x[0-9a-f]+)", stdout)
+    info = {
+        "fence_signaled": int(fence.group(1)) if fence else None,
+        "fence_completed": int(fence.group(2)) if fence else None,
+        "wait_result": int(fence.group(3)) if fence else None,
+        "index_count": int(fence.group(4)) if fence else None,
+        "pixels_exact": int(pixels.group(1)) if pixels else None,
+        "pixels_total": int(pixels.group(2)) if pixels else None,
+        "backend": backend.group(1) if backend else None,
+        "adapter": backend.group(2) if backend else None,
+        "vendor": backend.group(3) if backend else None,
+        "device": backend.group(4) if backend else None,
+        "warp": backend.group(5) if backend else None,
+    }
+    if failed:
+        info["first_failing_api"] = {"api": failed.group(1), "hresult": failed.group(2)}
+    info["requirements_met"] = bool(
+        fence and pixels and info["fence_completed"] >= info["fence_signaled"] >= 1 and info["wait_result"] == 0
+        and info["pixels_exact"] == info["pixels_total"] == 4096)
+    return info
+
+
+def cmd_regress(args) -> int:
+    out = Path(args.out).resolve()
+    out.mkdir(parents=True, exist_ok=True)
+    build = Path(args.build).resolve()
+    host = Host(args.bottle, args.wine)
+    summary = {"tool": "sx_regress regress", "started": time.strftime("%Y-%m-%dT%H:%M:%S%z"), "build": str(build),
+               "commit": args.commit, "host": None, "graphics": {}, "checks": []}
+    checks = summary["checks"]
+
+    def add(name, category, status, **details):
+        checks.append({"name": name, "category": category, "status": status, **details})
+        print(f"{status:8} {category:13} {name}" + (f"  ({details['note']})" if details.get("note") else ""), flush=True)
+
+    def finish() -> int:
+        counts = {s: sum(1 for c in checks if c["status"] == s) for s in (PASS, FAIL, SKIP, BLOCKED)}
+        summary["counts"] = counts
+        summary["finished"] = time.strftime("%Y-%m-%dT%H:%M:%S%z")
+        (out / "summary.json").write_text(json.dumps(summary, indent=1))
+        lines = ["| Check | Category | Status | Exit | Note |", "|---|---|---|---|---|"]
+        for c in checks:
+            lines.append(f"| `{c['name']}` | {c['category']} | {c['status']} | {c.get('exit_code', '')} | {c.get('note', '')} |")
+        (out / "summary.md").write_text("\n".join(lines) + "\n")
+        print(f"\n{counts}  ->  {out / 'summary.json'}")
+        return 0 if counts[FAIL] == 0 and counts[BLOCKED] == 0 else 1
+
+    if host.blocked:
+        add("host", "preflight", BLOCKED, note=host.blocked)
+        return finish()
+    summary["host"] = host.describe()
+    if not build.is_dir():
+        add("build", "preflight", BLOCKED, note=f"build folder not found: {build}")
+        return finish()
+
+    if args.sha256_list:
+        want = {}
+        for line in Path(args.sha256_list).read_text(encoding="utf-8-sig").splitlines():
+            if "  " in line:
+                digest, rel = line.strip().split("  ", 1)
+                rel = rel.replace("\\", "/")
+                want[rel.split("dist/", 1)[-1].lstrip("./")] = digest
+        bad = [rel for rel, digest in want.items()
+               if not (build / rel).exists() or hashlib.sha256((build / rel).read_bytes()).hexdigest() != digest]
+        add("build-checksums", "preflight", PASS if not bad else FAIL, files=len(want), mismatched=bad[:20],
+            note=f"{len(want) - len(bad)} of {len(want)} files match")
+
+    entries, inventory_root = load_inventory(Path(args.inventory))
+    fixture_env = {"SCARLETTX_TEST_BINARY_DIR": host.win_path(build)}
+    win_build = host.win_path(build)
+
+    def rewrite(arg: str) -> str:
+        norm = arg.replace("\\", "/")
+        if norm.startswith(inventory_root):
+            return win_build + norm[len(inventory_root):].replace("/", "\\")
+        return arg
+
+    # Adapter and backend, from the emulator's own diagnostic command.
+    diag_exe = build / "scarlettx.exe"
+    if diag_exe.exists():
+        r = run_logged(host, diag_exe, ["diag"], fixture_env, build, out / "logs", "scarlettx_diag", args.timeout)
+        m = re.search(r"\[diag\] Adapter: (.*) \(WARP=(\w+), Device5=(\w+), DXR Tier=(\d+)\)", r["stdout"])
+        summary["graphics"] = {"backend": "D3D12", "route": "D3DMetal (CrossOver)" if host.kind == "crossover" else "native",
+                               "adapter": m.group(1) if m else None, "warp": m.group(2) if m else None,
+                               "device5": m.group(3) if m else None, "dxr_tier": m.group(4) if m else None,
+                               "note": "scarlettx diag asks for WARP first and reports the adapter it ended on"}
+        add("scarlettx diag", "preflight", PASS if r["exit_code"] == 0 and m else FAIL, exit_code=r["exit_code"],
+            **{k: r[k] for k in ("stdout_log", "stderr_log")}, note=(m.group(1) if m else first_match(CRASH_RE, r["stderr"])))
+
+    for entry in entries:
+        name, exe = entry["name"], build / entry["exe"]
+        if args.only and name not in args.only:
+            continue
+        category = "gpu" if name in GPU_TESTS else ("boot" if name.startswith("test_boot_") else "cpu-loader")
+        if name == PRESENT_TEST:
+            category = "presentation"
+        if not exe.exists():
+            add(name, category, SKIP, note=f"{entry['exe']} is not in this build")
+            continue
+        env = dict(fixture_env, **entry["env"])
+        argv = [rewrite(a) for a in entry["args"]]
+        r = run_logged(host, exe, argv, env, build, out / "logs", name, args.timeout)
+        status = PASS if r["exit_code"] == 0 else FAIL
+        details = strip_logs(r)
+        details["adapters"] = adapters_in(r["stderr"])
+        note = None
+        if status == FAIL:
+            note = "timed out" if r["timed_out"] else first_match(CRASH_RE, r["stderr"], r["stdout"])
+            # A WARP request the host cannot meet: record the hardware-adapter result next to the failure.
+            if category in ("gpu", "presentation") and any(a["name"] == "" for a in details["adapters"]):
+                r2 = run_logged(host, exe, argv, dict(env, SCARLETTX_PREFER_WARP="0"), build, out / "logs",
+                                name + ".prefer-hardware", args.timeout)
+                details["with_SCARLETTX_PREFER_WARP_0"] = dict(strip_logs(r2), status=PASS if r2["exit_code"] == 0 else FAIL,
+                                                               adapters=adapters_in(r2["stderr"]),
+                                                               first_error=None if r2["exit_code"] == 0 else
+                                                               ("timed out" if r2["timed_out"] else
+                                                                first_match(CRASH_RE, r2["stderr"], r2["stdout"])))
+                details["finding"] = "warp-request-has-no-fallback"
+                note = (f"WARP adapter unusable; with SCARLETTX_PREFER_WARP=0: "
+                        f"{details['with_SCARLETTX_PREFER_WARP_0']['status']}")
+        if name == "test_inproc_loader":
+            m = re.search(r"\[test_inproc_loader\] PASSED \((.*?)\)", r["stdout"])
+            details["final_line"] = m.group(0) if m else None
+            if status == PASS and not m:
+                status, note = FAIL, "exit 0 but the PASSED line is missing"
+            elif m:
+                note = m.group(1)
+        if name in ("test_d3d12_offscreen_clear", "test_d3d12_offscreen_indexed"):
+            mode = name.rsplit("_", 1)[1]
+            probe = check_offscreen(r["stdout"], mode)
+            details["offscreen"] = probe
+            if status == PASS and not probe["requirements_met"]:
+                status, note = FAIL, "exit 0 but fence or exact-pixel requirement not met"
+            elif status == PASS:
+                note = (f"{probe['pixels_exact']}/{probe['pixels_total']} exact, fence {probe['fence_completed']}/"
+                        f"{probe['fence_signaled']}, adapter {probe['adapter']}")
+        add(name, category, status, note=note, **details)
+
+    # Presentation: the API results above, plus what the window showed.
+    present_exe = build / f"{PRESENT_TEST}.exe"
+    if not args.skip_present and (not args.only or PRESENT_TEST in args.only):
+        if not present_exe.exists():
+            add("presentation-on-screen", "presentation", SKIP, note=f"{PRESENT_TEST}.exe is not in this build")
+        else:
+            cap = WindowCapture(out)
+            try:
+                import PIL  # noqa: F401
+            except ImportError:
+                cap.blocked = cap.blocked or "Pillow is not installed (needed to read the captures)"
+            if cap.blocked:
+                add("presentation-on-screen", "presentation", BLOCKED, note=cap.blocked)
+            else:
+                pdir = out / "presentation"
+                env = dict(fixture_env, SCARLETTX_REAL_TITLE="1", SCARLETTX_PRESENT_HOLD_MS=str(args.hold_ms))
+                r = run_logged(host, present_exe, [], env, build, pdir, PRESENT_TEST, args.timeout + 60,
+                               while_running=lambda: cap.grab(pdir / "captures"))
+                if r["exit_code"] != 0 and any(a["name"] == "" for a in adapters_in(r["stderr"])):
+                    env["SCARLETTX_PREFER_WARP"] = "0"
+                    cap.shots.clear()
+                    r = run_logged(host, present_exe, [], env, build, pdir, PRESENT_TEST, args.timeout + 60,
+                                   while_running=lambda: cap.grab(pdir / "captures"))
+                report = analyse_presentation(r["stdout"], cap, pdir)
+                ok = r["exit_code"] == 0 and report["overall"] == PASS
+                add("presentation-on-screen", "presentation", PASS if ok else FAIL, exit_code=r["exit_code"],
+                    environment=env, adapters=adapters_in(r["stderr"]), stdout_log=r["stdout_log"],
+                    stderr_log=r["stderr_log"], capture_report=report,
+                    note=f"{sum(1 for s in report['stages'] if s['verdict'] == PASS)} of 4 stages seen in the window, "
+                         f"resize ratio {report.get('resize_ratio')}, {len(cap.shots)} captures")
+    return finish()
+
+
+def analyse_presentation(stdout: str, cap: WindowCapture, pdir: Path) -> dict:
+    stages = []
+    for m in re.finditer(r"stage=(\S+) frame=(\w) presentx_hr=(0x[0-9a-f]+) t_ms=(\d+) client=(\d+)x(\d+)", stdout):
+        end = re.search(rf"stage={re.escape(m.group(1))} end t_ms=(\d+)", stdout)
+        stages.append({"stage": m.group(1), "frame": m.group(2), "presentx_hr": m.group(3), "start_ms": int(m.group(4)),
+                       "end_ms": int(end.group(1)) if end else None, "client": [int(m.group(5)), int(m.group(6))]})
+    report = {"captures": len(cap.shots), "method": "screencapture -l <window id>: the window alone, as the window "
+              "server composites it", "window": cap.windows[:1] + cap.windows[-1:], "stages": stages}
+    from PIL import Image
+    for s in stages:
+        inside = [x for x in cap.shots if s["end_ms"] and x[0] >= s["start_ms"] + 300 and x[1] <= s["end_ms"]]
+        if not inside:
+            s["verdict"] = FAIL
+            s["reason"] = "no capture inside this stage"
+            continue
+        _t0, _t1, path = inside[len(inside) // 2]
+        keep = pdir / f"{s['stage']}.png"
+        Image.open(path).save(keep)
+        found, size = colour_regions(path, PRESENT_COLOURS)
+        left, right = PRESENT_FRAMES[s["frame"]]
+        s.update(capture=str(keep), capture_size=size, found=found)
+        ok = left in found and right in found
+        if ok:
+            lb, rb = found[left]["box"], found[right]["box"]
+            s["area_px"] = [rb[2] - lb[0], max(lb[3], rb[3]) - min(lb[1], rb[1])]
+            ok = (lb[0] < rb[0] and abs(lb[2] - rb[0]) <= 8 and abs(lb[1] - rb[1]) <= 8 and abs(lb[3] - rb[3]) <= 8
+                  and found[left]["pixels"] > 5000 and found[right]["pixels"] > 5000)
+            stale = {c: found[c]["pixels"] for c in PRESENT_COLOURS if c not in (left, right)
+                     and c in found and found[c]["pixels"] > 2000}
+            if stale:
+                s["stale_colours"] = stale
+                ok = False
+        s["verdict"] = PASS if ok else FAIL
+    by = {s["stage"]: s for s in stages}
+    if all(k in by and "area_px" in by[k] for k in ("2-frame-B", "3-frame-A-resized")):
+        a, b = by["2-frame-B"]["area_px"], by["3-frame-A-resized"]["area_px"]
+        report["resize_ratio"] = [round(b[0] / a[0], 3), round(b[1] / a[1], 3)]
+    closed = "window closed with the queue" in stdout
+    report["clean_close"] = closed
+    report["overall"] = PASS if len(stages) == 4 and all(s["verdict"] == PASS for s in stages) and closed and \
+        report.get("resize_ratio") == [0.5, 0.5] else FAIL
+    # Make a small animation of every capture and drop the raw ones.
+    if cap.shots:
+        frames = []
+        for _t0, _t1, path in cap.shots:
+            im = Image.open(path).convert("RGB")
+            canvas = Image.new("RGB", (640, 374), (20, 20, 20))
+            canvas.paste(im.resize((max(1, im.width // 4), max(1, im.height // 4))), (0, 0))
+            frames.append(canvas)
+        frames[0].save(pdir / "presentation.gif", save_all=True, append_images=frames[1:], duration=400, loop=0)
+        report["animation"] = str(pdir / "presentation.gif")
+        shutil.rmtree(pdir / "captures", ignore_errors=True)
+    (pdir / "capture-report.json").write_text(json.dumps(report, indent=1))
+    return report
+
+
+# --------------------------------------------------------------------------------------------
+# boot-diag
+# --------------------------------------------------------------------------------------------
+BOOT_STAGES = [
+    ("package_inspected", None),
+    ("package_drive_mapped", re.compile(r"\[ScarlettX\]\[vfs\] Mapped virtual G:")),
+    ("image_mapped", re.compile(r"\[ScarlettX\]\[loader\] Mapped ")),
+    ("guest_entered", re.compile(r"\[ScarlettX\]\[loader\] Entering native PE entry point|^\[(?!ScarlettX|boot|inspect)[\w ]+\] ", re.M)),
+    ("d3d12_device_created", re.compile(r"\[ScarlettX\]\[d3d12\] Adapter: .+ \((hardware|WARP/software)\)")),
+    ("swap_chain_created", re.compile(r"\[ScarlettX\]\[d3d12_xs\] SwapChain created")),
+    ("first_frame", re.compile(r"\bFrame \d+\b|\[ScarlettX\]\[d3d12_xs\] Dumped frame to")),
+    ("guest_exited_cleanly", re.compile(r"\[boot\] Guest exited cleanly\.")),
+]
+GRAPHICS_FAIL_RE = re.compile(
+    r"(?i)(d3d12|dxgi|present|swapchain|swap chain|metal|mtl|shader|pipeline|dxil|dxbc).*"
+    r"(failed|returned 0x(?!0+\b)[0-9a-f]+|hr=0x8[0-9a-f]{7}|unimplemented|not implemented|unsupported|assertion|invalid)"
+    r"|(failed assertion|check failed).*(d3d12|texture|MTL)")
+STATIC_STUB_RE = re.compile(r"^\s*\[stub #(\d+)\] (.+?) \(target=(.*?)\)", re.M)
+STUB_HIT_RE = re.compile(r"\[ScarlettX\]\[STUB\] (\S+) \(hit #1\)")
+WINE_UNIMPL_RE = re.compile(r"unimplemented function (\S+)")
+LOADER_ERR_RE = re.compile(r"(?i)\[(boot|inspect)\] Error: .*|could not load|cannot find|not found.*\.dll|error 126|"
+                           r"Library .* not found|import .* (unresolved|missing)")
+
+
+def manifest(root: Path) -> dict:
+    """Size and modification time of every file under a folder, to prove it was not written to."""
+    entries = {}
+    for dirpath, _dirs, files in os.walk(root):
+        for f in files:
+            p = Path(dirpath) / f
+            try:
+                st = p.stat()
+                entries[str(p.relative_to(root))] = [st.st_size, st.st_mtime_ns]
+            except OSError as exc:
+                entries[str(p.relative_to(root))] = ["unreadable", str(exc)]
+    return entries
+
+
+def cmd_boot_diag(args) -> int:
+    out = Path(args.out).resolve()
+    build = Path(args.build).resolve()
+    package = Path(args.package).resolve()
+    host = Host(args.bottle, args.wine)
+    diag = {"tool": "sx_regress boot-diag", "started": time.strftime("%Y-%m-%dT%H:%M:%S%z"), "build": str(build),
+            "commit": args.commit, "package": str(package), "status": None}
+
+    def finish(status, reason=None) -> int:
+        diag["status"], diag["reason"] = status, reason
+        diag["finished"] = time.strftime("%Y-%m-%dT%H:%M:%S%z")
+        out.mkdir(parents=True, exist_ok=True)
+        (out / "boot-diag.json").write_text(json.dumps(diag, indent=1))
+        print(json.dumps({k: diag.get(k) for k in ("status", "reason", "last_stage", "first_missing_import",
+                                                    "first_failing_graphics_call", "first_error", "frame_captures",
+                                                    "package_unchanged")}, indent=1))
+        print(f"-> {out / 'boot-diag.json'}")
+        return 0 if status == PASS else 1
+
+    if host.blocked:
+        return finish(BLOCKED, host.blocked)
+    if not (build / "scarlettx.exe").exists():
+        return finish(BLOCKED, f"scarlettx.exe not found in {build}")
+    if not package.is_dir():
+        return finish(BLOCKED, f"package folder not found: {package}")
+    try:
+        out.relative_to(package)
+        return finish(BLOCKED, "--out must not be inside the package")
+    except ValueError:
+        pass
+    # A package that did not come with the build is the user's own title: it needs an explicit go.
+    try:
+        package.relative_to(build / "packages")
+        synthetic = True
+    except ValueError:
+        synthetic = False
+    diag["package_kind"] = "synthetic (from the build tree)" if synthetic else "user-supplied"
+    if not synthetic and not args.confirm_user_package:
+        return finish(BLOCKED, "this package is not one of the build's synthetic packages; pass --confirm-user-package "
+                               "to boot a title you own")
+    out.mkdir(parents=True, exist_ok=True)
+    diag["host"] = host.describe()
+
+    before = manifest(package)
+    diag["package_files"] = len(before)
+    diag["package_bytes"] = sum(v[0] for v in before.values() if isinstance(v[0], int))
+
+    # Boot from a copy-on-write clone when possible, so nothing can write to the user's files.
+    boot_root, view = package, None
+    if args.clone != "never" and sys.platform == "darwin":
+        view = out / "package-view"
+        if view.exists():
+            shutil.rmtree(view)
+        same_volume = os.stat(package).st_dev == os.stat(out).st_dev
+        if same_volume:
+            cloned = subprocess.run(["cp", "-c", "-R", str(package), str(view)], capture_output=True, text=True)
+            if cloned.returncode == 0:
+                boot_root = view
+                diag["package_access"] = "APFS copy-on-write clone in --out (the original is never opened by the guest)"
+            else:
+                view = None
+                diag["package_access"] = "direct (clone failed: " + cloned.stderr.strip()[:120] + ")"
+        else:
+            view = None
+            diag["package_access"] = "direct (--out is on another volume, so no clone was made)"
+        if boot_root is package and args.clone == "require":
+            return finish(BLOCKED, "a clone was required (--clone require) but could not be made: " + diag["package_access"])
+    else:
+        diag["package_access"] = "direct"
+
+    logs = out / "logs"
+    env = {"SCARLETTX_SAVE_ROOT": host.win_path(out / "saves"),
+           "SCARLETTX_DUMP_FRAME": host.win_path(out / "frames" / "frame"),
+           "SCARLETTX_DUMP_FRAME_AT": args.dump_frames_at}
+    (out / "saves").mkdir(exist_ok=True)
+    (out / "frames").mkdir(exist_ok=True)
+    exe = build / "scarlettx.exe"
+    win_pkg = host.win_path(boot_root)
+
+    # Stage 1: static inspection (manifest, executable, imports).
+    r = run_logged(host, exe, ["inspect", win_pkg], env, build, logs, "inspect", args.timeout)
+    inspect = {"exit_code": r["exit_code"], "stdout_log": r["stdout_log"], "stderr_log": r["stderr_log"]}
+    for key, pattern in (("title", r"^Title: (.*)$"), ("identity", r"^Identity: (.*)$"),
+                         ("scarlett_native", r"^Scarlett Native: (.*)$"), ("executable", r"^Executable: (.*)$")):
+        m = re.search(pattern, r["stdout"], re.M)
+        inspect[key] = m.group(1).strip() if m else None
+    inspect["imports"] = [{"dll": m.group(1), "hle": bool(m.group(2)), "symbols": int(m.group(3))} for m in
+                          re.finditer(r"^\s+- (\S+)( \[HLE -> [^\]]*\])? \((\d+) symbols\)", r["stdout"], re.M)]
+    diag["inspect"] = inspect
+    reached = []
+    all_out, all_err = r["stdout"], r["stderr"]
+    if r["exit_code"] == 0:
+        reached.append("package_inspected")
+        # Stage 2: the bounded boot.
+        boot_args = ["boot", win_pkg, "--frames", str(args.frames)]
+        boot_args += ["--warp"] if args.warp else ["--gpu"]
+        if args.in_process:
+            boot_args.append("--in-process")
+        if not args.windowed:
+            boot_args.append("--headless")
+        if args.trace:
+            boot_args.append("--trace")
+        if args.stats:
+            boot_args.append("--stats")
+        if args.rt_dump:
+            boot_args += ["--rt-dump", host.win_path(out / "frames" / "rt_dump.ppm")]
+        if args.raster_dump:
+            boot_args += ["--raster-dump", host.win_path(out / "frames" / "raster_dump.ppm")]
+        boot_args += args.extra_arg
+        cap = None
+        if args.windowed:
+            cap = WindowCapture(out)
+            if cap.blocked:
+                diag["window_capture"] = "BLOCKED: " + cap.blocked
+                cap = None
+        b = run_logged(host, exe, boot_args, env, build, logs, "boot", args.timeout,
+                       while_running=(lambda: cap.grab(out / "window-captures")) if cap else None)
+        diag["boot"] = strip_logs(b)
+        all_out += b["stdout"]
+        all_err += b["stderr"]
+        combined = b["stdout"] + "\n" + b["stderr"]
+        for stage, regex in BOOT_STAGES[1:]:
+            if regex.search(combined):
+                reached.append(stage)
+        diag["adapters"] = adapters_in(b["stderr"])
+        diag["window_captures"] = [str(p) for _a, _b, p in cap.shots] if cap else []
+    diag["stages_reached"] = reached
+    order = [s for s, _ in BOOT_STAGES]
+    diag["last_stage"] = max(reached, key=order.index) if reached else "none"
+
+    # Missing imports: left as stubs when the image was mapped, then the first one the guest called.
+    static_stubs = [{"stub": int(m.group(1)), "import": m.group(2), "target": m.group(3)}
+                    for m in STATIC_STUB_RE.finditer(all_out)]
+    hit = STUB_HIT_RE.search(all_out)
+    unimpl = WINE_UNIMPL_RE.search(all_err)
+    diag["imports_left_as_stubs"] = static_stubs
+    diag["first_missing_import"] = None
+    if hit:
+        diag["first_missing_import"] = {"import": hit.group(1), "how": "first auto-stub the guest called"}
+    elif unimpl:
+        diag["first_missing_import"] = {"import": unimpl.group(1), "how": "host DLL has no implementation"}
+    elif static_stubs:
+        diag["first_missing_import"] = {"import": static_stubs[0]["import"], "how": "left as a stub at map time, not called"}
+    diag["first_failing_graphics_call"] = first_match(GRAPHICS_FAIL_RE, all_err, all_out)
+    diag["first_error"] = first_match(re.compile(CRASH_RE.pattern + "|" + LOADER_ERR_RE.pattern), all_err, all_out)
+
+    # Frames: what the shim dumped, what the emulator was asked to dump, and window captures.
+    frames = sorted(str(p) for p in (out / "frames").glob("*") if p.is_file())
+    try:
+        from PIL import Image
+        for f in list(frames):
+            if f.lower().endswith((".bmp", ".ppm")):
+                png = f.rsplit(".", 1)[0] + ".png"
+                Image.open(f).save(png)
+                frames.append(png)
+    except ImportError:
+        pass
+    diag["frame_captures"] = frames + diag.get("window_captures", [])
+
+    after = manifest(package)
+    changed = sorted(k for k in set(before) | set(after) if before.get(k) != after.get(k))
+    diag["package_unchanged"] = not changed
+    diag["package_changes"] = changed[:50]
+    if view and not args.keep_view:
+        view_after = manifest(view)
+        diag["writes_inside_the_clone"] = sorted(
+            k for k in set(before) | set(view_after)
+            if (before.get(k) or [None])[0] != (view_after.get(k) or [None])[0] or k not in before)[:50]
+        shutil.rmtree(view, ignore_errors=True)
+
+    if changed:
+        return finish(FAIL, "the package was modified during the run")
+    boot = diag.get("boot")
+    if not boot:
+        return finish(FAIL, "inspection failed: " + str(diag["first_error"]))
+    if boot["timed_out"]:
+        return finish(FAIL, f"boot did not end within {args.timeout} s (last stage: {diag['last_stage']})")
+    if boot["exit_code"] != 0:
+        return finish(FAIL, f"boot exited with {boot['exit_code']} (last stage: {diag['last_stage']})")
+    return finish(PASS, f"boot ended cleanly after --frames {args.frames}")
+
+
+def main() -> int:
+    ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+    sub = ap.add_subparsers(dest="cmd", required=True)
+
+    def common(p):
+        p.add_argument("--build", required=True, help="build tree with the EXEs, shim DLLs and packages/")
+        p.add_argument("--out", required=True, help="folder for logs, captures and the JSON summary")
+        p.add_argument("--bottle", default="scarlettx-m4", help="CrossOver bottle (macOS)")
+        p.add_argument("--wine", default=CROSSOVER_WINE, help="CrossOver's wine launcher (macOS)")
+        p.add_argument("--timeout", type=int, default=120, help="seconds per test or boot")
+        p.add_argument("--commit", default=None, help="source commit of the build, recorded in the summary")
+
+    r = sub.add_parser("regress", help="CTest inventory + offscreen probes + presentation")
+    common(r)
+    r.add_argument("--inventory", required=True, help="output of ctest --show-only=json-v1 for this build")
+    r.add_argument("--sha256-list", help="'<sha256>  <relative path>' lines to verify the build against")
+    r.add_argument("--only", type=lambda s: set(s.split(",")), help="comma-separated test names")
+    r.add_argument("--hold-ms", type=int, default=4000, help="how long each presentation stage is held")
+    r.add_argument("--skip-present", action="store_true", help="leave out the on-screen presentation check")
+    r.set_defaults(func=cmd_regress)
+
+    b = sub.add_parser("boot-diag", help="bounded, traced boot of one package")
+    common(b)
+    b.add_argument("--package", required=True, help="package folder (never written to)")
+    b.add_argument("--frames", type=int, default=3, help="frames after which the emulator stops the guest")
+    b.add_argument("--in-process", action="store_true", help="map the title into the emulator (real titles)")
+    b.add_argument("--windowed", action="store_true", help="show the output window and capture it")
+    b.add_argument("--warp", action="store_true", help="ask for the software rasterizer instead of --gpu")
+    b.add_argument("--trace", action="store_true", help="log shim calls (large)")
+    b.add_argument("--stats", action="store_true")
+    b.add_argument("--rt-dump", action="store_true", help="ask the emulator for a ray-traced frame dump in --out/frames")
+    b.add_argument("--raster-dump", action="store_true", help="ask the emulator for a raster frame dump in --out/frames")
+    b.add_argument("--extra-arg", action="append", default=[], help="extra scarlettx boot argument (repeatable)")
+    b.add_argument("--dump-frames-at", default="1,2,5,30,90", help="PresentX frame numbers the shim dumps")
+    b.add_argument("--clone", choices=["auto", "require", "never"], default="auto",
+                   help="boot from a copy-on-write clone of the package (macOS/APFS)")
+    b.add_argument("--keep-view", action="store_true", help="keep the clone in --out after the run")
+    b.add_argument("--confirm-user-package", action="store_true",
+                   help="required for any package that is not one of the build's synthetic packages")
+    b.set_defaults(func=cmd_boot_diag)
+
+    args = ap.parse_args()
+    return args.func(args)
+
+
+if __name__ == "__main__":
+    sys.exit(main())
