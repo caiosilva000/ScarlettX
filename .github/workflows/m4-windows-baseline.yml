@@ -1,0 +1,135 @@
+name: M4 feasibility - native Windows x64 baseline
+
+# Builds a pinned ScarlettX commit on a native Windows x64 runner and runs test_inproc_loader
+# with a timeout, keeping crash dumps. Runs only for the m4/present-frames branch or by hand.
+on:
+  push:
+    branches: [m4/present-frames]
+  workflow_dispatch:
+
+jobs:
+  windows:
+    runs-on: windows-latest
+    timeout-minutes: 40
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: baseline-msvc
+            ref: bd42cb224e32d93f30e45d3c01aa232e5c5b5520
+            cmake_args: ""
+          - name: baseline-clang-cl-lld
+            ref: bd42cb224e32d93f30e45d3c01aa232e5c5b5520
+            cmake_args: "-DCMAKE_C_COMPILER=clang-cl -DCMAKE_CXX_COMPILER=clang-cl -DCMAKE_LINKER_TYPE=LLD"
+          - name: present-frames-msvc
+            ref: ""
+            cmake_args: ""
+    name: ${{ matrix.name }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ matrix.ref }}
+
+      - uses: ilammy/msvc-dev-cmd@v1
+        with:
+          arch: x64
+
+      - name: Record environment
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Force out, out\dumps | Out-Null
+          $cv = Get-ItemProperty 'HKLM:\SOFTWARE\Microsoft\Windows NT\CurrentVersion'
+          $lines = @()
+          $lines += "commit=$(git rev-parse HEAD)"
+          $lines += "os=$($cv.ProductName) $($cv.DisplayVersion) build $($cv.CurrentBuild).$($cv.UBR)"
+          $lines += "arch=$env:PROCESSOR_ARCHITECTURE cpu=$((Get-CimInstance Win32_Processor).Name)"
+          $lines += "vs=$env:VSCMD_VER vctools=$env:VCToolsVersion winsdk=$env:WindowsSDKVersion"
+          $lines += "cl=$((cmd /c 'cl 2>&1' | Select-Object -First 1))"
+          $lines += "clang-cl=$((cmd /c 'clang-cl --version 2>&1' | Select-Object -First 1))"
+          $lines += "lld-link=$((cmd /c 'lld-link --version 2>&1' | Select-Object -First 1))"
+          $lines += "cmake=$((cmake --version | Select-Object -First 1)) ninja=$(ninja --version)"
+          foreach ($d in 'ucrtbase.dll','vcruntime140.dll','vcruntime140_1.dll','msvcp140.dll','ntdll.dll','d3d12.dll') {
+            $f = Join-Path $env:SystemRoot "System32\$d"
+            if (Test-Path $f) { $lines += "crt:$d=$((Get-Item $f).VersionInfo.FileVersion)" } else { $lines += "crt:$d=missing" }
+          }
+          $lines | Tee-Object out\environment.txt
+
+      - name: Configure
+        shell: cmd
+        run: cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=Release ${{ matrix.cmake_args }} > out\configure.log 2>&1 || (type out\configure.log & exit /b 1)
+
+      - name: Build
+        shell: cmd
+        run: cmake --build build --parallel > out\build.log 2>&1 || (type out\build.log & exit /b 1)
+
+      - name: Record compiler and inventory
+        shell: pwsh
+        run: |
+          Select-String -Path build\CMakeCache.txt -Pattern '^CMAKE_(C|CXX)_COMPILER:|^CMAKE_LINKER:|^CMAKE_BUILD_TYPE:|^CMAKE_LINKER_TYPE' | ForEach-Object { $_.Line } | Tee-Object -Append out\environment.txt
+          Get-Content build\CMakeFiles\*\CMakeCXXCompiler.cmake | Select-String 'CMAKE_CXX_COMPILER_ID |CMAKE_CXX_COMPILER_VERSION |CMAKE_CXX_SIMULATE' | ForEach-Object { $_.Line.Trim() } | Tee-Object -Append out\environment.txt
+          ctest --test-dir build --show-only=json-v1 > out\ctest-inventory.json
+
+      - name: Enable crash dumps
+        shell: pwsh
+        run: |
+          $dumps = (Resolve-Path out\dumps).Path
+          foreach ($exe in 'test_inproc_loader.exe','test_d3d12_present_frames.exe') {
+            $key = "HKLM:\SOFTWARE\Microsoft\Windows\Windows Error Reporting\LocalDumps\$exe"
+            New-Item -Path $key -Force | Out-Null
+            Set-ItemProperty -Path $key -Name DumpFolder -Value $dumps -Type ExpandString
+            Set-ItemProperty -Path $key -Name DumpType -Value 2 -Type DWord
+            Set-ItemProperty -Path $key -Name DumpCount -Value 5 -Type DWord
+          }
+
+      - name: Run test_inproc_loader (180 s timeout) and the present tests
+        shell: pwsh
+        run: |
+          function Run-Test([string]$name, [string]$exe, [int]$timeoutSec, [hashtable]$envs) {
+            if (-not (Test-Path "build\$exe")) { "$name`tSKIP`t-`tnot built at this commit" | Tee-Object -Append out\results.tsv; return }
+            foreach ($k in $envs.Keys) { Set-Item "env:$k" $envs[$k] }
+            $sw = [Diagnostics.Stopwatch]::StartNew()
+            $p = Start-Process -FilePath "build\$exe" -WorkingDirectory build -NoNewWindow -PassThru `
+                   -RedirectStandardOutput "out\$name.stdout" -RedirectStandardError "out\$name.stderr"
+            $h = $p.Handle
+            if ($p.WaitForExit($timeoutSec * 1000)) { $rc = $p.ExitCode; $status = if ($rc -eq 0) { 'PASS' } else { 'FAIL' } }
+            else { Stop-Process -Id $p.Id -Force; $rc = 'timeout'; $status = 'TIMEOUT' }
+            foreach ($k in $envs.Keys) { Remove-Item "env:$k" }
+            "$name`t$status`t$rc`t$([int]$sw.Elapsed.TotalSeconds)s" | Tee-Object -Append out\results.tsv
+            "---- $name stdout"; Get-Content "out\$name.stdout" -ErrorAction SilentlyContinue
+            "---- $name stderr"; Get-Content "out\$name.stderr" -ErrorAction SilentlyContinue
+          }
+          Run-Test 'test_inproc_loader' 'test_inproc_loader.exe' 180 @{}
+          Run-Test 'test_inproc_loader_run2' 'test_inproc_loader.exe' 180 @{}
+          Run-Test 'test_guest_loader' 'test_guest_loader.exe' 180 @{}
+          Run-Test 'test_pe_loader' 'test_pe_loader.exe' 180 @{}
+          Run-Test 'test_d3d12_offscreen_probe_warp' 'test_d3d12_offscreen_probe.exe' 180 @{}
+          Run-Test 'test_d3d12_present_window' 'test_d3d12_present_window.exe' 240 @{ SCARLETTX_REAL_TITLE = '1' }
+          Run-Test 'test_d3d12_present_frames' 'test_d3d12_present_frames.exe' 240 @{ SCARLETTX_REAL_TITLE = '1' }
+          exit 0
+
+      - name: Full CTest run (informational)
+        shell: cmd
+        continue-on-error: true
+        run: ctest --test-dir build --timeout 240 --output-on-failure > out\ctest-full.log 2>&1 & type out\ctest-full.log
+
+      - name: Collect binaries
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Force dist | Out-Null
+          Copy-Item build\*.exe, build\*.dll, build\*.lib, build\CTestTestfile.cmake, build\CMakeCache.txt dist\ -ErrorAction SilentlyContinue
+          foreach ($d in 'packages','dummy_import_libs','dummy_import_dlls') { if (Test-Path "build\$d") { Copy-Item "build\$d" dist\ -Recurse } }
+          Get-ChildItem dist -Recurse -File | Get-FileHash -Algorithm SHA256 | ForEach-Object { "$($_.Hash.ToLower())  $((Resolve-Path -Relative $_.Path))" } | Set-Content out\dist-sha256.txt
+
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: ${{ matrix.name }}-logs
+          path: out
+          if-no-files-found: warn
+
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: ${{ matrix.name }}-build
+          path: dist
+          if-no-files-found: warn
