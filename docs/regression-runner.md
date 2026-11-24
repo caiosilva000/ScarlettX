@@ -31,3 +31,17 @@ tools/sx_regress.py boot-diag --build <build> --package <package dir> --out <dir
 - The boot uses a copy-on-write clone of the package inside `--out` (APFS, same volume); the original is
   compared (size and modification time of every file) before and after. Saves go to `--out/saves`.
 - A package that is not one of the build's synthetic packages needs `--confirm-user-package`.
+
+## Building locally on a Mac (`tools/macos_cross_build.sh`)
+
+```sh
+tools/macos_cross_build.sh all        # download + verify LLVM-MinGW 20261117 (SHA-256 pinned), build, write the inventory
+tools/sx_regress.py regress --build build/macos-win64 \
+    --inventory build/macos-win64/ctest-inventory.json --out out/regress
+```
+
+This is the quick route for trying a change without a Windows machine. The MSVC build on a Windows
+runner remains the reference: the local build uses Clang with the MinGW runtime.
+
+`regress` preflight on CrossOver also checks that the bottle has `xaudio2_9 = native` (BLOCKED with the
+command to set it otherwise) and records the bottle's `CX_GRAPHICS_BACKEND` setting in `summary.json`.

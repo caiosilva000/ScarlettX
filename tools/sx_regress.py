@@ -107,6 +107,12 @@ class Host:
                     timeout=20).stdout.strip()
             except Exception:  # noqa: BLE001
                 pass
+            conf = self.bottle_dir / "cxbottle.conf"
+            setting = None
+            if conf.exists():
+                m = re.search(r'^"CX_GRAPHICS_BACKEND"\s*=\s*"([^"]*)"', conf.read_text(errors="replace"), re.M)
+                setting = m.group(1) if m else None
+            info["bottle_graphics_backend_setting"] = setting or "not set (CrossOver chooses)"
             reg = self.bottle_dir / "user.reg"
             if reg.exists():
                 text = reg.read_text(errors="replace")
@@ -340,6 +346,18 @@ def cmd_regress(args) -> int:
         add("build-checksums", "preflight", PASS if not bad else FAIL, files=len(want), mismatched=bad[:20],
             note=f"{len(want) - len(bad)} of {len(want)} files match")
 
+    # ScarlettX ships its own xaudio2_9.dll. Wine has a built-in one that wins unless the bottle says
+    # otherwise, and it lacks the shim's exports (the audio tests then stop in "unimplemented function").
+    if host.kind == "crossover" and (build / "xaudio2_9.dll").exists():
+        override = summary["host"].get("dll_overrides", {}).get("xaudio2_9", "")
+        if override.replace(" ", "").split(",")[0] == "native":
+            add("bottle-xaudio2_9-override", "preflight", PASS, note=f"xaudio2_9 = {override}")
+        else:
+            add("bottle-xaudio2_9-override", "preflight", BLOCKED,
+                note=f"xaudio2_9 override is '{override or 'not set'}'; the audio tests will fail. Fix: "
+                     f"\"{host.wine}\" --bottle {host.bottle} reg add 'HKCU\\Software\\Wine\\DllOverrides' "
+                     f"/v xaudio2_9 /t REG_SZ /d native /f")
+
     entries, inventory_root = load_inventory(Path(args.inventory))
     fixture_env = {"SCARLETTX_TEST_BINARY_DIR": host.win_path(build)}
     win_build = host.win_path(build)
@@ -355,7 +373,8 @@ def cmd_regress(args) -> int:
     if diag_exe.exists():
         r = run_logged(host, diag_exe, ["diag"], fixture_env, build, out / "logs", "scarlettx_diag", args.timeout)
         m = re.search(r"\[diag\] Adapter: (.*) \(WARP=(\w+), Device5=(\w+), DXR Tier=(\d+)\)", r["stdout"])
-        summary["graphics"] = {"backend": "D3D12", "route": "D3DMetal (CrossOver)" if host.kind == "crossover" else "native",
+        summary["graphics"] = {"backend": "D3D12", "route": ("CrossOver, bottle graphics backend setting: " + summary["host"].get("bottle_graphics_backend_setting", "?"))
+                               if host.kind == "crossover" else "native",
                                "adapter": m.group(1) if m else None, "warp": m.group(2) if m else None,
                                "device5": m.group(3) if m else None, "dxr_tier": m.group(4) if m else None,
                                "note": "scarlettx diag asks for WARP first and reports the adapter it ended on"}
