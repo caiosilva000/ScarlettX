@@ -27,6 +27,18 @@ struct FrameBufferRgba8 {
     Status WritePpm(const std::string& file_path) const;
 };
 
+// Offscreen probe: either a render-target clear alone, or the clear followed by an indexed draw.
+enum class OffscreenProbeMode { ClearOnly, IndexedQuad };
+
+struct OffscreenProbeReport {
+    std::string failed_api;     // First D3D12/D3DCompile call that failed, empty on success.
+    int32_t failed_hr = 0;      // Its HRESULT.
+    uint64_t fence_signaled = 0;
+    uint64_t fence_completed = 0;
+    uint32_t wait_result = 0;   // WaitForSingleObject result, 0 = WAIT_OBJECT_0 (or no wait needed).
+    uint32_t index_count = 0;   // Indices submitted with DrawIndexedInstanced (0 for ClearOnly).
+};
+
 class D3D12Backend {
 public:
     D3D12Backend();
@@ -45,6 +57,12 @@ public:
 
     // Compiles HLSL shaders via D3DCompile, renders an RGB triangle on D3D12, and reads back RGBA8.
     Status RenderTestTriangle(uint32_t width, uint32_t height, FrameBufferRgba8& out_frame);
+
+    // Clears an RGBA8 render target to clear_rgba (exact UNORM8 values), optionally draws an
+    // indexed quad with a constant colour, waits on a fence and reads every pixel back.
+    Status RenderOffscreenProbe(OffscreenProbeMode mode, uint32_t width, uint32_t height,
+                                const uint8_t clear_rgba[4], const uint8_t quad_rgba[4],
+                                FrameBufferRgba8& out_frame, OffscreenProbeReport& report);
 
 private:
     struct Impl;

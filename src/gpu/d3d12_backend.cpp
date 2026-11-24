@@ -539,6 +539,314 @@ Status D3D12Backend::RenderTestTriangle(uint32_t width, uint32_t height, FrameBu
     return Status::Ok();
 }
 
+namespace {
+
+// Constant-colour quad for the offscreen probe. The colour comes from four root constants so the
+// pixel shader writes exactly c/255, which UNORM8 stores back as c.
+constexpr const char* kProbeHlsl = R"(
+cbuffer ProbeColor : register(b0) { float4 probe_color; };
+
+float4 VSMain(float2 pos : POSITION) : SV_POSITION {
+    return float4(pos, 0.0f, 1.0f);
+}
+
+float4 PSMain() : SV_TARGET {
+    return probe_color;
+}
+)";
+
+}  // namespace
+
+Status D3D12Backend::RenderOffscreenProbe(OffscreenProbeMode mode, uint32_t width, uint32_t height,
+                                          const uint8_t clear_rgba[4], const uint8_t quad_rgba[4],
+                                          FrameBufferRgba8& out_frame,
+                                          OffscreenProbeReport& report) {
+    report = OffscreenProbeReport{};
+    if (!IsInitialized()) {
+        return Status::Error(StatusCode::DeviceError, "D3D12Backend is not initialized");
+    }
+    if (width == 0 || height == 0) {
+        return Status::Error(StatusCode::InvalidArgument, "Render dimensions must be > 0");
+    }
+    const bool indexed = mode == OffscreenProbeMode::IndexedQuad;
+
+    ID3DBlob* vs_blob = nullptr;
+    ID3DBlob* ps_blob = nullptr;
+    ID3DBlob* err_blob = nullptr;
+    ID3DBlob* sig_blob = nullptr;
+    ID3D12RootSignature* root_sig = nullptr;
+    ID3D12PipelineState* pso = nullptr;
+    ID3D12DescriptorHeap* rtv_heap = nullptr;
+    ID3D12Resource* render_target = nullptr;
+    ID3D12Resource* readback = nullptr;
+    ID3D12Resource* vertex_buffer = nullptr;
+    ID3D12Resource* index_buffer = nullptr;
+
+    auto cleanup = [&]() {
+        SafeRelease(index_buffer);
+        SafeRelease(vertex_buffer);
+        SafeRelease(readback);
+        SafeRelease(render_target);
+        SafeRelease(rtv_heap);
+        SafeRelease(pso);
+        SafeRelease(root_sig);
+        SafeRelease(sig_blob);
+        SafeRelease(err_blob);
+        SafeRelease(ps_blob);
+        SafeRelease(vs_blob);
+    };
+    // Records the first failing call and returns its status.
+    auto fail = [&](const char* api, HRESULT hr) -> Status {
+        report.failed_api = api;
+        report.failed_hr = static_cast<int32_t>(hr);
+        cleanup();
+        std::ostringstream msg;
+        msg << api << " failed, hr=0x" << std::hex << static_cast<uint32_t>(hr);
+        return Status::Error(StatusCode::DeviceError, msg.str());
+    };
+
+    HRESULT hr = S_OK;
+    if (indexed) {
+        hr = D3DCompile(kProbeHlsl, std::strlen(kProbeHlsl), "scarlettx_probe.hlsl", nullptr, nullptr,
+                        "VSMain", "vs_5_0", 0, 0, &vs_blob, &err_blob);
+        if (FAILED(hr)) return fail("D3DCompile(VSMain)", hr);
+        SafeRelease(err_blob);
+        hr = D3DCompile(kProbeHlsl, std::strlen(kProbeHlsl), "scarlettx_probe.hlsl", nullptr, nullptr,
+                        "PSMain", "ps_5_0", 0, 0, &ps_blob, &err_blob);
+        if (FAILED(hr)) return fail("D3DCompile(PSMain)", hr);
+
+        D3D12_ROOT_PARAMETER color_param{};
+        color_param.ParameterType = D3D12_ROOT_PARAMETER_TYPE_32BIT_CONSTANTS;
+        color_param.Constants.ShaderRegister = 0;
+        color_param.Constants.RegisterSpace = 0;
+        color_param.Constants.Num32BitValues = 4;
+        color_param.ShaderVisibility = D3D12_SHADER_VISIBILITY_PIXEL;
+
+        D3D12_ROOT_SIGNATURE_DESC rs_desc{};
+        rs_desc.NumParameters = 1;
+        rs_desc.pParameters = &color_param;
+        rs_desc.Flags = D3D12_ROOT_SIGNATURE_FLAG_ALLOW_INPUT_ASSEMBLER_INPUT_LAYOUT;
+        SafeRelease(err_blob);
+        hr = D3D12SerializeRootSignature(&rs_desc, D3D_ROOT_SIGNATURE_VERSION_1, &sig_blob, &err_blob);
+        if (FAILED(hr)) return fail("D3D12SerializeRootSignature", hr);
+        hr = impl_->device->CreateRootSignature(0, sig_blob->GetBufferPointer(), sig_blob->GetBufferSize(),
+                                                IID_PPV_ARGS(&root_sig));
+        if (FAILED(hr)) return fail("ID3D12Device::CreateRootSignature", hr);
+
+        const D3D12_INPUT_ELEMENT_DESC input_layout[] = {
+            {"POSITION", 0, DXGI_FORMAT_R32G32_FLOAT, 0, 0, D3D12_INPUT_CLASSIFICATION_PER_VERTEX_DATA, 0},
+        };
+        D3D12_GRAPHICS_PIPELINE_STATE_DESC pso_desc{};
+        pso_desc.pRootSignature = root_sig;
+        pso_desc.VS = {vs_blob->GetBufferPointer(), vs_blob->GetBufferSize()};
+        pso_desc.PS = {ps_blob->GetBufferPointer(), ps_blob->GetBufferSize()};
+        pso_desc.InputLayout = {input_layout, 1};
+        for (auto& rt : pso_desc.BlendState.RenderTarget) {
+            rt.BlendEnable = FALSE;
+            rt.LogicOpEnable = FALSE;
+            rt.SrcBlend = D3D12_BLEND_ONE;
+            rt.DestBlend = D3D12_BLEND_ZERO;
+            rt.BlendOp = D3D12_BLEND_OP_ADD;
+            rt.SrcBlendAlpha = D3D12_BLEND_ONE;
+            rt.DestBlendAlpha = D3D12_BLEND_ZERO;
+            rt.BlendOpAlpha = D3D12_BLEND_OP_ADD;
+            rt.LogicOp = D3D12_LOGIC_OP_NOOP;
+            rt.RenderTargetWriteMask = D3D12_COLOR_WRITE_ENABLE_ALL;
+        }
+        pso_desc.SampleMask = UINT_MAX;
+        pso_desc.RasterizerState.FillMode = D3D12_FILL_MODE_SOLID;
+        pso_desc.RasterizerState.CullMode = D3D12_CULL_MODE_NONE;
+        pso_desc.RasterizerState.DepthClipEnable = TRUE;
+        pso_desc.DepthStencilState.DepthEnable = FALSE;
+        pso_desc.DepthStencilState.StencilEnable = FALSE;
+        pso_desc.PrimitiveTopologyType = D3D12_PRIMITIVE_TOPOLOGY_TYPE_TRIANGLE;
+        pso_desc.NumRenderTargets = 1;
+        pso_desc.RTVFormats[0] = DXGI_FORMAT_R8G8B8A8_UNORM;
+        pso_desc.SampleDesc.Count = 1;
+        hr = impl_->device->CreateGraphicsPipelineState(&pso_desc, IID_PPV_ARGS(&pso));
+        if (FAILED(hr)) return fail("ID3D12Device::CreateGraphicsPipelineState", hr);
+    }
+
+    D3D12_DESCRIPTOR_HEAP_DESC rtv_heap_desc{};
+    rtv_heap_desc.NumDescriptors = 1;
+    rtv_heap_desc.Type = D3D12_DESCRIPTOR_HEAP_TYPE_RTV;
+    hr = impl_->device->CreateDescriptorHeap(&rtv_heap_desc, IID_PPV_ARGS(&rtv_heap));
+    if (FAILED(hr)) return fail("ID3D12Device::CreateDescriptorHeap(RTV)", hr);
+
+    D3D12_HEAP_PROPERTIES default_heap{};
+    default_heap.Type = D3D12_HEAP_TYPE_DEFAULT;
+    D3D12_RESOURCE_DESC rt_desc{};
+    rt_desc.Dimension = D3D12_RESOURCE_DIMENSION_TEXTURE2D;
+    rt_desc.Width = width;
+    rt_desc.Height = height;
+    rt_desc.DepthOrArraySize = 1;
+    rt_desc.MipLevels = 1;
+    rt_desc.Format = DXGI_FORMAT_R8G8B8A8_UNORM;
+    rt_desc.SampleDesc.Count = 1;
+    rt_desc.Layout = D3D12_TEXTURE_LAYOUT_UNKNOWN;
+    rt_desc.Flags = D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET;
+
+    float clear_color[4];
+    float quad_color[4];
+    for (int i = 0; i < 4; ++i) {
+        clear_color[i] = static_cast<float>(clear_rgba[i]) / 255.0f;
+        quad_color[i] = static_cast<float>(quad_rgba[i]) / 255.0f;
+    }
+    D3D12_CLEAR_VALUE clear_val{};
+    clear_val.Format = DXGI_FORMAT_R8G8B8A8_UNORM;
+    std::memcpy(clear_val.Color, clear_color, sizeof(clear_color));
+    hr = impl_->device->CreateCommittedResource(&default_heap, D3D12_HEAP_FLAG_NONE, &rt_desc,
+                                                D3D12_RESOURCE_STATE_RENDER_TARGET, &clear_val,
+                                                IID_PPV_ARGS(&render_target));
+    if (FAILED(hr)) return fail("ID3D12Device::CreateCommittedResource(RT)", hr);
+    D3D12_CPU_DESCRIPTOR_HANDLE rtv_handle = rtv_heap->GetCPUDescriptorHandleForHeapStart();
+    impl_->device->CreateRenderTargetView(render_target, nullptr, rtv_handle);
+
+    const UINT row_pitch = (width * 4 + D3D12_TEXTURE_DATA_PITCH_ALIGNMENT - 1) &
+                           ~(D3D12_TEXTURE_DATA_PITCH_ALIGNMENT - 1);
+    const UINT64 readback_size = static_cast<UINT64>(row_pitch) * height;
+
+    auto make_buffer = [&](D3D12_HEAP_TYPE type, UINT64 size, D3D12_RESOURCE_STATES state,
+                           ID3D12Resource** out) -> HRESULT {
+        D3D12_HEAP_PROPERTIES heap{};
+        heap.Type = type;
+        D3D12_RESOURCE_DESC desc{};
+        desc.Dimension = D3D12_RESOURCE_DIMENSION_BUFFER;
+        desc.Width = size;
+        desc.Height = 1;
+        desc.DepthOrArraySize = 1;
+        desc.MipLevels = 1;
+        desc.Format = DXGI_FORMAT_UNKNOWN;
+        desc.SampleDesc.Count = 1;
+        desc.Layout = D3D12_TEXTURE_LAYOUT_ROW_MAJOR;
+        return impl_->device->CreateCommittedResource(&heap, D3D12_HEAP_FLAG_NONE, &desc, state, nullptr,
+                                                      IID_PPV_ARGS(out));
+    };
+    hr = make_buffer(D3D12_HEAP_TYPE_READBACK, readback_size, D3D12_RESOURCE_STATE_COPY_DEST, &readback);
+    if (FAILED(hr)) return fail("ID3D12Device::CreateCommittedResource(Readback)", hr);
+
+    // Vertex 0 is a decoy that no index references: a draw that ignores the index buffer, or
+    // reads it from the wrong offset, covers different pixels. The quad covers pixel centres
+    // [w/4, 3w/4) x [h/4, 3h/4) exactly.
+    const float vertices[5][2] = {
+        {0.95f, 0.95f},
+        {-0.5f, 0.5f},
+        {0.5f, 0.5f},
+        {-0.5f, -0.5f},
+        {0.5f, -0.5f},
+    };
+    const uint16_t indices[6] = {1, 2, 3, 3, 2, 4};
+    D3D12_VERTEX_BUFFER_VIEW vbv{};
+    D3D12_INDEX_BUFFER_VIEW ibv{};
+    if (indexed) {
+        hr = make_buffer(D3D12_HEAP_TYPE_UPLOAD, sizeof(vertices), D3D12_RESOURCE_STATE_GENERIC_READ,
+                         &vertex_buffer);
+        if (FAILED(hr)) return fail("ID3D12Device::CreateCommittedResource(VertexBuffer)", hr);
+        hr = make_buffer(D3D12_HEAP_TYPE_UPLOAD, sizeof(indices), D3D12_RESOURCE_STATE_GENERIC_READ,
+                         &index_buffer);
+        if (FAILED(hr)) return fail("ID3D12Device::CreateCommittedResource(IndexBuffer)", hr);
+
+        void* dst = nullptr;
+        D3D12_RANGE no_read{0, 0};
+        hr = vertex_buffer->Map(0, &no_read, &dst);
+        if (FAILED(hr) || !dst) return fail("ID3D12Resource::Map(VertexBuffer)", FAILED(hr) ? hr : E_POINTER);
+        std::memcpy(dst, vertices, sizeof(vertices));
+        vertex_buffer->Unmap(0, nullptr);
+        dst = nullptr;
+        hr = index_buffer->Map(0, &no_read, &dst);
+        if (FAILED(hr) || !dst) return fail("ID3D12Resource::Map(IndexBuffer)", FAILED(hr) ? hr : E_POINTER);
+        std::memcpy(dst, indices, sizeof(indices));
+        index_buffer->Unmap(0, nullptr);
+
+        vbv.BufferLocation = vertex_buffer->GetGPUVirtualAddress();
+        vbv.SizeInBytes = sizeof(vertices);
+        vbv.StrideInBytes = sizeof(vertices[0]);
+        ibv.BufferLocation = index_buffer->GetGPUVirtualAddress();
+        ibv.SizeInBytes = sizeof(indices);
+        ibv.Format = DXGI_FORMAT_R16_UINT;
+    }
+
+    hr = impl_->allocator->Reset();
+    if (FAILED(hr)) return fail("ID3D12CommandAllocator::Reset", hr);
+    hr = impl_->cmd_list->Reset(impl_->allocator, pso);
+    if (FAILED(hr)) return fail("ID3D12GraphicsCommandList::Reset", hr);
+
+    impl_->cmd_list->OMSetRenderTargets(1, &rtv_handle, FALSE, nullptr);
+    impl_->cmd_list->ClearRenderTargetView(rtv_handle, clear_color, 0, nullptr);
+    if (indexed) {
+        D3D12_VIEWPORT vp{0.0f, 0.0f, static_cast<float>(width), static_cast<float>(height), 0.0f, 1.0f};
+        D3D12_RECT scissor{0, 0, static_cast<LONG>(width), static_cast<LONG>(height)};
+        impl_->cmd_list->SetGraphicsRootSignature(root_sig);
+        impl_->cmd_list->SetGraphicsRoot32BitConstants(0, 4, quad_color, 0);
+        impl_->cmd_list->RSSetViewports(1, &vp);
+        impl_->cmd_list->RSSetScissorRects(1, &scissor);
+        impl_->cmd_list->IASetPrimitiveTopology(D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
+        impl_->cmd_list->IASetVertexBuffers(0, 1, &vbv);
+        impl_->cmd_list->IASetIndexBuffer(&ibv);
+        impl_->cmd_list->DrawIndexedInstanced(6, 1, 0, 0, 0);
+        report.index_count = 6;
+    }
+
+    D3D12_RESOURCE_BARRIER barrier{};
+    barrier.Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
+    barrier.Transition.pResource = render_target;
+    barrier.Transition.StateBefore = D3D12_RESOURCE_STATE_RENDER_TARGET;
+    barrier.Transition.StateAfter = D3D12_RESOURCE_STATE_COPY_SOURCE;
+    barrier.Transition.Subresource = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
+    impl_->cmd_list->ResourceBarrier(1, &barrier);
+
+    D3D12_TEXTURE_COPY_LOCATION src_loc{};
+    src_loc.pResource = render_target;
+    src_loc.Type = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX;
+    D3D12_TEXTURE_COPY_LOCATION dst_loc{};
+    dst_loc.pResource = readback;
+    dst_loc.Type = D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT;
+    dst_loc.PlacedFootprint.Footprint.Format = DXGI_FORMAT_R8G8B8A8_UNORM;
+    dst_loc.PlacedFootprint.Footprint.Width = width;
+    dst_loc.PlacedFootprint.Footprint.Height = height;
+    dst_loc.PlacedFootprint.Footprint.Depth = 1;
+    dst_loc.PlacedFootprint.Footprint.RowPitch = row_pitch;
+    impl_->cmd_list->CopyTextureRegion(&dst_loc, 0, 0, 0, &src_loc, nullptr);
+    hr = impl_->cmd_list->Close();
+    if (FAILED(hr)) return fail("ID3D12GraphicsCommandList::Close", hr);
+
+    ID3D12CommandList* lists[] = {impl_->cmd_list};
+    impl_->queue->ExecuteCommandLists(1, lists);
+
+    // Fence wait, recorded rather than assumed.
+    const uint64_t target = ++impl_->fence_value;
+    report.fence_signaled = target;
+    hr = impl_->queue->Signal(impl_->fence, target);
+    if (FAILED(hr)) return fail("ID3D12CommandQueue::Signal", hr);
+    if (impl_->fence->GetCompletedValue() < target) {
+        hr = impl_->fence->SetEventOnCompletion(target, impl_->fence_event);
+        if (FAILED(hr)) return fail("ID3D12Fence::SetEventOnCompletion", hr);
+        report.wait_result = WaitForSingleObject(impl_->fence_event, 10000);
+    }
+    report.fence_completed = impl_->fence->GetCompletedValue();
+    if (report.fence_completed < target) {
+        const HRESULT removed = impl_->device->GetDeviceRemovedReason();
+        return fail("ID3D12Fence::GetCompletedValue (fence not reached)", FAILED(removed) ? removed : E_FAIL);
+    }
+
+    void* mapped = nullptr;
+    D3D12_RANGE read_range{0, static_cast<SIZE_T>(readback_size)};
+    hr = readback->Map(0, &read_range, &mapped);
+    if (FAILED(hr) || !mapped) return fail("ID3D12Resource::Map(Readback)", FAILED(hr) ? hr : E_POINTER);
+    out_frame.width = width;
+    out_frame.height = height;
+    out_frame.pixels.resize(static_cast<size_t>(width) * height * 4);
+    const auto* src_bytes = static_cast<const uint8_t*>(mapped);
+    for (uint32_t y = 0; y < height; ++y) {
+        std::memcpy(out_frame.pixels.data() + static_cast<size_t>(y) * width * 4,
+                    src_bytes + static_cast<size_t>(y) * row_pitch, static_cast<size_t>(width) * 4);
+    }
+    D3D12_RANGE empty_range{0, 0};
+    readback->Unmap(0, &empty_range);
+    cleanup();
+    return Status::Ok();
+}
+
 #else
 
 struct D3D12Backend::Impl {};
@@ -550,6 +858,12 @@ Status D3D12Backend::Initialize(bool, bool) {
 }
 void D3D12Backend::Shutdown() {}
 Status D3D12Backend::RenderTestTriangle(uint32_t, uint32_t, FrameBufferRgba8&) {
+    return Status::Error(StatusCode::NotImplemented, "D3D12Backend requires Windows");
+}
+Status D3D12Backend::RenderOffscreenProbe(OffscreenProbeMode, uint32_t, uint32_t, const uint8_t[4],
+                                          const uint8_t[4], FrameBufferRgba8&,
+                                          OffscreenProbeReport& report) {
+    report = OffscreenProbeReport{};
     return Status::Error(StatusCode::NotImplemented, "D3D12Backend requires Windows");
 }
 

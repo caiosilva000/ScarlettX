@@ -297,10 +297,17 @@ function(scarlettx_add_test name src)
         ${CMAKE_CURRENT_SOURCE_DIR}/include
         ${CMAKE_CURRENT_SOURCE_DIR}/tests
     )
+    # Configure-time fixture roots are the defaults; SCARLETTX_TEST_BINARY_DIR and
+    # SCARLETTX_TEST_SOURCE_DIR override them at run time (tests/sx_test_paths.h).
     target_compile_definitions(${name} PRIVATE
-        SCARLETTX_BINARY_DIR="${CMAKE_BINARY_DIR}"
-        SCARLETTX_SOURCE_DIR="${CMAKE_CURRENT_SOURCE_DIR}"
+        SCARLETTX_BINARY_DIR_DEFAULT="${CMAKE_BINARY_DIR}"
+        SCARLETTX_SOURCE_DIR_DEFAULT="${CMAKE_CURRENT_SOURCE_DIR}"
     )
+    if(MSVC)
+        target_compile_options(${name} PRIVATE "/FI${CMAKE_CURRENT_SOURCE_DIR}/tests/sx_test_paths.h")
+    else()
+        target_compile_options(${name} PRIVATE -include "${CMAKE_CURRENT_SOURCE_DIR}/tests/sx_test_paths.h")
+    endif()
     add_test(NAME ${name} COMMAND ${name})
 endfunction()
 
@@ -352,6 +359,13 @@ target_link_libraries(test_gameinput PRIVATE GameInput)
 
 scarlettx_add_test(test_shader_pipeline tests/test_shader_pipeline.cpp)
 target_link_libraries(test_shader_pipeline PRIVATE d3d12_xs)
+
+# Offscreen D3D12Backend probe: exact render-target clear, then an indexed draw, each with fence
+# completion and full pixel readback. The bare test runs both; the two entries below run them
+# one at a time (clear first).
+scarlettx_add_test(test_d3d12_offscreen_probe tests/test_d3d12_offscreen_probe.cpp)
+add_test(NAME test_d3d12_offscreen_clear COMMAND test_d3d12_offscreen_probe clear)
+add_test(NAME test_d3d12_offscreen_indexed COMMAND test_d3d12_offscreen_probe indexed)
 
 scarlettx_add_test(test_middleware_net tests/test_middleware_net.cpp)
 target_link_libraries(test_middleware_net PRIVATE
