@@ -794,6 +794,43 @@ std::vector<XboxD3D12ResourceProxy*> g_guest_textures;
 std::atomic<uint64_t> g_upload_textures{0};
 std::atomic<uint64_t> g_upload_bytes{0};
 
+// Planar (video) formats: one resource, several planes.
+bool IsPlanarFormat(DXGI_FORMAT format) {
+    switch (format) {
+        case DXGI_FORMAT_NV12:
+        case DXGI_FORMAT_P010:
+        case DXGI_FORMAT_P016:
+        case DXGI_FORMAT_420_OPAQUE:
+        case DXGI_FORMAT_NV11:
+        case DXGI_FORMAT_P208:
+            return true;
+        default:
+            return false;
+    }
+}
+
+// Whether the host can create a 2D texture of a planar format. A host that cannot must be asked
+// first: CrossOver's D3DMetal does not fail CreateCommittedResource for NV12, it ends the process
+// in Metal's texture validation (invalid pixelFormat). The answer is logged once per format.
+bool HostCreatesPlanarTexture(ID3D12Device* device, DXGI_FORMAT format) {
+    D3D12_FEATURE_DATA_FORMAT_SUPPORT support = {};
+    support.Format = format;
+    const HRESULT hr = device->CheckFeatureSupport(D3D12_FEATURE_FORMAT_SUPPORT, &support, sizeof(support));
+    const bool ok = SUCCEEDED(hr) && (support.Support1 & D3D12_FORMAT_SUPPORT1_TEXTURE2D) != 0;
+    static std::mutex logged_mutex;
+    static std::vector<DXGI_FORMAT> logged;
+    std::lock_guard<std::mutex> lock(logged_mutex);
+    if (std::find(logged.begin(), logged.end(), format) == logged.end()) {
+        logged.push_back(format);
+        std::fprintf(stderr,
+                     "[ScarlettX][d3d12_xs] planar format %u: FORMAT_SUPPORT hr=0x%08x support1=0x%08x -> %s\n",
+                     static_cast<unsigned>(format), static_cast<unsigned>(hr),
+                     static_cast<unsigned>(support.Support1), ok ? "creatable" : "refused");
+        std::fflush(stderr);
+    }
+    return ok;
+}
+
 // True when the guest layout describes the same rows as the host texture's
 // subresources. Rules out planar formats and element sizes the layout code
 // does not know, whose conversion would not fit the host footprints.
@@ -3679,6 +3716,11 @@ intptr_t SCARLETTX_GDK_CALLBACK ProxyCreateCommittedResource(
         ? nullptr
         : reinterpret_cast<const D3D12_CLEAR_VALUE*>(pClearVal);
     const auto pc_heap_flags = static_cast<D3D12_HEAP_FLAGS>(heapFlags & 0x3FFFu);
+    if (desc.Dimension == D3D12_RESOURCE_DIMENSION_TEXTURE2D && IsPlanarFormat(desc.Format) &&
+        !HostCreatesPlanarTexture(obj->pc_device, desc.Format)) {
+        // What D3D12 itself answers for a format the device cannot create.
+        return static_cast<intptr_t>(E_INVALIDARG);
+    }
     ID3D12Resource* pc_res = nullptr;
     const HRESULT hr = obj->pc_device->CreateCommittedResource(
         &hp, pc_heap_flags, &desc, pc_state,
