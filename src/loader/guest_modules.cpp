@@ -764,33 +764,9 @@ bool IsPackageModule(void* host_module) {
     return LowerWide(path).compare(0, dir.size(), dir) == 0;
 }
 
-}  // namespace
 
-void PatchHostModuleForGuests(void* host_module) {
-    auto* base = static_cast<uint8_t*>(host_module);
-    // Low bits are set on data-file and image-resource handles.
-    if (!base || (reinterpret_cast<uintptr_t>(base) & 0xFFFF) != 0) {
-        return;
-    }
-    // The overrides fall back to the real functions through this module's own
-    // imports, so those must stay as they are.
-    HMODULE self = nullptr;
-    if (GetModuleHandleExW(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS |
-                               GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
-                           reinterpret_cast<LPCWSTR>(&GuestRtlPcToFileHeader), &self) &&
-        self == host_module) {
-        return;
-    }
-    // Only two kinds of host-loaded module are touched: the C++ runtime, whose
-    // throw looks up the image that owns the exception's type data, and DLLs
-    // that shipped with the title. System DLLs keep their imports.
-    const bool package_module = IsPackageModule(host_module);
-    wchar_t module_path[MAX_PATH + 1] = {};
-    GetModuleFileNameW(static_cast<HMODULE>(host_module), module_path, MAX_PATH);
-    const bool runtime_module = BaseNameLower(Narrow(module_path)).compare(0, 9, "vcruntime") == 0;
-    if (!package_module && !runtime_module) {
-        return;
-    }
+// Rewrites the import table entries of one host module (see PatchHostModuleForGuests).
+void RedirectImports(uint8_t* base, bool package_module) {
     const auto* dos = reinterpret_cast<const IMAGE_DOS_HEADER*>(base);
     if (dos->e_magic != IMAGE_DOS_SIGNATURE) {
         return;
@@ -832,6 +808,51 @@ void PatchHostModuleForGuests(void* host_module) {
                 iat->u1.Function = reinterpret_cast<ULONGLONG>(replacement);
                 VirtualProtect(&iat->u1.Function, sizeof(ULONGLONG), old_protect, &old_protect);
             }
+        }
+    }
+}
+
+}  // namespace
+
+void PatchHostModuleForGuests(void* host_module) {
+    auto* base = static_cast<uint8_t*>(host_module);
+    // Low bits are set on data-file and image-resource handles.
+    if (!base || (reinterpret_cast<uintptr_t>(base) & 0xFFFF) != 0) {
+        return;
+    }
+    // The overrides fall back to the real functions through this module's own
+    // imports, so those must stay as they are.
+    HMODULE self = nullptr;
+    if (GetModuleHandleExW(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS |
+                               GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
+                           reinterpret_cast<LPCWSTR>(&GuestRtlPcToFileHeader), &self) &&
+        self == host_module) {
+        return;
+    }
+    // Only two kinds of host-loaded module are touched: the C++ runtime, whose
+    // throw looks up the image that owns the exception's type data, and DLLs
+    // that shipped with the title. System DLLs keep their imports.
+    const bool package_module = IsPackageModule(host_module);
+    wchar_t module_path[MAX_PATH + 1] = {};
+    GetModuleFileNameW(static_cast<HMODULE>(host_module), module_path, MAX_PATH);
+    const bool runtime_module = BaseNameLower(Narrow(module_path)).compare(0, 9, "vcruntime") == 0;
+    if (!package_module && !runtime_module) {
+        return;
+    }
+    RedirectImports(base, package_module);
+    if (runtime_module) {
+        // The lookup has to be redirected in the module that implements the throw. On Windows
+        // that is vcruntime140.dll itself. Wine and CrossOver export _CxxThrowException from
+        // vcruntime140.dll as a forward to their ucrtbase.dll, whose own RtlPcToFileHeader import
+        // would otherwise report no module for a guest image and leave the throw's image base 0.
+        HMODULE thrower = nullptr;
+        const FARPROC throw_fn = GetProcAddress(static_cast<HMODULE>(host_module), "_CxxThrowException");
+        if (throw_fn &&
+            GetModuleHandleExW(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS |
+                                   GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
+                               reinterpret_cast<LPCWSTR>(throw_fn), &thrower) &&
+            thrower && thrower != host_module && thrower != self) {
+            RedirectImports(reinterpret_cast<uint8_t*>(thrower), false);
         }
     }
 }
