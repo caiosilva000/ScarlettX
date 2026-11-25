@@ -39,6 +39,17 @@ struct OffscreenProbeReport {
     uint32_t index_count = 0;   // Indices submitted with DrawIndexedInstanced (0 for ClearOnly).
 };
 
+// Compute probe: one compute shader, its user data as 32-bit root constants at b0 (space 0), and
+// one raw buffer UAV at index 0 of a directly indexed CBV/SRV/UAV heap (SM 6.6 dynamic resources).
+struct ComputeProbeDesc {
+    const uint8_t* shader = nullptr;       // DXIL container
+    size_t shader_size = 0;
+    std::vector<uint32_t> root_constants;  // every dword of b0
+    uint32_t uav_dwords = 4;               // size of the raw UAV
+    uint32_t uav_fill = 0;                 // each dword's value before the dispatch
+    uint32_t groups[3] = {1, 1, 1};
+};
+
 class D3D12Backend {
 public:
     D3D12Backend();
@@ -63,6 +74,10 @@ public:
     Status RenderOffscreenProbe(OffscreenProbeMode mode, uint32_t width, uint32_t height,
                                 const uint8_t clear_rgba[4], const uint8_t quad_rgba[4],
                                 FrameBufferRgba8& out_frame, OffscreenProbeReport& report);
+
+    // Fills the UAV, dispatches the shader once, waits on a fence and reads the whole UAV back.
+    Status RunComputeProbe(const ComputeProbeDesc& desc, std::vector<uint32_t>& out_dwords,
+                           OffscreenProbeReport& report);
 
 private:
     struct Impl;

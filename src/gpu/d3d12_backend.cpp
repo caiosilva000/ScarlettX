@@ -847,6 +847,186 @@ Status D3D12Backend::RenderOffscreenProbe(OffscreenProbeMode mode, uint32_t widt
     return Status::Ok();
 }
 
+Status D3D12Backend::RunComputeProbe(const ComputeProbeDesc& desc, std::vector<uint32_t>& out_dwords,
+                                     OffscreenProbeReport& report) {
+    report = OffscreenProbeReport{};
+    out_dwords.clear();
+    if (!IsInitialized()) {
+        return Status::Error(StatusCode::DeviceError, "D3D12Backend is not initialized");
+    }
+    if (!desc.shader || desc.shader_size == 0 || desc.root_constants.empty() || desc.uav_dwords == 0) {
+        return Status::Error(StatusCode::InvalidArgument, "Compute probe needs a shader, constants and a UAV");
+    }
+
+    ID3DBlob* sig_blob = nullptr;
+    ID3DBlob* err_blob = nullptr;
+    ID3D12RootSignature* root_sig = nullptr;
+    ID3D12PipelineState* pso = nullptr;
+    ID3D12DescriptorHeap* view_heap = nullptr;
+    ID3D12DescriptorHeap* sampler_heap = nullptr;
+    ID3D12Resource* uav = nullptr;
+    ID3D12Resource* upload = nullptr;
+    ID3D12Resource* readback = nullptr;
+    auto cleanup = [&]() {
+        SafeRelease(readback);
+        SafeRelease(upload);
+        SafeRelease(uav);
+        SafeRelease(sampler_heap);
+        SafeRelease(view_heap);
+        SafeRelease(pso);
+        SafeRelease(root_sig);
+        SafeRelease(err_blob);
+        SafeRelease(sig_blob);
+    };
+    auto fail = [&](const char* api, HRESULT hr) -> Status {
+        report.failed_api = api;
+        report.failed_hr = static_cast<int32_t>(hr);
+        cleanup();
+        std::ostringstream msg;
+        msg << api << " failed, hr=0x" << std::hex << static_cast<uint32_t>(hr);
+        return Status::Error(StatusCode::DeviceError, msg.str());
+    };
+
+    // Root parameter 0: the user data. The shader takes its views from the heap by index.
+    D3D12_ROOT_PARAMETER user_data{};
+    user_data.ParameterType = D3D12_ROOT_PARAMETER_TYPE_32BIT_CONSTANTS;
+    user_data.Constants.ShaderRegister = 0;
+    user_data.Constants.RegisterSpace = 0;
+    user_data.Constants.Num32BitValues = static_cast<UINT>(desc.root_constants.size());
+    user_data.ShaderVisibility = D3D12_SHADER_VISIBILITY_ALL;
+    D3D12_ROOT_SIGNATURE_DESC rs_desc{};
+    rs_desc.NumParameters = 1;
+    rs_desc.pParameters = &user_data;
+    rs_desc.Flags = static_cast<D3D12_ROOT_SIGNATURE_FLAGS>(
+        D3D12_ROOT_SIGNATURE_FLAG_CBV_SRV_UAV_HEAP_DIRECTLY_INDEXED |
+        D3D12_ROOT_SIGNATURE_FLAG_SAMPLER_HEAP_DIRECTLY_INDEXED);
+    HRESULT hr = D3D12SerializeRootSignature(&rs_desc, D3D_ROOT_SIGNATURE_VERSION_1, &sig_blob, &err_blob);
+    if (FAILED(hr)) return fail("D3D12SerializeRootSignature(compute)", hr);
+    hr = impl_->device->CreateRootSignature(0, sig_blob->GetBufferPointer(), sig_blob->GetBufferSize(),
+                                            IID_PPV_ARGS(&root_sig));
+    if (FAILED(hr)) return fail("ID3D12Device::CreateRootSignature(compute)", hr);
+
+    D3D12_COMPUTE_PIPELINE_STATE_DESC pso_desc{};
+    pso_desc.pRootSignature = root_sig;
+    pso_desc.CS.pShaderBytecode = desc.shader;
+    pso_desc.CS.BytecodeLength = desc.shader_size;
+    hr = impl_->device->CreateComputePipelineState(&pso_desc, IID_PPV_ARGS(&pso));
+    if (FAILED(hr)) return fail("ID3D12Device::CreateComputePipelineState", hr);
+
+    D3D12_DESCRIPTOR_HEAP_DESC heap_desc{};
+    heap_desc.NumDescriptors = 1;
+    heap_desc.Type = D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV;
+    heap_desc.Flags = D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE;
+    hr = impl_->device->CreateDescriptorHeap(&heap_desc, IID_PPV_ARGS(&view_heap));
+    if (FAILED(hr)) return fail("ID3D12Device::CreateDescriptorHeap(CBV_SRV_UAV)", hr);
+    heap_desc.Type = D3D12_DESCRIPTOR_HEAP_TYPE_SAMPLER;
+    hr = impl_->device->CreateDescriptorHeap(&heap_desc, IID_PPV_ARGS(&sampler_heap));
+    if (FAILED(hr)) return fail("ID3D12Device::CreateDescriptorHeap(SAMPLER)", hr);
+
+    const UINT64 bytes = static_cast<UINT64>(desc.uav_dwords) * 4;
+    auto make_buffer = [&](D3D12_HEAP_TYPE type, D3D12_RESOURCE_FLAGS flags, D3D12_RESOURCE_STATES state,
+                           ID3D12Resource** out) -> HRESULT {
+        D3D12_HEAP_PROPERTIES heap{};
+        heap.Type = type;
+        D3D12_RESOURCE_DESC buffer{};
+        buffer.Dimension = D3D12_RESOURCE_DIMENSION_BUFFER;
+        buffer.Width = bytes;
+        buffer.Height = 1;
+        buffer.DepthOrArraySize = 1;
+        buffer.MipLevels = 1;
+        buffer.Format = DXGI_FORMAT_UNKNOWN;
+        buffer.SampleDesc.Count = 1;
+        buffer.Layout = D3D12_TEXTURE_LAYOUT_ROW_MAJOR;
+        buffer.Flags = flags;
+        return impl_->device->CreateCommittedResource(&heap, D3D12_HEAP_FLAG_NONE, &buffer, state, nullptr,
+                                                      IID_PPV_ARGS(out));
+    };
+    hr = make_buffer(D3D12_HEAP_TYPE_DEFAULT, D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS,
+                     D3D12_RESOURCE_STATE_COPY_DEST, &uav);
+    if (FAILED(hr)) return fail("ID3D12Device::CreateCommittedResource(UAV)", hr);
+    hr = make_buffer(D3D12_HEAP_TYPE_UPLOAD, D3D12_RESOURCE_FLAG_NONE, D3D12_RESOURCE_STATE_GENERIC_READ,
+                     &upload);
+    if (FAILED(hr)) return fail("ID3D12Device::CreateCommittedResource(Upload)", hr);
+    hr = make_buffer(D3D12_HEAP_TYPE_READBACK, D3D12_RESOURCE_FLAG_NONE, D3D12_RESOURCE_STATE_COPY_DEST,
+                     &readback);
+    if (FAILED(hr)) return fail("ID3D12Device::CreateCommittedResource(Readback)", hr);
+
+    void* mapped = nullptr;
+    D3D12_RANGE no_read{0, 0};
+    hr = upload->Map(0, &no_read, &mapped);
+    if (FAILED(hr) || !mapped) return fail("ID3D12Resource::Map(Upload)", FAILED(hr) ? hr : E_POINTER);
+    for (uint32_t i = 0; i < desc.uav_dwords; ++i) {
+        std::memcpy(static_cast<uint8_t*>(mapped) + static_cast<size_t>(i) * 4, &desc.uav_fill, 4);
+    }
+    upload->Unmap(0, nullptr);
+
+    // A raw view (ByteAddressBuffer): R32_TYPELESS with the raw flag.
+    D3D12_UNORDERED_ACCESS_VIEW_DESC view{};
+    view.Format = DXGI_FORMAT_R32_TYPELESS;
+    view.ViewDimension = D3D12_UAV_DIMENSION_BUFFER;
+    view.Buffer.NumElements = desc.uav_dwords;
+    view.Buffer.Flags = D3D12_BUFFER_UAV_FLAG_RAW;
+    impl_->device->CreateUnorderedAccessView(uav, nullptr, &view,
+                                             view_heap->GetCPUDescriptorHandleForHeapStart());
+
+    hr = impl_->allocator->Reset();
+    if (FAILED(hr)) return fail("ID3D12CommandAllocator::Reset", hr);
+    hr = impl_->cmd_list->Reset(impl_->allocator, pso);
+    if (FAILED(hr)) return fail("ID3D12GraphicsCommandList::Reset", hr);
+
+    auto transition = [&](D3D12_RESOURCE_STATES before, D3D12_RESOURCE_STATES after) {
+        D3D12_RESOURCE_BARRIER barrier{};
+        barrier.Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
+        barrier.Transition.pResource = uav;
+        barrier.Transition.StateBefore = before;
+        barrier.Transition.StateAfter = after;
+        barrier.Transition.Subresource = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
+        impl_->cmd_list->ResourceBarrier(1, &barrier);
+    };
+    impl_->cmd_list->CopyBufferRegion(uav, 0, upload, 0, bytes);
+    transition(D3D12_RESOURCE_STATE_COPY_DEST, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
+    // The heaps go first: a directly indexed root signature reads whichever are set.
+    ID3D12DescriptorHeap* heaps[] = {view_heap, sampler_heap};
+    impl_->cmd_list->SetDescriptorHeaps(2, heaps);
+    impl_->cmd_list->SetComputeRootSignature(root_sig);
+    impl_->cmd_list->SetComputeRoot32BitConstants(0, static_cast<UINT>(desc.root_constants.size()),
+                                                  desc.root_constants.data(), 0);
+    impl_->cmd_list->Dispatch(desc.groups[0], desc.groups[1], desc.groups[2]);
+    transition(D3D12_RESOURCE_STATE_UNORDERED_ACCESS, D3D12_RESOURCE_STATE_COPY_SOURCE);
+    impl_->cmd_list->CopyBufferRegion(readback, 0, uav, 0, bytes);
+    hr = impl_->cmd_list->Close();
+    if (FAILED(hr)) return fail("ID3D12GraphicsCommandList::Close", hr);
+
+    ID3D12CommandList* lists[] = {impl_->cmd_list};
+    impl_->queue->ExecuteCommandLists(1, lists);
+
+    const uint64_t target = ++impl_->fence_value;
+    report.fence_signaled = target;
+    hr = impl_->queue->Signal(impl_->fence, target);
+    if (FAILED(hr)) return fail("ID3D12CommandQueue::Signal", hr);
+    if (impl_->fence->GetCompletedValue() < target) {
+        hr = impl_->fence->SetEventOnCompletion(target, impl_->fence_event);
+        if (FAILED(hr)) return fail("ID3D12Fence::SetEventOnCompletion", hr);
+        report.wait_result = WaitForSingleObject(impl_->fence_event, 10000);
+    }
+    report.fence_completed = impl_->fence->GetCompletedValue();
+    if (report.fence_completed < target) {
+        const HRESULT removed = impl_->device->GetDeviceRemovedReason();
+        return fail("ID3D12Fence::GetCompletedValue (fence not reached)", FAILED(removed) ? removed : E_FAIL);
+    }
+
+    mapped = nullptr;
+    D3D12_RANGE read_range{0, static_cast<SIZE_T>(bytes)};
+    hr = readback->Map(0, &read_range, &mapped);
+    if (FAILED(hr) || !mapped) return fail("ID3D12Resource::Map(Readback)", FAILED(hr) ? hr : E_POINTER);
+    out_dwords.resize(desc.uav_dwords);
+    std::memcpy(out_dwords.data(), mapped, static_cast<size_t>(bytes));
+    D3D12_RANGE empty_range{0, 0};
+    readback->Unmap(0, &empty_range);
+    cleanup();
+    return Status::Ok();
+}
+
 #else
 
 struct D3D12Backend::Impl {};
@@ -864,6 +1044,12 @@ Status D3D12Backend::RenderOffscreenProbe(OffscreenProbeMode, uint32_t, uint32_t
                                           const uint8_t[4], FrameBufferRgba8&,
                                           OffscreenProbeReport& report) {
     report = OffscreenProbeReport{};
+    return Status::Error(StatusCode::NotImplemented, "D3D12Backend requires Windows");
+}
+Status D3D12Backend::RunComputeProbe(const ComputeProbeDesc&, std::vector<uint32_t>& out_dwords,
+                                     OffscreenProbeReport& report) {
+    report = OffscreenProbeReport{};
+    out_dwords.clear();
     return Status::Error(StatusCode::NotImplemented, "D3D12Backend requires Windows");
 }
 
