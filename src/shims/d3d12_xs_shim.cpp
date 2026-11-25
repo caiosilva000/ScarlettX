@@ -1110,9 +1110,120 @@ struct GuestTextureUpload {
     uint64_t size = 0;
 };
 
-// Uploads all dirty textures in one command list and one fence wait. The
-// per-texture version used to allocate, submit and block once per texture,
-// which turned a handful of streamed textures into a long CPU stall.
+// Staging for guest-texture uploads, kept per command queue. A slot (an upload buffer, an
+// allocator and a command list) is reused once the fence value signalled after its copy has
+// completed; until then it also keeps the textures it copies into alive. Creating these for
+// every flush and waiting for the copy cost about 0.7 ms a flush.
+struct GuestUploadSlot {
+    ID3D12Resource* upload = nullptr;
+    uint64_t capacity = 0;
+    void* mapped = nullptr;
+    ID3D12CommandAllocator* alloc = nullptr;
+    ID3D12GraphicsCommandList* list = nullptr;
+    uint64_t busy_until = 0;                 // fence value; 0 when never used
+    std::vector<ID3D12Resource*> targets;    // referenced until the copy has run
+};
+struct GuestUploadPool {
+    ID3D12Fence* fence = nullptr;
+    uint64_t signaled = 0;
+    std::vector<GuestUploadSlot> slots;
+};
+constexpr size_t kGuestUploadSlots = 4;
+std::unordered_map<ID3D12CommandQueue*, GuestUploadPool> g_guest_upload_pools;  // under g_guest_textures_mutex
+
+void ReleaseGuestUploadSlot(GuestUploadSlot& slot) {
+    for (ID3D12Resource* t : slot.targets) t->Release();
+    slot.targets.clear();
+    if (slot.list) slot.list->Release();
+    if (slot.alloc) slot.alloc->Release();
+    if (slot.upload) slot.upload->Release();
+    slot = GuestUploadSlot{};
+}
+
+// A slot whose last copy has completed, with room for `bytes`, its command list open. Waits for
+// the oldest copy when every slot is still in flight. Null when the host refuses an object.
+GuestUploadSlot* AcquireGuestUploadSlot(ID3D12Device* device, GuestUploadPool& pool, uint64_t bytes) {
+    if (!pool.fence && FAILED(device->CreateFence(0, D3D12_FENCE_FLAG_NONE, IID_PPV_ARGS(&pool.fence)))) return nullptr;
+    const uint64_t completed = pool.fence->GetCompletedValue();
+    GuestUploadSlot* slot = nullptr;
+    for (GuestUploadSlot& s : pool.slots) {
+        if (s.busy_until > completed) continue;
+        if (!slot || (s.capacity >= bytes && slot->capacity < bytes)) slot = &s;
+    }
+    if (!slot && pool.slots.size() < kGuestUploadSlots) {
+        pool.slots.emplace_back();
+        slot = &pool.slots.back();
+    }
+    if (!slot) {
+        // Every slot is in flight: wait for the oldest (a null event makes this call wait; a
+        // removed device completes its fences).
+        for (GuestUploadSlot& s : pool.slots) {
+            if (!slot || s.busy_until < slot->busy_until) slot = &s;
+        }
+        pool.fence->SetEventOnCompletion(slot->busy_until, nullptr);
+    }
+    for (ID3D12Resource* t : slot->targets) t->Release();
+    slot->targets.clear();
+    if (slot->capacity < bytes) {
+        if (slot->upload) slot->upload->Release();
+        slot->upload = nullptr;
+        slot->mapped = nullptr;
+        slot->capacity = 0;
+        D3D12_HEAP_PROPERTIES hp = {};
+        hp.Type = D3D12_HEAP_TYPE_UPLOAD;
+        D3D12_RESOURCE_DESC bd = {};
+        bd.Dimension = D3D12_RESOURCE_DIMENSION_BUFFER;
+        bd.Width = AlignUp(bytes, 65536);
+        bd.Height = 1;
+        bd.DepthOrArraySize = 1;
+        bd.MipLevels = 1;
+        bd.SampleDesc.Count = 1;
+        bd.Layout = D3D12_TEXTURE_LAYOUT_ROW_MAJOR;
+        if (FAILED(device->CreateCommittedResource(&hp, D3D12_HEAP_FLAG_NONE, &bd, D3D12_RESOURCE_STATE_GENERIC_READ,
+                                                   nullptr, IID_PPV_ARGS(&slot->upload))) ||
+            FAILED(slot->upload->Map(0, nullptr, &slot->mapped))) {
+            return nullptr;
+        }
+        slot->capacity = bd.Width;
+    }
+    if (!slot->alloc) {
+        if (FAILED(device->CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT, IID_PPV_ARGS(&slot->alloc))) ||
+            FAILED(device->CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_DIRECT, slot->alloc, nullptr,
+                                             IID_PPV_ARGS(&slot->list)))) {
+            return nullptr;
+        }
+    } else if (FAILED(slot->alloc->Reset()) || FAILED(slot->list->Reset(slot->alloc, nullptr))) {
+        return nullptr;
+    }
+    return slot;
+}
+
+// The queue is going away: let its last uploads finish, then drop its staging.
+void ReleaseGuestUploadPool(ID3D12CommandQueue* queue) {
+    std::lock_guard<std::mutex> lock(g_guest_textures_mutex);
+    const auto it = g_guest_upload_pools.find(queue);
+    if (it == g_guest_upload_pools.end()) return;
+    GuestUploadPool& pool = it->second;
+    if (pool.fence && pool.fence->GetCompletedValue() < pool.signaled) pool.fence->SetEventOnCompletion(pool.signaled, nullptr);
+    for (GuestUploadSlot& s : pool.slots) ReleaseGuestUploadSlot(s);
+    if (pool.fence) pool.fence->Release();
+    g_guest_upload_pools.erase(it);
+}
+
+// Uploads are not waited for on the queue they were submitted to: that queue runs them before
+// whatever the title submits next. Another queue has no such order, so a submission to it waits
+// for uploads still in flight elsewhere.
+void WaitForGuestUploadsOnOtherQueues(ID3D12CommandQueue* queue) {
+    std::lock_guard<std::mutex> lock(g_guest_textures_mutex);
+    for (auto& [other, pool] : g_guest_upload_pools) {
+        if (other == queue || !pool.fence || pool.fence->GetCompletedValue() >= pool.signaled) continue;
+        pool.fence->SetEventOnCompletion(pool.signaled, nullptr);
+    }
+}
+
+// Uploads all dirty textures in one command list, from staging that is reused (see
+// GuestUploadSlot). The per-texture version used to allocate, submit and block once per
+// texture, which turned a handful of streamed textures into a long CPU stall.
 void UploadGuestTextureBatch(ID3D12CommandQueue* queue,
                              std::vector<GuestTextureUpload>& uploads) {
     if (uploads.empty()) return;
@@ -1136,34 +1247,13 @@ void UploadGuestTextureBatch(ID3D12CommandQueue* queue,
     g_upload_bytes.fetch_add(total, std::memory_order_relaxed);
     g_upload_textures.fetch_add(uploads.size(), std::memory_order_relaxed);
 
-    D3D12_HEAP_PROPERTIES hp = {};
-    hp.Type = D3D12_HEAP_TYPE_UPLOAD;
-    D3D12_RESOURCE_DESC bd = {};
-    bd.Dimension = D3D12_RESOURCE_DIMENSION_BUFFER;
-    bd.Width = total;
-    bd.Height = 1;
-    bd.DepthOrArraySize = 1;
-    bd.MipLevels = 1;
-    bd.SampleDesc.Count = 1;
-    bd.Layout = D3D12_TEXTURE_LAYOUT_ROW_MAJOR;
-
-    ID3D12Resource* upload = nullptr;
-    ID3D12CommandAllocator* alloc = nullptr;
-    ID3D12GraphicsCommandList* list = nullptr;
-    ID3D12Fence* fence = nullptr;
-    void* mapped = nullptr;
-    const bool ready =
-        SUCCEEDED(device->CreateCommittedResource(&hp, D3D12_HEAP_FLAG_NONE, &bd,
-                                                  D3D12_RESOURCE_STATE_GENERIC_READ, nullptr,
-                                                  IID_PPV_ARGS(&upload))) &&
-        SUCCEEDED(device->CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT,
-                                                 IID_PPV_ARGS(&alloc))) &&
-        SUCCEEDED(device->CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_DIRECT, alloc, nullptr,
-                                            IID_PPV_ARGS(&list))) &&
-        SUCCEEDED(device->CreateFence(0, D3D12_FENCE_FLAG_NONE, IID_PPV_ARGS(&fence))) &&
-        SUCCEEDED(upload->Map(0, nullptr, &mapped));
-
-    if (ready) {
+    // The caller holds g_guest_textures_mutex.
+    GuestUploadPool& pool = g_guest_upload_pools[queue];
+    GuestUploadSlot* slot = AcquireGuestUploadSlot(device, pool, total);
+    if (slot) {
+        ID3D12Resource* upload = slot->upload;
+        ID3D12GraphicsCommandList* list = slot->list;
+        void* mapped = slot->mapped;
         for (const GuestTextureUpload& u : uploads) {
             const GuestTextureMemory& mem = *u.tex->guest_memory;
             for (const UINT s : u.dirty) {
@@ -1173,7 +1263,6 @@ void UploadGuestTextureBatch(ID3D12CommandQueue* queue,
                     u.fps[s].Footprint.RowPitch);
             }
         }
-        upload->Unmap(0, nullptr);
 
         for (const GuestTextureUpload& u : uploads) {
             const auto state =
@@ -1205,14 +1294,20 @@ void UploadGuestTextureBatch(ID3D12CommandQueue* queue,
         if (SUCCEEDED(list->Close())) {
             ID3D12CommandList* lists[] = {list};
             queue->ExecuteCommandLists(1, lists);
-            if (SUCCEEDED(queue->Signal(fence, 1))) fence->SetEventOnCompletion(1, nullptr);
+            // The copy is ahead of whatever the title submits next on this queue. The slot and
+            // the textures it writes stay untouched until this fence value completes.
+            if (SUCCEEDED(queue->Signal(pool.fence, pool.signaled + 1))) {
+                slot->busy_until = ++pool.signaled;
+                for (const GuestTextureUpload& u : uploads) {
+                    u.tex->pc_res->AddRef();
+                    slot->targets.push_back(u.tex->pc_res);
+                }
+            } else {
+                // No fence to tell when the copy has run: do not reuse this staging.
+                ReleaseGuestUploadSlot(*slot);
+            }
         }
     }
-
-    if (fence) fence->Release();
-    if (list) list->Release();
-    if (alloc) alloc->Release();
-    if (upload) upload->Release();
     device->Release();
 }
 
@@ -2689,6 +2784,7 @@ intptr_t SCARLETTX_GDK_CALLBACK QueueProxyRelease(void* self, uintptr_t, uintptr
         if (obj->present_alloc) obj->present_alloc->Release();
         if (obj->swapchain) obj->swapchain->Release();
         StopPresentWindow(obj);
+        if (obj->pc_queue) ReleaseGuestUploadPool(obj->pc_queue);
         if (obj->pc_device) obj->pc_device->Release();
         if (obj->pc_queue) obj->pc_queue->Release();
 #endif
@@ -2762,6 +2858,7 @@ intptr_t SCARLETTX_GDK_CALLBACK QueueProxyExecuteCommandLists(
             g_flush_count.fetch_add(1, std::memory_order_relaxed);
             g_flushed_epoch.store(epoch, std::memory_order_relaxed);
         }
+        WaitForGuestUploadsOnOtherQueues(obj->pc_queue);
         obj->pc_queue->ExecuteCommandLists(static_cast<UINT>(pc_lists.size()), pc_lists.data());
     }
 #endif
