@@ -344,6 +344,7 @@ struct Args {
     uint32_t upload_size = 256;
     uint32_t interval_us = 16667;
     uint32_t hold_ms = 0;
+    uint32_t idle_guest_textures = 0;
     bool markers = false;
 };
 
@@ -978,6 +979,7 @@ bool ParseArgs(int argc, char** argv, Args& a) {
         else if (k == "--upload-size") a.upload_size = u();
         else if (k == "--interval-us") a.interval_us = u();
         else if (k == "--hold-ms") a.hold_ms = u();
+        else if (k == "--idle-guest-textures") a.idle_guest_textures = u();
         else return false;
     }
     const bool mode_ok =
@@ -1006,6 +1008,7 @@ int main(int argc, char** argv) {
                      "  [--frames N] [--warmup N] [--inflight N] [--check-frames N] [--seed N]\n"
                      "  [--width N --height N] [--draws N] [--textures N] [--rounds N]\n"
                      "  [--upload-count N] [--upload-size N] [--interval-us N] [--markers] [--hold-ms N]\n"
+                     "  [--idle-guest-textures N]\n"
                      "  [--series NAME] [--launch N] [--csv FILE] [--frames-csv FILE]\n");
         return 64;
     }
@@ -1394,6 +1397,22 @@ int main(int argc, char** argv) {
         }
     }
 
+    // --idle-guest-textures N: N more 64x64 textures with guest memory, written once now and
+    // never again. They are not drawn. Every flush still has to look at each of them, which is
+    // what this option is for measuring.
+    double idle_create_ms = 0;
+    if (a.idle_guest_textures) {
+        const int64_t t0 = Ticks();
+        for (uint32_t i = 0; i < a.idle_guest_textures; ++i) {
+            void* tex = b.CreateTexture(64, 64, false);
+            auto* base = reinterpret_cast<uint32_t*>(Call(tex, kResGetGPUVirtualAddress));
+            if (!base) return Fail("shim GetGPUVirtualAddress on an idle texture (slot 11)", E_FAIL);
+            base[0] = 0xFF000000u | i;
+        }
+        b.PlumbBegin();
+        b.PlumbRun();  // one submission: the single write of each is uploaded here
+        idle_create_ms = Us(t0, Ticks()) / 1000.0;
+    }
     if (a.path == "windowed" && a.interval_us) {
         Call(b.dev, kDevSetFrameIntervalX, uintptr_t{0}, static_cast<uintptr_t>(a.interval_us), uintptr_t{2}, uintptr_t{0});
     }
@@ -1619,6 +1638,8 @@ int main(int argc, char** argv) {
         metric("pace_wait_ms_median", Percentile(pace, 0.5));
         metric("presented_fps", n * 1000.0 / (Us(loop_start, loop_submitted) / 1000.0));
     }
+    metric("idle_guest_textures", a.idle_guest_textures);
+    metric("idle_guest_textures_create_ms", idle_create_ms);
     metric("first_frame_ms", first_frame_ms);
     metric("pso_create_ms", pso_ms);
     metric("shader_compile_ms", compile_ms);
