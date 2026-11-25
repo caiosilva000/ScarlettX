@@ -405,6 +405,11 @@ set_tests_properties(test_d3d12_guest_texture PROPERTIES ENVIRONMENT "SCARLETTX_
 scarlettx_add_test(test_d3d12_guest_texture_order tests/test_d3d12_guest_texture_order.cpp)
 target_link_libraries(test_d3d12_guest_texture_order PRIVATE d3d12_xs)
 set_tests_properties(test_d3d12_guest_texture_order PROPERTIES ENVIRONMENT "SCARLETTX_REAL_TITLE=1")
+# Guest-texture uploads still in flight: a second queue, more uploads than staging slots, and a
+# texture released straight after the submission that draws it.
+scarlettx_add_test(test_d3d12_guest_texture_inflight tests/test_d3d12_guest_texture_inflight.cpp)
+target_link_libraries(test_d3d12_guest_texture_inflight PRIVATE d3d12_xs)
+set_tests_properties(test_d3d12_guest_texture_inflight PROPERTIES ENVIRONMENT "SCARLETTX_REAL_TITLE=1")
 scarlettx_add_test(test_d3d12_list_layout tests/test_d3d12_list_layout.cpp)
 target_link_libraries(test_d3d12_list_layout PRIVATE d3d12_xs)
 set_tests_properties(test_d3d12_list_layout PROPERTIES ENVIRONMENT "SCARLETTX_REAL_TITLE=1")
