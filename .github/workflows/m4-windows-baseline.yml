@@ -113,6 +113,12 @@ jobs:
           Run-Test 'test_d3d12_offscreen_probe_warp' 'test_d3d12_offscreen_probe.exe' 180 @{}
           Run-Test 'test_d3d12_present_window' 'test_d3d12_present_window.exe' 240 @{ SCARLETTX_REAL_TITLE = '1' }
           Run-Test 'test_d3d12_present_frames' 'test_d3d12_present_frames.exe' 240 @{ SCARLETTX_REAL_TITLE = '1' }
+          # Kept with their output even when they pass: the verdicts are per case.
+          Run-Test 'test_d3d12_guest_texture_inflight' 'test_d3d12_guest_texture_inflight.exe' 240 @{}
+          Run-Test 'test_victory_compute_conformance' 'test_victory_compute_conformance.exe' 240 @{}
+          Run-Test 'test_victory_wave64_exchange' 'test_victory_wave64_exchange.exe' 240 @{}
+          Run-Test 'test_victory_quad_edge' 'test_victory_quad_edge.exe' 240 @{}
+          Run-Test 'test_victory_draw_table' 'test_victory_draw_table.exe' 240 @{}
           exit 0
 
       - name: Full CTest run (informational)
