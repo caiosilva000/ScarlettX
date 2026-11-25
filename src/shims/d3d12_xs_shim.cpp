@@ -501,6 +501,9 @@ struct GuestViewHeap {
     UINT count = 0;
     UINT increment = 0;
     std::vector<GuestViewRecord> views;
+    // How often each descriptor was written. A draw that keeps its binding compares the counts
+    // of the descriptors it uses with what it saw, without the lock.
+    std::unique_ptr<std::atomic<uint32_t>[]> written;
 };
 std::mutex g_view_heaps_mutex;
 std::map<SIZE_T, std::shared_ptr<GuestViewHeap>> g_view_heaps_by_cpu;                     // by cpu_start
@@ -508,31 +511,40 @@ std::unordered_map<ID3D12DescriptorHeap*, std::shared_ptr<GuestViewHeap>> g_view
 std::atomic<uint64_t> g_view_generation{1};  // bumped whenever a record changes
 
 // The record of the descriptor at `cpu`, or null when it is in no heap this shim made. Caller
-// holds g_view_heaps_mutex.
-GuestViewRecord* FindViewRecordLocked(SIZE_T cpu) {
+// holds g_view_heaps_mutex. `out_heap` and `out_index` say where it is.
+GuestViewRecord* FindViewRecordLocked(SIZE_T cpu, GuestViewHeap** out_heap = nullptr, SIZE_T* out_index = nullptr) {
     auto it = g_view_heaps_by_cpu.upper_bound(cpu);
     if (it == g_view_heaps_by_cpu.begin()) return nullptr;
     --it;
     GuestViewHeap& heap = *it->second;
     if (heap.increment == 0) return nullptr;
     const SIZE_T index = (cpu - heap.cpu_start) / heap.increment;
-    return index < heap.views.size() ? &heap.views[index] : nullptr;
+    if (index >= heap.views.size()) return nullptr;
+    if (out_heap) *out_heap = &heap;
+    if (out_index) *out_index = index;
+    return &heap.views[index];
+}
+// Writes the record of the descriptor at `cpu` and counts the write. Caller holds the mutex.
+void WriteViewRecordLocked(SIZE_T cpu, GuestViewRecord value) {
+    GuestViewHeap* heap = nullptr;
+    SIZE_T index = 0;
+    if (GuestViewRecord* record = FindViewRecordLocked(cpu, &heap, &index)) {
+        *record = value;
+        heap->written[index].fetch_add(1, std::memory_order_release);
+    }
 }
 void RecordGuestView(SIZE_T cpu, uint8_t kind, uint8_t dimension) {
     std::lock_guard<std::mutex> lock(g_view_heaps_mutex);
-    if (GuestViewRecord* record = FindViewRecordLocked(cpu)) {
-        *record = GuestViewRecord{kind, dimension};
-        g_view_generation.fetch_add(1, std::memory_order_relaxed);
-    }
+    WriteViewRecordLocked(cpu, GuestViewRecord{kind, dimension});
+    g_view_generation.fetch_add(1, std::memory_order_release);
 }
 void CopyGuestViews(SIZE_T dst, SIZE_T src, UINT count, UINT increment) {
     std::lock_guard<std::mutex> lock(g_view_heaps_mutex);
     for (UINT i = 0; i < count; ++i) {
-        GuestViewRecord* to = FindViewRecordLocked(dst + static_cast<SIZE_T>(i) * increment);
         const GuestViewRecord* from = FindViewRecordLocked(src + static_cast<SIZE_T>(i) * increment);
-        if (to) *to = from ? *from : GuestViewRecord{};
+        WriteViewRecordLocked(dst + static_cast<SIZE_T>(i) * increment, from ? *from : GuestViewRecord{});
     }
-    g_view_generation.fetch_add(1, std::memory_order_relaxed);
+    g_view_generation.fetch_add(1, std::memory_order_release);
 }
 #endif
 
@@ -1842,6 +1854,10 @@ struct XboxD3D12GraphicsCommandListProxy {
     bool graphics_constants_changed = true;  // constants, tables or the view heap, since bound_user_data was built
     std::shared_ptr<GuestViewHeap> view_heap_records;  // what the title put in `view_heap`
     uint64_t views_checked_at = 0;           // g_view_generation when the bound views were last checked
+    // The descriptors the bound user data was built from: their heap, and each one's index with
+    // the write count it had when it was checked.
+    std::shared_ptr<GuestViewHeap> bound_view_heap;
+    std::vector<std::pair<uint32_t, uint32_t>> bound_view_slots;
 #endif
 };
 #if defined(_WIN32)
@@ -1860,6 +1876,8 @@ void ResetComputeShadow(XboxD3D12GraphicsCommandListProxy* obj) {
     obj->host_bound.reset();
     obj->graphics_constants_changed = true;
     obj->view_heap_records.reset();
+    obj->bound_view_heap.reset();
+    obj->bound_view_slots.clear();
 }
 
 // Puts the host root signature and both stages' user data on the list for a draw with a
@@ -1869,12 +1887,30 @@ bool BindTranslatedGraphics(XboxD3D12GraphicsCommandListProxy* obj) {
     const TranslatedGraphicsPipeline& pipeline = *obj->graphics_translated;
     const bool same_root = obj->host_bound == obj->graphics_translated;
     // A descriptor written since the views were last checked may be one this pipeline reads.
-    const uint64_t view_generation = pipeline.reads_views ? g_view_generation.load(std::memory_order_relaxed) : 0;
-    if (same_root && !obj->graphics_constants_changed && view_generation == obj->views_checked_at) {
-        // The previous translated draw's bindings still stand: nothing to put on the list.
-        g_draws_translated.fetch_add(1, std::memory_order_relaxed);
-        return true;
+    const uint64_t view_generation = pipeline.reads_views ? g_view_generation.load(std::memory_order_acquire) : 0;
+    if (same_root && !obj->graphics_constants_changed) {
+        bool views_stand = view_generation == obj->views_checked_at;
+        if (!views_stand && obj->bound_view_heap && obj->bound_view_heap == obj->view_heap_records) {
+            // Some descriptor was written since. Only a write to one this binding uses matters:
+            // compare their write counts with what the check saw.
+            g_view_slot_rechecks.fetch_add(1, std::memory_order_relaxed);
+            views_stand = true;
+            for (const auto& [index, seen] : obj->bound_view_slots) {
+                if (obj->bound_view_heap->written[index].load(std::memory_order_acquire) != seen) {
+                    views_stand = false;
+                    break;
+                }
+            }
+            if (views_stand) obj->views_checked_at = view_generation;
+        }
+        if (views_stand) {
+            // The previous translated draw's bindings still stand: nothing to put on the list.
+            g_draws_translated.fetch_add(1, std::memory_order_relaxed);
+            return true;
+        }
     }
+    obj->bound_view_heap.reset();
+    obj->bound_view_slots.clear();
     g_view_bindings_built.fetch_add(1, std::memory_order_relaxed);
     const scarlettx::VictoryComputeBinding* stages[2] = {&pipeline.vs, &pipeline.ps};
     std::vector<uint32_t>* user_data = obj->scratch_user_data;
@@ -1903,10 +1939,14 @@ bool BindTranslatedGraphics(XboxD3D12GraphicsCommandListProxy* obj) {
                 const uint32_t index = static_cast<uint32_t>((table_it->second - start) / increment);
                 // The one view this route maps is a 2D texture read as a shader resource.
                 GuestViewRecord record;
+                uint32_t written = 0;
                 g_views_validated.fetch_add(1, std::memory_order_relaxed);
                 if (obj->view_heap_records) {
                     std::lock_guard<std::mutex> lock(g_view_heaps_mutex);
-                    if (index < obj->view_heap_records->views.size()) record = obj->view_heap_records->views[index];
+                    if (index < obj->view_heap_records->views.size()) {
+                        record = obj->view_heap_records->views[index];
+                        written = obj->view_heap_records->written[index].load(std::memory_order_relaxed);
+                    }
                 }
                 if (record.kind != 2 || record.dimension != D3D12_SRV_DIMENSION_TEXTURE2D) {
                     static const char* const kHolds[] = {"was never written", "holds a constant buffer view",
@@ -1917,6 +1957,9 @@ bool BindTranslatedGraphics(XboxD3D12GraphicsCommandListProxy* obj) {
                                 stage);
                 }
                 user_data[stage][entry.index] = index * 32u;
+                // Remembered with the count read under the lock, together with the record.
+                obj->bound_view_heap = obj->view_heap_records;
+                obj->bound_view_slots.emplace_back(index, written);
                 continue;
             }
             const auto it = obj->graphics_constants.find(entry.slot);
@@ -4118,6 +4161,8 @@ intptr_t SCARLETTX_GDK_CALLBACK ProxyCreateDescriptorHeap(
         record->count = pc_desc.NumDescriptors;
         record->increment = obj->pc_device->GetDescriptorHandleIncrementSize(D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV);
         record->views.resize(pc_desc.NumDescriptors);
+        record->written = std::make_unique<std::atomic<uint32_t>[]>(pc_desc.NumDescriptors);
+        for (UINT i = 0; i < pc_desc.NumDescriptors; ++i) record->written[i].store(0, std::memory_order_relaxed);
         std::lock_guard<std::mutex> lock(g_view_heaps_mutex);
         g_view_heaps_by_cpu[record->cpu_start] = record;
         g_view_heaps[pc_heap] = record;
