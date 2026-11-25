@@ -1623,6 +1623,39 @@ mod tests {
         assert!(matches!(translate_stage_container(&direct_ps.dxil, HwStage::Ps), ComputeInput::Desktop));
     }
 
+    /// How often `name` occurs in a bitcode stream as text, at any bit
+    /// offset: as 8-bit or 7-bit characters, in the six-bit alphabet
+    /// (a-z, A-Z, 0-9, '.', '_') bitcode uses for names, or as the
+    /// variable-width numbers (six-bit chunks) of an unabbreviated record.
+    fn names_in(bytes: &[u8], name: &str) -> usize {
+        let bits: Vec<bool> = bytes.iter().flat_map(|b| (0..8).map(move |k| b >> k & 1 == 1)).collect();
+        let char6 = |c: u8| -> u32 {
+            match c {
+                b'a'..=b'z' => u32::from(c - b'a'),
+                b'A'..=b'Z' => u32::from(c - b'A') + 26,
+                b'0'..=b'9' => u32::from(c - b'0') + 52,
+                b'.' => 62,
+                _ => 63,
+            }
+        };
+        let mut found = 0;
+        for width in [6usize, 7, 8, 12] {
+            let needle: Vec<bool> = name
+                .bytes()
+                .flat_map(|c| {
+                    let v = match width {
+                        6 => char6(c),
+                        12 => (u32::from(c) & 31 | 32) | (u32::from(c) >> 5) << 6,
+                        _ => u32::from(c),
+                    };
+                    (0..width).map(move |k| v >> k & 1 == 1)
+                })
+                .collect();
+            found += bits.windows(needle.len()).filter(|w| *w == &needle[..]).count();
+        }
+        found
+    }
+
     #[test]
     fn the_quad_read_fixture_parses_back_and_translates() {
         for (variant, native, stage) in [
@@ -1638,7 +1671,14 @@ mod tests {
                     // Neither stage reads user data or binds anything.
                     assert_eq!(shader.user_data_dwords(), 0, "variant {variant}: {:?}", shader.user_data);
                     assert!(!shader.memory && !shader.heap, "variant {variant}");
-                    eprintln!("variant {variant}: {} bytes of DXIL", shader.dxil.len());
+                    // Which operation reads the other lanes (it changed with VIctory 4015a18).
+                    let (quad, wave) = (names_in(&shader.dxil, "quadReadLaneAt"), names_in(&shader.dxil, "waveReadLaneAt"));
+                    eprintln!(
+                        "variant {variant}: {} bytes of DXIL, names quadReadLaneAt {quad} waveReadLaneAt {wave}",
+                        shader.dxil.len()
+                    );
+                    // The pixel program reads other lanes, one way or the other.
+                    assert_eq!(quad + wave > 0, variant == 16, "variant {variant}");
                 }
                 ComputeInput::Refused(text) => panic!("variant {variant} refused: {text}"),
                 ComputeInput::Malformed(text) => panic!("variant {variant} malformed: {text}"),
