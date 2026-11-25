@@ -62,14 +62,22 @@ One discarded launch per pipeline comes first, so the host's on-disk shader cach
 
 ## Correctness (outside the timed loop; a wrong result is a non-zero exit)
 
-- After the drain, the render target of every in-flight slot is read back and compared, pixel for pixel, with a
-  picture computed on the CPU for the frame that slot last held: the last frames of the timed loop itself.
-- `--check-frames` (2) more frames run through the same code, pipelined, each copied to its own read-back
-  buffer, and are compared the same way. In `upload` every frame's textures carry 16 texels that belong to that
+- `--check-frames` (2) more frames run through the same code straight after the timed loop, pipelined, in slots
+  of their own, each copied to a read-back buffer, and are compared, pixel for pixel, with a picture computed on
+  the CPU for that frame.
+- Then the render target of every in-flight slot is read back and compared the same way with the frame that
+  slot last held: the last frames of the timed loop itself. In `upload` every frame's textures carry 16 texels that belong to that
   frame alone, so a frame drawn with an earlier update does not compare equal.
 - `draws` adds a frame with a table change per draw over 16 textures that differ, to show that a per-draw
   binding reaches its draw.
 - Every fence value signalled must have completed, and the device must not be removed.
+
+The checked frames come before any other submission on purpose. On the windowed path the shim looks for writes
+to texture memory (the `guestmem` route) once per presented frame, at the first `ExecuteCommandLists` after a
+`PresentX`. A title that submits one command list, then writes texture memory, then submits another in the same
+frame gets the old texels in that second submission and the new ones a frame later. An earlier revision of this
+benchmark submitted a read-back in between and saw exactly that (19,456 of 1,048,576 pixels exact in the frame
+that followed).
 
 Exit codes: 0 pass, 1 a read-back was not exact or a fence did not complete, 2 a call failed, 3 no device,
 5 shader source not available, 64 usage.

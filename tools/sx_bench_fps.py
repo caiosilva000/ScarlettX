@@ -408,11 +408,14 @@ def analyse_captures(out: Path, shots, keep):
             rec["frames_advanced_on_screen"] = timed[-1]["decoded_frame"] - timed[0]["decoded_frame"]
             rec["seconds_between_first_and_last_capture"] = round(span_s, 3)
             rec["on_screen_frames_per_second"] = round(rec["frames_advanced_on_screen"] / span_s, 2) if span_s > 0 else None
-            # How far the picture on screen is behind the newest PresentX call when the capture starts and ends.
-            rec["frames_behind_at_capture_start"] = sorted(
-                r["last_presented_before_capture"] - r["decoded_frame"] for r in timed)
-            rec["frames_ahead_of_capture_start"] = sum(
-                1 for r in timed if r["decoded_frame"] > r["last_presented_by_capture_end"])
+            # A capture takes tens to hundreds of milliseconds. Its picture is consistent with the
+            # benchmark's log when the frame it shows was the newest presented at some point between
+            # the capture's start and its end.
+            rec["captures_in_timed_loop"] = len(timed)
+            rec["consistent_with_present_log"] = sum(
+                1 for r in timed if r["last_presented_before_capture"] - 1 <= r["decoded_frame"] <= r["last_presented_by_capture_end"])
+            rec["frames_past_capture_start"] = sorted(
+                r["decoded_frame"] - r["last_presented_before_capture"] for r in timed)
         per_launch[n] = rec
     return per_launch
 

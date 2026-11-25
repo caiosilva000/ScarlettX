@@ -1010,7 +1010,10 @@ int main(int argc, char** argv) {
     heap_desc.Flags = D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE;
     hr = Call(b.dev, kDevCreateDescriptorHeap, P(&heap_desc), uintptr_t{0}, P(&b.srv_heap));
     if (hr != 0 || !b.srv_heap) return Fail("shim CreateDescriptorHeap(CBV_SRV_UAV) (slot 14)", hr);
-    const uint32_t rt_count = a.inflight;
+    // Checked frames get slots of their own, after the in-flight ones, so they can run straight
+    // after the timed loop without overwriting what the loop left in its render targets.
+    const uint32_t check_slots = std::min<uint32_t>(a.check_frames, 8) + (a.mode == "draws" ? 1 : 0);
+    const uint32_t rt_count = a.inflight + check_slots;
     heap_desc.Type = D3D12_DESCRIPTOR_HEAP_TYPE_RTV;
     heap_desc.NumDescriptors = rt_count;
     heap_desc.Flags = D3D12_DESCRIPTOR_HEAP_FLAG_NONE;
@@ -1119,8 +1122,8 @@ int main(int argc, char** argv) {
     if (hr != 0) return Fail("shim CreateCommandAllocator/CreateCommandList (slots 9, 12)", hr);
 
     const uint64_t readback_bytes = static_cast<uint64_t>(b.rt_pitch) * b.rt_h;
-    b.slots.resize(a.inflight);
-    for (uint32_t i = 0; i < a.inflight; ++i) {
+    b.slots.resize(rt_count);
+    for (uint32_t i = 0; i < rt_count; ++i) {
         Slot& s = b.slots[i];
         hr = make_list(&s.alloc, &s.list);
         if (hr != 0) return Fail("shim CreateCommandAllocator/CreateCommandList (slots 9, 12)", hr);
@@ -1250,8 +1253,8 @@ int main(int argc, char** argv) {
 
     // ---- one frame of the loop ---------------------------------------------------------------
     uint64_t plane[8] = {};
-    auto run_frame = [&](uint32_t frame, bool probe, void* readback, FrameSample& s) {
-        Slot& slot = b.slots[frame % a.inflight];
+    auto run_frame = [&](uint32_t frame, bool probe, void* readback, FrameSample& s, Slot* check_slot = nullptr) {
+        Slot& slot = check_slot ? *check_slot : b.slots[frame % a.inflight];
         const int64_t t0 = Ticks();
         if (slot.used) b.WaitFor(slot.fence_value);  // recycle: this slot's previous frame must be done
         const int64_t t1 = Ticks();
@@ -1317,41 +1320,37 @@ int main(int argc, char** argv) {
     // ---- checks, outside the timed loop ------------------------------------------------------
     uint64_t checked = 0, exact = 0;
     const uint64_t pixels = static_cast<uint64_t>(b.rt_w) * b.rt_h;
-    // 1. What the timed loop left in each slot's render target.
-    b.PlumbBegin();
-    for (Slot& s : b.slots) b.RecordReadback(b.plumb_list, s.rt, s.readback);
-    b.PlumbRun();
-    for (Slot& s : b.slots) {
-        exact += b.Compare(s.readback, s.last_frame, false, "timed-loop tail");
-        checked += pixels;
-    }
-    // 2. Further frames through the same code, pipelined, each copied to its own buffer.
+    // 1. Further frames through the same code, pipelined, each copied to its own buffer. They come
+    //    first: on the windowed path the shim looks for texture-memory writes at the first
+    //    submission after a PresentX only, and a read-back submitted in between would use that up.
     uint32_t next = base + a.frames;
     const uint32_t extra = std::min<uint32_t>(a.check_frames, 8);
-    std::vector<void*> check_buffers;
-    std::vector<uint32_t> check_frame_ids;
     for (uint32_t i = 0; i < extra; ++i) {
-        void* buffer = b.CreateBuffer(D3D12_HEAP_TYPE_READBACK, readback_bytes);
+        Slot& slot = b.slots[a.inflight + i];
         FrameSample s{};
-        run_frame(next, false, buffer, s);
-        check_buffers.push_back(buffer);
-        check_frame_ids.push_back(next++);
+        run_frame(next++, false, slot.readback, s, &slot);
     }
-    b.WaitFor(b.fence_value);
-    for (uint32_t i = 0; i < extra; ++i) {
-        exact += b.Compare(check_buffers[i], check_frame_ids[i], false, "checked frame");
-        checked += pixels;
-    }
-    // 3. Draws mode: a frame with a table change per draw over textures that differ, to show
+    // 2. Draws mode: a frame with a table change per draw over textures that differ, to show
     //    that the per-draw binding reaches the draw.
     if (a.mode == "draws") {
-        void* buffer = b.CreateBuffer(D3D12_HEAP_TYPE_READBACK, readback_bytes);
+        Slot& slot = b.slots[a.inflight + extra];
         FrameSample s{};
-        run_frame(next, true, buffer, s);
-        b.WaitFor(b.fence_value);
-        exact += b.Compare(buffer, next, true, "binding probe (distinct textures)");
+        run_frame(next++, true, slot.readback, s, &slot);
+    }
+    b.WaitFor(b.fence_value);
+    for (uint32_t i = 0; i < check_slots; ++i) {
+        const Slot& slot = b.slots[a.inflight + i];
+        const bool probe = a.mode == "draws" && i == extra;
+        exact += b.Compare(slot.readback, slot.last_frame, probe, probe ? "binding probe (distinct textures)" : "checked frame");
         checked += pixels;
-        ++next;
+    }
+    // 3. What the timed loop left in each in-flight slot's render target.
+    b.PlumbBegin();
+    for (uint32_t i = 0; i < a.inflight; ++i) b.RecordReadback(b.plumb_list, b.slots[i].rt, b.slots[i].readback);
+    b.PlumbRun();
+    for (uint32_t i = 0; i < a.inflight; ++i) {
+        exact += b.Compare(b.slots[i].readback, b.slots[i].last_frame, false, "timed-loop tail");
+        checked += pixels;
     }
     const uint64_t final_signaled = b.fence_value;
     const uint64_t final_completed = b.Completed();
