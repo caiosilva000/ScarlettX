@@ -1,7 +1,7 @@
 name: M4 feasibility - GDK sample build (PC target)
 
-# Builds Microsoft's MIT-licensed SimpleTriangleDesktop GDK sample (PC x64 target) on a Windows
-# runner, as an unencrypted non-synthetic input for ScarlettX boot diagnostics. The GDK comes
+# Builds a few of Microsoft's MIT-licensed GDK samples (PC x64 target) on a Windows runner, as
+# unencrypted non-synthetic inputs for ScarlettX boot diagnostics. The GDK comes
 # from the public Microsoft.GDK.Core / Microsoft.GDK.Windows NuGet packages. No ScarlettX code
 # is built here. Runs only for the m4/gdk-sample-build branch or by hand.
 on:
@@ -12,12 +12,25 @@ on:
 env:
   SAMPLES_REF: b1e77b6ac10f95b07296025fda171ca2ddc42dbe
   GDK_VERSION: 2610.0.9661
-  SAMPLE_DIR: Samples\IntroGraphics\SimpleTriangleDesktop
 
 jobs:
   build:
     runs-on: windows-latest
-    timeout-minutes: 40
+    timeout-minutes: 75
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { name: SimpleTriangleDesktop, group: IntroGraphics }
+          - { name: AsynchronousProgramming, group: System }
+          - { name: GameSaveCombo, group: System }
+          - { name: SimpleUserModel, group: System }
+          - { name: Gamepad, group: System }
+          - { name: SimpleDirectStorageCombo, group: System }
+    name: ${{ matrix.name }}
+    env:
+      SAMPLE: ${{ matrix.name }}
+      SAMPLE_DIR: Samples\${{ matrix.group }}\${{ matrix.name }}
     steps:
       - name: Check out the samples (sparse)
         shell: pwsh
@@ -26,7 +39,7 @@ jobs:
           cd s
           git remote add origin https://github.com/microsoft/Xbox-GDK-Samples.git
           git sparse-checkout init --no-cone
-          git sparse-checkout set /LICENSE /Samples/NuGet.config /Samples/Directory.Build.props /Samples/Directory.Build.targets /Samples/IntroGraphics/SimpleTriangleDesktop/ /Kits/DirectXTK12/ /Kits/ATGTK/ /Kits/ATGTelemetry/
+          git sparse-checkout set /LICENSE /Samples/NuGet.config /Samples/Directory.Build.props /Samples/Directory.Build.targets "/Samples/${{ matrix.group }}/${{ matrix.name }}/" /Kits/DirectXTK12/ /Kits/ATGTK/ /Kits/ATGTelemetry/ /Kits/UITK/ /Kits/OpenSource/ /Kits/LiveTK/ /Kits/PlayFabGDK/ /Media/Fonts/ /Media/Textures/
           git fetch -q --depth 1 --filter=blob:none origin $env:SAMPLES_REF
           git checkout -q FETCH_HEAD
           git rev-parse HEAD
@@ -62,12 +75,14 @@ jobs:
         run: |
           $d = "s\$env:SAMPLE_DIR"
           $main = Get-Content "$d\Main.cpp" -Raw
-          if ($main -notmatch 'ATG::SendLaunchTelemetry\(\);') { throw "telemetry call not found" }
-          Set-Content "$d\Main.cpp" ($main -replace 'ATG::SendLaunchTelemetry\(\);', '// telemetry call removed (opt-out, see the samples README)') -NoNewline
-          $proj = Get-Content "$d\SimpleTriangleDesktop.vcxproj" -Raw
-          if ($env:HAVE_MAKEPKG -ne 'True') { $proj = $proj -replace '(?m)^makepkg\.exe localize.*?(?=</Command>)', ''; "makepkg localize step removed (makepkg.exe not in the NuGet packages)" | Tee-Object out\adaptations.txt }
+          New-Item -ItemType File -Force out\adaptations.txt | Out-Null
+          if ($main -match 'ATG::SendLaunchTelemetry\(\);') {
+            Set-Content "$d\Main.cpp" ($main -replace 'ATG::SendLaunchTelemetry\(\);', '// telemetry call removed (opt-out, see the samples README)') -NoNewline
+          } else { "WARNING: telemetry call not found in Main.cpp, left as is" | Tee-Object -Append out\adaptations.txt }
+          $proj = Get-Content "$d\$env:SAMPLE.vcxproj" -Raw
+          if ($env:HAVE_MAKEPKG -ne 'True') { $proj = $proj -replace '(?m)^makepkg\.exe localize.*?(?=</Command>)', ''; "makepkg localize step removed (makepkg.exe not in the NuGet packages)" | Tee-Object -Append out\adaptations.txt }
           if ($env:HAVE_BIN -ne 'True') { $proj = $proj -replace '(?m)^\s*<ReferenceCopyLocalPaths Include="\$\(GDKCrossPlatformPath\)windows\\bin\\x64\\[^"]+" />\r?\n', ''; "x64 runtime DLL copy removed (DLLs not in the NuGet packages)" | Tee-Object -Append out\adaptations.txt }
-          Set-Content "$d\SimpleTriangleDesktop.vcxproj" $proj -NoNewline
+          Set-Content "$d\$env:SAMPLE.vcxproj" $proj -NoNewline
           git -C s diff --stat | Tee-Object out\source-diff-stat.txt
           git -C s diff > out\source.diff
 
@@ -75,33 +90,34 @@ jobs:
         shell: pwsh
         run: |
           $d = "s\$env:SAMPLE_DIR"
-          nuget restore "$d\packages.config" -PackagesDirectory s\Samples\packages -NonInteractive | Tee-Object out\nuget-restore.log
-          msbuild "$d\SimpleTriangleDesktop.vcxproj" /m /p:Configuration=Release /p:Platform=x64 "/p:GameDK=$env:GDKROOT" "/p:GDKCrossPlatformPath=$env:GDKROOT" /p:PlatformToolset=v143 /v:minimal /fl "/flp:logfile=out\msbuild.log;verbosity=normal"
+          if (Test-Path "$d\packages.config") { nuget restore "$d\packages.config" -PackagesDirectory s\Samples\packages -NonInteractive | Tee-Object out\nuget-restore.log }
+          msbuild "$d\$env:SAMPLE.vcxproj" /m /p:Configuration=Release /p:Platform=x64 "/p:GameDK=$env:GDKROOT" "/p:GDKCrossPlatformPath=$env:GDKROOT" /p:PlatformToolset=v143 /v:minimal /fl "/flp:logfile=out\msbuild.log;verbosity=normal"
           if ($LASTEXITCODE -ne 0) { throw "msbuild failed with $LASTEXITCODE" }
 
       - name: Package
         if: always()
         shell: pwsh
         run: |
-          $exe = Get-ChildItem s -Recurse -Filter SimpleTriangleDesktop.exe | Select-Object -First 1
+          $exe = Get-ChildItem "s\$env:SAMPLE_DIR" -Recurse -Filter "$env:SAMPLE.exe" | Select-Object -First 1
           if ($exe) {
-            $pkg = 'out\SimpleTriangleDesktop'
+            $pkg = "out\$env:SAMPLE"
             Copy-Item $exe.DirectoryName $pkg -Recurse
             Get-ChildItem $pkg -Recurse -Include *.pdb,*.ilk,*.iobj,*.ipdb,*.lib,*.exp | Remove-Item -Force
             Copy-Item s\LICENSE "$pkg\LICENSE-Xbox-GDK-Samples.txt"
             $vs = & "${env:ProgramFiles(x86)}\Microsoft Visual Studio\Installer\vswhere.exe" -latest -property installationPath
             $dumpbin = Get-ChildItem "$vs\VC\Tools\MSVC" -Recurse -Filter dumpbin.exe | Where-Object { $_.FullName -match 'Hostx64\\x64' } | Select-Object -First 1
-            & $dumpbin.FullName /headers /imports "$pkg\SimpleTriangleDesktop.exe" > out\dumpbin.txt
+            & $dumpbin.FullName /headers /imports "$pkg\$env:SAMPLE.exe" | Out-File -Encoding utf8 out\dumpbin.txt
             Get-ChildItem $pkg -Recurse -File | ForEach-Object { "$((Get-FileHash $_.FullName -Algorithm SHA256).Hash.ToLower())  $($_.FullName.Substring((Resolve-Path $pkg).Path.Length + 1).Replace('\','/'))" } | Set-Content out\package-sha256.txt
-            tar -czf out\SimpleTriangleDesktop-pc-x64.tar.gz -C out SimpleTriangleDesktop
-            (Get-FileHash out\SimpleTriangleDesktop-pc-x64.tar.gz -Algorithm SHA256).Hash.ToLower() | Set-Content out\archive-sha256.txt
+            tar -czf "out\$env:SAMPLE-pc-x64.tar.gz" -C out $env:SAMPLE
+            (Get-FileHash "out\$env:SAMPLE-pc-x64.tar.gz" -Algorithm SHA256).Hash.ToLower() | Set-Content out\archive-sha256.txt
             Remove-Item $pkg -Recurse -Force
           }
-          "samples=$env:SAMPLES_REF gdk=$env:GDK_VERSION" | Set-Content out\build-info.txt
+          Select-String -Path out\msbuild.log -Pattern ': (fatal )?error ' | Select-Object -First 40 | ForEach-Object { $_.Line } | Set-Content out\build-errors.txt
+          "sample=$env:SAMPLE samples=$env:SAMPLES_REF gdk=$env:GDK_VERSION" | Set-Content out\build-info.txt
           msbuild -version | Add-Content out\build-info.txt
 
       - uses: actions/upload-artifact@v4
         if: always()
         with:
-          name: gdk-sample-simpletriangledesktop
+          name: gdk-sample-${{ matrix.name }}
           path: out
