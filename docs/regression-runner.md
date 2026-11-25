@@ -11,7 +11,8 @@ tools/sx_regress.py regress --build <build> --inventory <ctest --show-only=json-
 
 # bounded, traced boot of one package; the package is never written to
 tools/sx_regress.py boot-diag --build <build> --package <package dir> --out <dir> \
-    [--in-process] [--windowed] [--frames N] [--trace] [--rt-dump] [--raster-dump] [--confirm-user-package]
+    [--in-process] [--windowed] [--frames N] [--trace] [--rt-dump] [--raster-dump] [--confirm-user-package] \
+    [--allow-pc-target] [--until-window SECONDS]
 ```
 
 `regress`
@@ -31,6 +32,17 @@ tools/sx_regress.py boot-diag --build <build> --package <package dir> --out <dir
 - The boot uses a copy-on-write clone of the package inside `--out` (APFS, same volume); the original is
   compared (size and modification time of every file) before and after. Saves go to `--out/saves`.
 - A package that is not one of the build's synthetic packages needs `--confirm-user-package`.
+- With `--windowed` the runner captures the largest window owned by the emulator or the guest, whatever its
+  title, about once a second, and adds two stages from those captures: `guest_window_visible` and
+  `guest_window_content` (at least 1% of the client area differs from the most common colour). A boot that
+  times out says which of the three it saw: content, a blank window, or no window.
+- `--allow-pc-target` passes the emulator's flag of the same name, for GDK packages built for PC
+  (`TargetDeviceFamily="PC"`, for example Microsoft's desktop GDK samples). Such a title draws through the
+  desktop `d3d12.dll`, not the `d3d12_xs` shim, so it logs no frames and `--frames` never ends it.
+- `--until-window SECONDS` is the end condition for those titles: once the guest window has shown content for
+  that long the runner ends the boot and reports PASS. It is BLOCKED without working window capture. A still
+  picture cannot prove the guest is not stuck after drawing it; `guest_window.picture_changed` records whether
+  the captures differed.
 
 ## Building locally on a Mac (`tools/macos_cross_build.sh`)
 

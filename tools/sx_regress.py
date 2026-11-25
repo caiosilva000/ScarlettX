@@ -129,7 +129,7 @@ class Host:
 
 
 def run_logged(host: Host, exe: Path, args, env_extra: dict, cwd: Path, out_dir: Path, name: str, timeout: int,
-               while_running=None) -> dict:
+               while_running=None, stop_when=None) -> dict:
     """Runs one executable with a timeout; stdout and stderr go to <name>.stdout / <name>.stderr."""
     out_dir.mkdir(parents=True, exist_ok=True)
     env = dict(os.environ)
@@ -141,7 +141,14 @@ def run_logged(host: Host, exe: Path, args, env_extra: dict, cwd: Path, out_dir:
     with open(so_path, "wb") as so, open(se_path, "wb") as se:
         proc = subprocess.Popen(cmd, cwd=str(cwd), env=env, stdout=so, stderr=se)
         timed_out = False
+        stopped = False
         while proc.poll() is None:
+            if stop_when and stop_when():
+                stopped = True
+                proc.kill()
+                proc.wait()
+                host.cleanup_after_timeout(exe.name)
+                break
             if time.time() - start > timeout:
                 timed_out = True
                 proc.kill()
@@ -157,8 +164,9 @@ def run_logged(host: Host, exe: Path, args, env_extra: dict, cwd: Path, out_dir:
     return {
         "command": [exe.name] + list(args),
         "environment": env_extra,
-        "exit_code": None if timed_out else proc.returncode,
+        "exit_code": None if (timed_out or stopped) else proc.returncode,
         "timed_out": timed_out,
+        "stopped_by_runner": stopped,
         "seconds": round(time.time() - start, 1),
         "stdout_log": str(so_path),
         "stderr_log": str(se_path),
@@ -230,6 +238,72 @@ class WindowCapture:
             self.windows.append({"t_ms": t0, "window_id": int(wid), "owner": owner, "bounds": bounds,
                                  "onscreen": onscreen})
         time.sleep(0.25)
+
+
+    def grab_guest(self, into: Path, owners, min_interval: float = 1.0):
+        """One capture of the largest window owned by the emulator or the guest, whatever its title.
+
+        A title that does not present through the d3d12_xs shim (a PC-target package using the desktop
+        d3d12.dll) logs no frames, so its own window is the only sign that it is rendering."""
+        now = time.time()
+        if now - getattr(self, "_last_guest", 0.0) < min_interval:
+            time.sleep(0.05)
+            return
+        self._last_guest = now
+        best = None
+        for line in subprocess.run([str(self.helper)], capture_output=True, text=True).stdout.splitlines():
+            parts = line.split("\t")
+            if len(parts) != 5 or parts[1].lower() not in owners:
+                continue
+            try:
+                w, h = (float(v) for v in parts[3].split(",")[2:])
+            except ValueError:
+                continue
+            if w < 200 or h < 100:      # menu-bar strips and other helper windows
+                continue
+            if best is None or w * h > best[0]:
+                best = (w * h, parts, w, h)
+        if best is None:
+            return
+        _area, (wid, owner, title, bounds, onscreen), w, _h = best
+        into.mkdir(parents=True, exist_ok=True)
+        t0 = int(now * 1000)
+        path = into / f"{t0}.png"
+        subprocess.run(["screencapture", "-x", "-o", "-l", wid, "-t", "png", str(path)], capture_output=True,
+                       check=False)
+        entry = {"t_ms": t0, "window_id": int(wid), "owner": owner, "title": title, "bounds": bounds,
+                 "onscreen": onscreen, "captured": path.exists(), "content_fraction": None, "digest": None}
+        if path.exists():
+            self.shots.append((t0, int(time.time() * 1000), path))
+            entry["content_fraction"], entry["digest"] = window_content(path, w)
+        self.windows.append(entry)
+
+
+CONTENT_MIN_FRACTION = 0.01
+
+
+def window_content(path: Path, window_points_wide: float):
+    """(share of client-area pixels that differ from the most common colour, digest of the client area).
+
+    A blank or single-colour window gives 0. The title bar is cut off first. None when Pillow is missing."""
+    try:
+        from PIL import Image
+    except ImportError:
+        return None, None
+    try:
+        img = Image.open(path).convert("RGB")
+    except OSError:
+        return None, None
+    scale = img.width / window_points_wide if window_points_wide else 1.0
+    top = min(int(34 * scale), img.height // 4)
+    client = img.crop((0, top, img.width, img.height))
+    small = client.resize((256, max(1, round(256 * client.height / client.width))), Image.NEAREST)
+    buckets = {}
+    for r, g, b in small.getdata():
+        key = (r >> 4, g >> 4, b >> 4)
+        buckets[key] = buckets.get(key, 0) + 1
+    total = small.width * small.height
+    return round(1 - max(buckets.values()) / total, 4), hashlib.sha256(small.tobytes()).hexdigest()[:16]
 
 
 def colour_regions(path: Path, colours: dict, tolerance: int = 72):
@@ -530,6 +604,8 @@ BOOT_STAGES = [
     ("d3d12_device_created", re.compile(r"\[ScarlettX\]\[d3d12\] Adapter: .+ \((hardware|WARP/software)\)")),
     ("swap_chain_created", re.compile(r"\[ScarlettX\]\[d3d12_xs\] SwapChain created")),
     ("first_frame", re.compile(r"\bFrame \d+\b|\[ScarlettX\]\[d3d12_xs\] Dumped frame to")),
+    ("guest_window_visible", None),     # from window captures, not from the log
+    ("guest_window_content", None),
     ("guest_exited_cleanly", re.compile(r"\[boot\] Guest exited cleanly\.")),
 ]
 GRAPHICS_FAIL_RE = re.compile(
@@ -541,6 +617,32 @@ STUB_HIT_RE = re.compile(r"\[ScarlettX\]\[STUB\] (\S+) \(hit #1\)")
 WINE_UNIMPL_RE = re.compile(r"unimplemented function (\S+)")
 LOADER_ERR_RE = re.compile(r"(?i)\[(boot|inspect)\] Error: .*|could not load|cannot find|not found.*\.dll|error 126|"
                            r"Library .* not found|import .* (unresolved|missing)")
+
+
+def content_span(windows):
+    """Seconds between the first and the latest capture that showed content; None before the first one."""
+    shown = [w["t_ms"] for w in windows if (w.get("content_fraction") or 0) >= CONTENT_MIN_FRACTION]
+    return round((shown[-1] - shown[0]) / 1000, 1) if shown else None
+
+
+def summarise_guest_window(windows, boot_seconds) -> dict:
+    captured = [w for w in windows if w.get("captured")]
+    shown = [w for w in captured if (w.get("content_fraction") or 0) >= CONTENT_MIN_FRACTION]
+    last = captured[-1] if captured else (windows[-1] if windows else None)
+    return {
+        "captures": len(captured),
+        "seen_without_capture": len(windows) - len(captured),
+        "title": last["title"] if last else None,
+        "owner": last["owner"] if last else None,
+        "bounds": last["bounds"] if last else None,
+        "content_fraction": shown[-1]["content_fraction"] if shown else (last or {}).get("content_fraction"),
+        "content_seconds": content_span(windows),
+        "picture_changed": len({w["digest"] for w in shown}) > 1 if shown else None,
+        "note": "content = share of client-area pixels differing from the most common colour, at least "
+                f"{CONTENT_MIN_FRACTION:.0%}. A still picture cannot prove the guest is not stuck after drawing it; "
+                "picture_changed says whether captures differed.",
+        "boot_seconds": boot_seconds,
+    }
 
 
 def manifest(root: Path) -> dict:
@@ -665,6 +767,8 @@ def cmd_boot_diag(args) -> int:
             boot_args += ["--rt-dump", host.win_path(out / "frames" / "rt_dump.ppm")]
         if args.raster_dump:
             boot_args += ["--raster-dump", host.win_path(out / "frames" / "raster_dump.ppm")]
+        if args.allow_pc_target:
+            boot_args.append("--allow-pc-target")
         boot_args += args.extra_arg
         cap = None
         if args.windowed:
@@ -672,15 +776,43 @@ def cmd_boot_diag(args) -> int:
             if cap.blocked:
                 diag["window_capture"] = "BLOCKED: " + cap.blocked
                 cap = None
-        b = run_logged(host, exe, boot_args, env, build, logs, "boot", args.timeout,
-                       while_running=(lambda: cap.grab(out / "window-captures")) if cap else None)
+        owners = {exe.name.lower()}
+        if inspect["executable"]:
+            owners.add(re.split(r"[\\/]", inspect["executable"].split(" (PE64")[0])[-1].lower())
+
+        def content_held() -> bool:
+            held = content_span(cap.windows)
+            return held is not None and held >= args.until_window
+
+        if args.until_window is not None and not cap:
+            if view and not args.keep_view:
+                shutil.rmtree(view, ignore_errors=True)
+            return finish(BLOCKED, "--until-window needs --windowed and working window capture: "
+                          + str(diag.get("window_capture", "--windowed was not given")))
+        # A sleeping display makes every window capture fail, so keep it awake while the boot runs.
+        awake = None
+        if cap and shutil.which("caffeinate"):
+            awake = subprocess.Popen(["caffeinate", "-d", "-u"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        try:
+            b = run_logged(host, exe, boot_args, env, build, logs, "boot", args.timeout,
+                           while_running=(lambda: cap.grab_guest(out / "window-captures", owners)) if cap else None,
+                           stop_when=content_held if (cap and args.until_window is not None) else None)
+        finally:
+            if awake:
+                awake.terminate()
         diag["boot"] = strip_logs(b)
         all_out += b["stdout"]
         all_err += b["stderr"]
         combined = b["stdout"] + "\n" + b["stderr"]
         for stage, regex in BOOT_STAGES[1:]:
-            if regex.search(combined):
+            if regex and regex.search(combined):
                 reached.append(stage)
+        if cap:
+            diag["guest_window"] = summarise_guest_window(cap.windows, b["seconds"])
+            if diag["guest_window"]["captures"]:
+                reached.append("guest_window_visible")
+            if diag["guest_window"]["content_seconds"] is not None:
+                reached.append("guest_window_content")
         diag["adapters"] = adapters_in(b["stderr"])
         diag["window_captures"] = [str(p) for _a, _b, p in cap.shots] if cap else []
     diag["stages_reached"] = reached
@@ -732,8 +864,25 @@ def cmd_boot_diag(args) -> int:
     boot = diag.get("boot")
     if not boot:
         return finish(FAIL, "inspection failed: " + str(diag["first_error"]))
+    gw = diag.get("guest_window")
+    if boot.get("stopped_by_runner"):
+        return finish(PASS, f"guest window '{gw['title']}' showed rendered content for {gw['content_seconds']} s; "
+                            f"the runner ended the boot (--until-window {args.until_window:g})")
     if boot["timed_out"]:
-        return finish(FAIL, f"boot did not end within {args.timeout} s (last stage: {diag['last_stage']})")
+        if gw is None:
+            seen = "window capture was off, so a hang and a running guest cannot be told apart"
+        elif gw["content_seconds"] is not None:
+            seen = (f"a guest window '{gw['title']}' with rendered content was up for {gw['content_seconds']} s, "
+                    "so the guest was running, not stopped before its first picture")
+        elif gw["captures"]:
+            seen = f"a guest window '{gw['title']}' was up but stayed blank"
+        elif gw["seen_without_capture"]:
+            return finish(BLOCKED, f"boot did not end within {args.timeout} s (last stage: {diag['last_stage']}); "
+                                   f"a guest window '{gw['title']}' was listed but could not be captured "
+                                   "(display asleep or screen locked?), so rendering could not be judged")
+        else:
+            seen = "no guest window appeared"
+        return finish(FAIL, f"boot did not end within {args.timeout} s (last stage: {diag['last_stage']}); {seen}")
     if boot["exit_code"] != 0:
         return finish(FAIL, f"boot exited with {boot['exit_code']} (last stage: {diag['last_stage']})")
     return finish(PASS, f"boot ended cleanly after --frames {args.frames}")
@@ -771,6 +920,11 @@ def main() -> int:
     b.add_argument("--stats", action="store_true")
     b.add_argument("--rt-dump", action="store_true", help="ask the emulator for a ray-traced frame dump in --out/frames")
     b.add_argument("--raster-dump", action="store_true", help="ask the emulator for a raster frame dump in --out/frames")
+    b.add_argument("--allow-pc-target", action="store_true",
+                   help="also boot a GDK package built for PC (it bypasses the d3d12_xs shim: use --until-window)")
+    b.add_argument("--until-window", type=float, default=None, metavar="SECONDS",
+                   help="end the boot as PASS once the guest's own window has shown rendered content this long "
+                        "(for titles that log no frames; needs --windowed)")
     b.add_argument("--extra-arg", action="append", default=[], help="extra scarlettx boot argument (repeatable)")
     b.add_argument("--dump-frames-at", default="1,2,5,30,90", help="PresentX frame numbers the shim dumps")
     b.add_argument("--clone", choices=["auto", "require", "never"], default="auto",
