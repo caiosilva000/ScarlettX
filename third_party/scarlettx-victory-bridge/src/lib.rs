@@ -1024,6 +1024,107 @@ fn synthetic_pixel_program() -> NativeProgram {
     }
 }
 
+const V_SUB_F32: u8 = 0x04;
+/// `SPI_PS_INPUT_ADDR` bits: the pixel position's x and y, as floats, in the first VGPRs.
+const PS_ADDR_POS_X: u32 = 1 << 8;
+const PS_ADDR_POS_Y: u32 = 1 << 9;
+
+/// VOP1 `v_mov_b32 vdst, vsrc quad_perm:[p0,p1,p2,p3] bound_ctrl:1` (DPP):
+/// lane l of each quad takes `vsrc` of lane `p[l]` of the same quad.
+const fn dpp_quad_mov(vdst: u8, vsrc: u8, perm: [u8; 4]) -> [u32; 2] {
+    let ctrl = perm[0] as u32 | (perm[1] as u32) << 2 | (perm[2] as u32) << 4 | (perm[3] as u32) << 6;
+    [vop1(V_MOV_B32, vdst, 0xFA), 0xFF08_0000 | ctrl << 8 | vsrc as u32]
+}
+
+/// The triangle of the quad-read fixture, in pixels of a 64 by 64 target
+/// (x right, y down): (3.25, 3.25), (59.25, 6.25), (11.25, 60.25). All three
+/// edges are diagonal and cross pixel quads, and no pixel centre lies on one.
+pub const EDGE_TRIANGLE_QUARTER_PIXELS: [[i32; 2]; 3] = [[13, 13], [237, 25], [45, 241]];
+
+/// A vertex program without attributes: vertex n of that triangle, from the
+/// vertex id in v0. With a = n & 1 and b = n & 2 as floats,
+/// x = -0.8984375 + 1.75 a + 0.125 b and y = 0.8984375 - 0.09375 a - 0.890625 b
+/// (every step exact in single precision), z = 0, w = 1.
+fn synthetic_edge_vertex_program() -> NativeProgram {
+    let lit = |f: f32| f.to_bits();
+    let mut w = vec![
+        vop2(V_AND_B32, 1, int(1), 0),   // v1 = id & 1
+        vop2(V_AND_B32, 2, int(2), 0),   // v2 = id & 2
+        vop1(V_CVT_F32_U32, 1, vgpr(1)), // to float
+        vop1(V_CVT_F32_U32, 2, vgpr(2)),
+        vop2(V_MUL_F32, 3, LITERAL, 1),
+        lit(1.75), // v3 = 1.75 a
+        vop2(V_MUL_F32, 4, LITERAL, 2),
+        lit(0.125), // v4 = 0.125 b
+        vop2(V_ADD_F32, 3, vgpr(3), 4),
+        vop2(V_ADD_F32, 3, LITERAL, 3),
+        lit(-0.898_437_5), // x
+        vop2(V_MUL_F32, 5, LITERAL, 1),
+        lit(-0.093_75), // v5 = -0.09375 a
+        vop2(V_MUL_F32, 6, LITERAL, 2),
+        lit(-0.890_625), // v6 = -0.890625 b
+        vop2(V_ADD_F32, 5, vgpr(5), 6),
+        vop2(V_ADD_F32, 5, LITERAL, 5),
+        lit(0.898_437_5),           // y
+        vop1(V_MOV_B32, 7, int(0)), // z = 0
+        vop1(V_MOV_B32, 8, F_ONE),  // w = 1
+    ];
+    w.extend_from_slice(&exp(EXP_POS0, [3, 5, 7, 8], false));
+    w.push(S_ENDPGM);
+    NativeProgram {
+        stage: HwStage::Vs,
+        wave64: false,
+        vgprs: 12,
+        layout: vec![],
+        used: vec![],
+        io: StageIo::Vs { inputs: vec![], outputs: vec![] },
+        code: w.iter().flat_map(|w| w.to_le_bytes()).collect(),
+    }
+}
+
+/// A pixel program that reads its quad neighbours. From the pixel position
+/// (x in v0, y in v1, floats at pixel centres) it computes w = x * y, then
+/// reads w of other lanes of its quad with DPP `quad_perm`, as the console
+/// compiler does for derivatives of computed values, and writes to render
+/// target 0:
+///
+/// * red: w of the right pixel of its row minus w of the left (`ddx_fine`);
+/// * green: w of the lower pixel of its column minus w of the upper
+///   (`ddy_fine`);
+/// * blue: w of the pixel diagonally opposite in the quad;
+/// * alpha: w of the quad's first pixel (upper left).
+///
+/// In a quad a triangle edge crosses, some of those lanes are outside the
+/// triangle: the console runs them as helpers, and the reads must reach
+/// what they computed.
+fn synthetic_quad_read_pixel_program() -> NativeProgram {
+    let mut w = vec![vop2(V_MUL_F32, 2, vgpr(0), 1)]; // v2 = x * y
+    w.extend_from_slice(&dpp_quad_mov(3, 2, [1, 1, 3, 3]));
+    w.extend_from_slice(&dpp_quad_mov(4, 2, [0, 0, 2, 2]));
+    w.push(vop2(V_SUB_F32, 3, vgpr(3), 4)); // v3 = right - left
+    w.extend_from_slice(&dpp_quad_mov(5, 2, [2, 3, 2, 3]));
+    w.extend_from_slice(&dpp_quad_mov(6, 2, [0, 1, 0, 1]));
+    w.push(vop2(V_SUB_F32, 5, vgpr(5), 6)); // v5 = lower - upper
+    w.extend_from_slice(&dpp_quad_mov(6, 2, [3, 2, 1, 0])); // v6 = the opposite pixel's
+    w.extend_from_slice(&dpp_quad_mov(7, 2, [0, 0, 0, 0])); // v7 = the first pixel's
+    w.extend_from_slice(&exp(EXP_MRT0, [3, 5, 6, 7], true));
+    w.push(S_ENDPGM);
+    NativeProgram {
+        stage: HwStage::Ps,
+        wave64: false,
+        vgprs: 8,
+        layout: vec![],
+        used: vec![],
+        io: StageIo::Ps {
+            inputs: vec![],
+            input_addr: PS_ADDR_POS_X | PS_ADDR_POS_Y,
+            db_shader_control: 0,
+            patches: vec![],
+        },
+        code: w.iter().flat_map(|w| w.to_le_bytes()).collect(),
+    }
+}
+
 /// An `ISG1`/`OSG1` part: (name, D3D system value, component type, register, mask) per element.
 fn signature_part(elements: &[(&str, u32, u32, u32, u8)]) -> Vec<u8> {
     let mut out = Vec::new();
@@ -1233,6 +1334,16 @@ fn synthetic_container(variant: u32) -> Option<Vec<u8>> {
         }
         12 => {
             let native = synthetic_pixel_program_with_table();
+            Some(graphics_container(&native, pixel_signatures(), xbch(&fssm_program(&native))))
+        }
+        // The quad-read fixture: 15 its vertex program (a triangle with diagonal edges),
+        // 16 its pixel program (derivatives and quad reads of a computed value).
+        15 => {
+            let native = synthetic_edge_vertex_program();
+            Some(graphics_container(&native, vertex_signatures(), xbch(&fssm_program(&native))))
+        }
+        16 => {
+            let native = synthetic_quad_read_pixel_program();
             Some(graphics_container(&native, pixel_signatures(), xbch(&fssm_program(&native))))
         }
         // The lane exchange (see its function): 13 in a wave of 32, 14 in a wave of 64.
@@ -1510,6 +1621,35 @@ mod tests {
         ));
         // A translated shader is a desktop container for every stage.
         assert!(matches!(translate_stage_container(&direct_ps.dxil, HwStage::Ps), ComputeInput::Desktop));
+    }
+
+    #[test]
+    fn the_quad_read_fixture_parses_back_and_translates() {
+        for (variant, native, stage) in [
+            (15u32, synthetic_edge_vertex_program(), HwStage::Vs),
+            (16, synthetic_quad_read_pixel_program(), HwStage::Ps),
+        ] {
+            let bytes = synthetic_container(variant).unwrap();
+            let container = Container::parse(&bytes).unwrap();
+            let parsed = native_programs(container.part(FourCC::DXIL).unwrap().data).unwrap();
+            assert_eq!(parsed, [native], "variant {variant}");
+            match translate_stage_container(&bytes, stage) {
+                ComputeInput::Translated(shader, _) => {
+                    // Neither stage reads user data or binds anything.
+                    assert_eq!(shader.user_data_dwords(), 0, "variant {variant}: {:?}", shader.user_data);
+                    assert!(!shader.memory && !shader.heap, "variant {variant}");
+                    eprintln!("variant {variant}: {} bytes of DXIL", shader.dxil.len());
+                }
+                ComputeInput::Refused(text) => panic!("variant {variant} refused: {text}"),
+                ComputeInput::Malformed(text) => panic!("variant {variant} malformed: {text}"),
+                _ => panic!("variant {variant} not translated"),
+            }
+        }
+        // The triangle the vertex program makes, from its own constants.
+        let px = |a: f32, b: f32| ((-0.898_437_5 + 1.75 * a + 0.125 * b + 1.0) * 32.0 * 4.0) as i32;
+        let py = |a: f32, b: f32| ((1.0 - (0.898_437_5 - 0.093_75 * a - 0.890_625 * b)) * 32.0 * 4.0) as i32;
+        let made = [[px(0.0, 0.0), py(0.0, 0.0)], [px(1.0, 0.0), py(1.0, 0.0)], [px(0.0, 2.0), py(0.0, 2.0)]];
+        assert_eq!(made, EDGE_TRIANGLE_QUARTER_PIXELS);
     }
 
     #[test]

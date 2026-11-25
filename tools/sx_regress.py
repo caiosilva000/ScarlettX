@@ -47,7 +47,7 @@ GPU_TESTS = {
     "test_d3d12_offscreen_probe", "test_d3d12_offscreen_clear", "test_d3d12_offscreen_indexed",
     "test_victory_compute_e2e", "test_victory_compute_guest", "test_d3d12_blend_mrt",
     "test_victory_compute_conformance", "test_victory_draw_e2e", "test_victory_draw_guest",
-    "test_victory_wave64_exchange",
+    "test_victory_wave64_exchange", "test_victory_quad_edge",
 }
 # Translated compute (tests/test_victory_compute_e2e.cpp): five dispatches of four dwords each.
 VICTORY_COMPUTE_TEST = "test_victory_compute_e2e"
@@ -532,6 +532,47 @@ def check_victory_wave(stdout: str) -> dict:
     return info
 
 
+def check_victory_quad(stdout: str) -> dict:
+    """The quad-read test at triangle edges: coverage, and where translated and desktop differ."""
+    cov = re.search(r"\[victory-quad\] coverage: cpu=(\d+) desktop=(\d+) \(differs at (\d+)\) translated=(\d+) "
+                    r"\(differs at (\d+)\) of (\d+) pixels", stdout)
+    px = re.search(r"\[victory-quad\] pixels: covered=(\d+) edge=(\d+) interior=(\d+); reads of a lane outside the "
+                   r"triangle: (\d+)", stdout)
+    compares = {}
+    for name, pixels, edge, interior, ddx, ddy, diag, first, hw, ht, ow in re.findall(
+            r"\[victory-quad\] (\w+): differing_pixels=(\d+) edge=(\d+) interior=(\d+) values ddx=(\d+) ddy=(\d+) "
+            r"diagonal=(\d+) first=(\d+) helper_reads_wrong=(\d+)/(\d+) other_reads_wrong=(\d+)", stdout):
+        compares[name] = {"differing_pixels": int(pixels), "edge": int(edge), "interior": int(interior),
+                          "values": {"ddx": int(ddx), "ddy": int(ddy), "diagonal": int(diag), "first": int(first)},
+                          "helper_reads_wrong": int(hw), "helper_reads": int(ht), "other_reads_wrong": int(ow)}
+    fences = [(int(s_), int(c), int(w)) for s_, c, w in
+              re.findall(r"\[victory-quad\] \w+ fence signaled=(\d+) completed=(\d+) wait_result=(\d+)", stdout)]
+    adapter = re.search(r"\[victory-quad\] adapter=(.*?) vendor=", stdout)
+    info = {
+        "shader_path": ("synthetic console-shaped vertex and pixel containers -> victory-shader bridge -> DXIL -> "
+                        "host D3D12 draw; reference: HLSL through D3DCompile"),
+        "adapter": adapter.group(1) if adapter else None,
+        "covered_cpu": int(cov.group(1)) if cov else None,
+        "coverage_differs_desktop": int(cov.group(3)) if cov else None,
+        "coverage_differs_translated": int(cov.group(5)) if cov else None,
+        "edge_pixels": int(px.group(2)) if px else None,
+        "interior_pixels": int(px.group(3)) if px else None,
+        "helper_reads": int(px.group(4)) if px else None,
+        "compares": compares,
+        "fences": len(fences),
+        "fences_completed": sum(1 for s_, c, w in fences if c >= s_ >= 1 and w == 0),
+        "final_line": (re.search(r"\[victory-quad\] (PASS|FAIL) \(edge pixels differing: \d+ of \d+\)", stdout)
+                       or [None])[0],
+    }
+    td = compares.get("translated_vs_desktop", {})
+    info["requirements_met"] = bool(
+        cov and px and info["coverage_differs_desktop"] == 0 and info["coverage_differs_translated"] == 0
+        and info["edge_pixels"] and info["helper_reads"] and td and td["differing_pixels"] == 0
+        and info["fences"] == 2 and info["fences_completed"] == 2
+        and (info["final_line"] or "").startswith("[victory-quad] PASS"))
+    return info
+
+
 def check_victory_draw(stdout: str) -> dict:
     """The requirements of the translated draw test: four draws, every pixel exact."""
     fences = [(int(s_), int(c), int(w)) for s_, c, w in
@@ -763,6 +804,16 @@ def cmd_regress(args) -> int:
                 verdicts = ", ".join(f"{n} {c.get('verdict')}" for n, c in probe["cases"].items())
                 note = (f"{verdicts}; adapter waves {probe['wave_lanes_min']}..{probe['wave_lanes_max']}"
                         + (f"; SKIPPED: {', '.join(probe['skipped'])}" if probe["skipped"] else ""))
+        if name == "test_victory_quad_edge":
+            probe = check_victory_quad(r["stdout"])
+            details["victory_quad"] = probe
+            td = probe["compares"].get("translated_vs_desktop")
+            if status == PASS and not probe["requirements_met"]:
+                status, note = FAIL, "exit 0 but a quad-read requirement was not met"
+            elif td:
+                note = (f"translated vs desktop: {td['edge']} of {probe['edge_pixels']} edge pixels and "
+                        f"{td['interior']} of {probe['interior_pixels']} interior pixels differ; "
+                        f"{td['helper_reads_wrong']} of {td['helper_reads']} reads of a lane outside the triangle wrong")
         if name == "test_victory_wave64_exchange":
             probe = check_victory_wave(r["stdout"])
             details["victory_wave"] = probe

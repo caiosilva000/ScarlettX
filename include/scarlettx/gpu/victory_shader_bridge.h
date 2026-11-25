@@ -109,6 +109,8 @@ bool VictoryComputeBindingSupported(const VictoryComputeBinding& binding, std::s
 //   descriptor table's UAV (bindings beyond root constants)
 //   13 a lane exchange in a wave of 32 (ds_bpermute_b32: the wave reversed, the halves
 //   exchanged)   14 the same in a wave of 64
+//   15 the quad-read fixture's vertex program (a triangle with three diagonal edges)
+//   16 its pixel program (derivatives and quad reads of a computed value, by DPP quad_perm)
 Status BuildVictorySyntheticContainer(uint32_t variant, std::vector<uint8_t>& out_bytes);
 
 }  // namespace scarlettx

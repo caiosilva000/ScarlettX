@@ -454,6 +454,8 @@ if(SCARLETTX_VICTORY_SHADER_BRIDGE)
     # Group ids, offset stores and lane masks (wave32, wave64) on the same route.
     scarlettx_add_test(test_victory_compute_conformance tests/test_victory_compute_conformance.cpp)
     target_link_libraries(test_victory_compute_conformance PRIVATE d3d12_xs)
+    # Quad reads at triangle edges: a translated pixel program against a desktop shader.
+    scarlettx_add_test(test_victory_quad_edge tests/test_victory_quad_edge.cpp)
     # A lane exchange across the halves of a wave (wave32 control, wave64), classified by what
     # the adapter does with it.
     scarlettx_add_test(test_victory_wave64_exchange tests/test_victory_wave64_exchange.cpp)
