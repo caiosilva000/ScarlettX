@@ -238,12 +238,21 @@ struct Rig {
         Mark(stage);
         if (Completed(q) < value) {
             SX_REQUIRE(Call(fence[q], kFenceSetEventOnCompletion, static_cast<uintptr_t>(value), P(event), uintptr_t{0}) == 0);
-            // In steps, so that a slow queue shows its fence moving and a stuck one shows it still.
-            for (int step = 0; step < 12 && Completed(q) < value; ++step) {
-                if (WaitForSingleObject(event, 10000) == WAIT_OBJECT_0) break;
-                std::snprintf(stage, sizeof(stage), "wait:q%d:for-%llu:still-waiting-%ds", q,
-                              static_cast<unsigned long long>(value), (step + 1) * 10);
-                Mark(stage);
+            // The fence value decides, not the event: the event is shared by both fences, and an
+            // earlier registration can set it late (seen on the Windows software adapter), so a
+            // set event only means "look again". A line every 10 s shows a slow queue's fence
+            // moving and a stuck one's standing still.
+            const ULONGLONG begin = GetTickCount64();
+            ULONGLONG next_line = begin + 10000;
+            while (Completed(q) < value && GetTickCount64() - begin < 120000) {
+                WaitForSingleObject(event, 50);
+                if (GetTickCount64() >= next_line) {
+                    std::snprintf(stage, sizeof(stage), "wait:q%d:for-%llu:still-waiting-%llus", q,
+                                  static_cast<unsigned long long>(value),
+                                  static_cast<unsigned long long>((GetTickCount64() - begin) / 1000));
+                    Mark(stage);
+                    next_line += 10000;
+                }
             }
             if (Completed(q) < value) {
                 std::snprintf(stage, sizeof(stage), "wait:q%d:for-%llu:GAVE-UP", q, static_cast<unsigned long long>(value));
