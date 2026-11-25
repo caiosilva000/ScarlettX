@@ -17,6 +17,7 @@
 #include <sstream>
 #include <string>
 #include <tuple>
+#include <map>
 #include <unordered_map>
 #include <utility>
 #include <vector>
@@ -878,7 +879,91 @@ struct GuestTextureMemory {
     std::vector<uint64_t> uploaded_sum;   // by subresource: checksum of the memory last uploaded
     std::vector<uint8_t> has_sum;         // by subresource: uploaded_sum is valid
     std::vector<UINT> pending;            // subresources the next flush uploads whatever the watch says
+    struct GuestArenaChunk* chunk = nullptr;  // where the memory comes from; null when it has its own allocation
+    uint64_t flush_mark = 0;              // the last flush that looked at this texture
 };
+
+// Texture memory comes out of large write-watched reservations, so that one GetWriteWatch call
+// per reservation tells a flush which textures were written at all. Asking each texture cost
+// about 0.75 microseconds a texture a flush: 3 ms for 4,096 textures nobody had touched.
+struct XboxD3D12ResourceProxy;
+struct GuestArenaChunk {
+    uint8_t* base = nullptr;
+    size_t bump = 0;                                             // bytes handed out so far
+    size_t live = 0;                                             // textures in it
+    std::map<size_t, XboxD3D12ResourceProxy*> spans;             // by offset
+    std::multimap<size_t, size_t> free_by_size;                  // size -> offset, for reuse
+};
+constexpr size_t kGuestArenaChunkBytes = 64u << 20;
+constexpr size_t kGuestArenaLargest = 8u << 20;                   // larger textures get their own allocation
+std::vector<std::unique_ptr<GuestArenaChunk>> g_guest_arena;      // under g_guest_textures_mutex
+std::vector<XboxD3D12ResourceProxy*> g_guest_standalone;          // textures with their own allocation
+std::vector<XboxD3D12ResourceProxy*> g_guest_followup;            // textures the next flush must look at anyway
+uint64_t g_guest_flush_mark = 0;
+
+// Memory for a texture of `size` bytes (a multiple of 64 KB), committed and with a clean watch.
+void* GuestArenaAllocate(size_t size, XboxD3D12ResourceProxy* tex, GuestArenaChunk** out_chunk) {
+    *out_chunk = nullptr;
+    if (size > kGuestArenaLargest) {
+        return VirtualAlloc(nullptr, size, MEM_RESERVE | MEM_COMMIT | MEM_WRITE_WATCH, PAGE_READWRITE);
+    }
+    GuestArenaChunk* chunk = nullptr;
+    size_t offset = 0;
+    for (auto& c : g_guest_arena) {
+        const auto it = c->free_by_size.find(size);
+        if (it != c->free_by_size.end()) {
+            chunk = c.get();
+            offset = it->second;
+            c->free_by_size.erase(it);
+            break;
+        }
+    }
+    if (!chunk) {
+        for (auto& c : g_guest_arena) {
+            if (c->bump + size <= kGuestArenaChunkBytes) {
+                chunk = c.get();
+                break;
+            }
+        }
+        if (!chunk) {
+            auto fresh = std::make_unique<GuestArenaChunk>();
+            fresh->base = static_cast<uint8_t*>(
+                VirtualAlloc(nullptr, kGuestArenaChunkBytes, MEM_RESERVE | MEM_WRITE_WATCH, PAGE_READWRITE));
+            if (!fresh->base) return VirtualAlloc(nullptr, size, MEM_RESERVE | MEM_COMMIT | MEM_WRITE_WATCH, PAGE_READWRITE);
+            g_guest_arena.push_back(std::move(fresh));
+            chunk = g_guest_arena.back().get();
+        }
+        offset = chunk->bump;
+        chunk->bump += size;
+    }
+    void* memory = VirtualAlloc(chunk->base + offset, size, MEM_COMMIT, PAGE_READWRITE);
+    if (!memory) {
+        chunk->free_by_size.emplace(size, offset);
+        return nullptr;
+    }
+    ResetWriteWatch(memory, size);
+    chunk->spans[offset] = tex;
+    ++chunk->live;
+    *out_chunk = chunk;
+    return memory;
+}
+
+void GuestArenaFree(GuestArenaChunk* chunk, void* memory, size_t size) {
+    if (!chunk) {
+        VirtualFree(memory, 0, MEM_RELEASE);
+        return;
+    }
+    const size_t offset = static_cast<size_t>(static_cast<uint8_t*>(memory) - chunk->base);
+    VirtualFree(memory, size, MEM_DECOMMIT);
+    chunk->spans.erase(offset);
+    chunk->free_by_size.emplace(size, offset);
+    if (--chunk->live == 0) {
+        VirtualFree(chunk->base, 0, MEM_RELEASE);
+        g_guest_arena.erase(std::remove_if(g_guest_arena.begin(), g_guest_arena.end(),
+                                           [&](const std::unique_ptr<GuestArenaChunk>& c) { return c.get() == chunk; }),
+                            g_guest_arena.end());
+    }
+}
 constexpr uint32_t kQuietFlushesBeforeRearm = 4;
 
 // A 64-bit checksum of texture memory (four multiply-xorshift lanes over 8-byte words; a change
@@ -994,8 +1079,10 @@ void* EnsureGuestTextureMemory(XboxD3D12ResourceProxy* obj) {
         return nullptr;
     }
     mem->size = static_cast<size_t>(mem->layout.SizeBytes);
-    mem->base = VirtualAlloc(nullptr, mem->size, MEM_RESERVE | MEM_COMMIT | MEM_WRITE_WATCH, PAGE_READWRITE);
+    // 64 KB steps, as separate allocations had: a texture's memory starts on a 64 KB boundary.
+    mem->base = GuestArenaAllocate(static_cast<size_t>(AlignUp(mem->size, 65536)), obj, &mem->chunk);
     if (!mem->base) return nullptr;
+    if (!mem->chunk) g_guest_standalone.push_back(obj);
     if (TraceEnabled()) {
         std::ostringstream os;
         os << "[ScarlettX][d3d12_xs] texture " << d.Width << "x" << d.Height << " mips=" << d.MipLevels
@@ -1013,7 +1100,11 @@ void ReleaseGuestTextureMemory(XboxD3D12ResourceProxy* obj) {
     if (!obj->guest_memory) return;
     g_guest_textures.erase(std::remove(g_guest_textures.begin(), g_guest_textures.end(), obj),
                            g_guest_textures.end());
-    VirtualFree(obj->guest_memory->base, 0, MEM_RELEASE);
+    for (auto* list : {&g_guest_standalone, &g_guest_followup}) {
+        list->erase(std::remove(list->begin(), list->end(), obj), list->end());
+    }
+    GuestArenaFree(obj->guest_memory->chunk, obj->guest_memory->base,
+                   static_cast<size_t>(AlignUp(obj->guest_memory->size, 65536)));
     delete obj->guest_memory;
     obj->guest_memory = nullptr;
 }
@@ -1355,6 +1446,7 @@ void GuestTextureCopyTarget(XboxD3D12ResourceProxy* tex) {
             GuestMemoryChecksum(static_cast<const uint8_t*>(mem.base) + offset, static_cast<size_t>(size));
         if (!mem.has_sum[s] || mem.uploaded_sum[s] != sum) mem.pending.push_back(s);
     }
+    if (!mem.pending.empty()) g_guest_followup.push_back(tex);
 }
 
 // Uploads every guest-memory texture the title has written to since the last call.
@@ -1365,8 +1457,47 @@ void FlushGuestTextureWrites(ID3D12CommandQueue* queue) {
     std::vector<void*> pages;
     std::vector<UINT> dirty;
     std::vector<uint64_t> sums;
-    for (XboxD3D12ResourceProxy* tex : g_guest_textures) {
+    // Which textures to look at: those with a written page in their reservation (one call per
+    // reservation), those with an allocation of their own, and those the last flush left in a
+    // state that has to be followed up (written last time, hot, or holding kept writes).
+    const uint64_t mark = ++g_guest_flush_mark;
+    std::vector<XboxD3D12ResourceProxy*> candidates;
+    auto consider = [&](XboxD3D12ResourceProxy* tex) {
+        if (tex->guest_memory->flush_mark == mark) return;
+        tex->guest_memory->flush_mark = mark;
+        candidates.push_back(tex);
+    };
+    for (auto& chunk : g_guest_arena) {
+        if (chunk->bump == 0) continue;
+        pages.resize(chunk->bump / 4096 + 1);
+        ULONG_PTR count = pages.size();
+        DWORD granularity = 0;
+        if (GetWriteWatch(0, chunk->base, chunk->bump, pages.data(), &count, &granularity) != 0) {
+            for (auto& [offset, tex] : chunk->spans) consider(tex);  // cannot tell: look at all of them
+            continue;
+        }
+        for (ULONG_PTR i = 0; i < count; ++i) {
+            const size_t at = static_cast<size_t>(static_cast<uint8_t*>(pages[i]) - chunk->base);
+            auto it = chunk->spans.upper_bound(at);
+            if (it == chunk->spans.begin()) continue;
+            --it;
+            consider(it->second);
+        }
+    }
+    for (XboxD3D12ResourceProxy* tex : g_guest_standalone) consider(tex);
+    for (XboxD3D12ResourceProxy* tex : g_guest_followup) consider(tex);
+    g_guest_followup.clear();
+    for (XboxD3D12ResourceProxy* tex : candidates) {
         GuestTextureMemory& mem = *tex->guest_memory;
+        // Whatever happens below, a texture left written-last-time, hot or with kept writes is
+        // looked at again by the next flush even if none of its pages is written by then.
+        struct FollowUp {
+            XboxD3D12ResourceProxy* tex;
+            ~FollowUp() {
+                const GuestTextureMemory& m = *tex->guest_memory;
+                if (m.hot || m.written_streak != 0 || !m.pending.empty()) g_guest_followup.push_back(tex);
+            }
+        } follow_up{tex};
         const D3D12_RESOURCE_DESC d = tex->pc_res->GetDesc();
         const UINT subresources = static_cast<UINT>(d.MipLevels) * d.DepthOrArraySize;
         auto checksum = [&](UINT s) {

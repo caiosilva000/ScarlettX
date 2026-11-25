@@ -11,6 +11,12 @@
 //   3. a texture released straight after the submission that draws it must still be drawn
 //      (the staging keeps the host texture until its copy has run).
 //
+// And one thing about many textures, whose memory the shim takes from shared reservations and
+// asks about once per reservation rather than once per texture:
+//
+//   4. of forty textures, only the ones written are uploaded, the others keep what they had,
+//      and memory given back by released textures and handed out again starts clean.
+//
 // A draw samples the texture texel for pixel into a band of eight rows of a 64x64 target.
 //
 // Exit codes: 0 pass, 1 a band showed the wrong texels, 2 a call failed, 3 no device.
@@ -290,7 +296,7 @@ int main() {
 
     D3D12_DESCRIPTOR_HEAP_DESC hd{};
     hd.Type = D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV;
-    hd.NumDescriptors = 4;
+    hd.NumDescriptors = 64;
     hd.Flags = D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE;
     SX_REQUIRE(Call(r.device, kDevCreateDescriptorHeap, P(&hd), uintptr_t{0}, P(&r.srv_heap)) == 0 && r.srv_heap);
     void* rtv_heap = nullptr;
@@ -432,6 +438,54 @@ int main() {
         SX_REQUIRE(Call(second, 2) == 0);  // Release: the title's last reference
         r.Wait(0, last);
         r.ExpectBands("3 released early", {p});
+    }
+
+    // 4. Forty textures. Every step is waited for; this part is about which textures get uploaded.
+    {
+        constexpr uint32_t kCount = 40, kFirstSlot = 8;
+        std::vector<void*> tex(kCount);
+        std::vector<uint8_t*> mem(kCount);
+        std::vector<std::vector<uint32_t>> have(kCount);
+        for (uint32_t i = 0; i < kCount; ++i) {
+            tex[i] = r.GuestTexture(kFirstSlot + i, &mem[i]);
+            have[i] = Pattern(100 + i);
+            r.Write(mem[i], have[i]);
+        }
+        const uint32_t show[8] = {0, 1, 7, 13, 20, 26, 33, 39};
+        auto check = [&](const char* part) {
+            uint64_t last = 0;
+            std::vector<std::vector<uint32_t>> want;
+            for (uint32_t b = 0; b < 8; ++b) {
+                last = r.DrawBand(0, kFirstSlot + show[b], b);
+                want.push_back(have[show[b]]);
+            }
+            r.Wait(0, last);
+            r.ExpectBands(part, want);
+        };
+        check("4 forty written");
+        // Three of the shown ones written again, twice running; the rest left alone.
+        for (uint32_t pass = 0; pass < 2; ++pass) {
+            for (uint32_t i : {1u, 20u, 39u}) {
+                have[i] = Pattern(200 + i + pass * 50);
+                r.Write(mem[i], have[i]);
+            }
+            check(pass == 0 ? "4 three rewritten" : "4 three rewritten again");
+        }
+        check("4 nothing written");
+        // Every odd texture released, then created again in the same slot: its memory may be the
+        // memory another just gave back. Only two of the new ones are written.
+        for (uint32_t i = 1; i < kCount; i += 2) SX_REQUIRE(Call(tex[i], 2) == 0);
+        for (uint32_t i = 1; i < kCount; i += 2) {
+            tex[i] = r.GuestTexture(kFirstSlot + i, &mem[i]);
+            have[i].assign(kSize * kSize, 0);  // a new texture nobody wrote: zero
+        }
+        for (uint32_t i : {7u, 33u}) {
+            have[i] = Pattern(400 + i);
+            r.Write(mem[i], have[i]);
+        }
+        have[26] = Pattern(426);
+        r.Write(mem[26], have[26]);  // one that was never released
+        check("4 released and created again");
     }
 
     if (r.failures) {
