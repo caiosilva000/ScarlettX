@@ -84,8 +84,14 @@ if(WIN32)
             "${SCARLETTX_VICTORY_BRIDGE_DIR}/target/${SCARLETTX_RUST_TARGET}/release/${SCARLETTX_VICTORY_BRIDGE_FILE}")
         string(TOUPPER "${SCARLETTX_RUST_TARGET}" SCARLETTX_CARGO_TARGET_KEY)
         string(REPLACE "-" "_" SCARLETTX_CARGO_TARGET_KEY "${SCARLETTX_CARGO_TARGET_KEY}")
-        set(SCARLETTX_CARGO_LINKER_ENV
-            "CARGO_TARGET_${SCARLETTX_CARGO_TARGET_KEY}_LINKER=${CMAKE_C_COMPILER}")
+        # The cross build links Rust through the toolchain's compiler driver. Under MSVC, rustc
+        # finds link.exe itself; handing it cl.exe breaks every build script (unresolved memcpy).
+        if(MSVC)
+            set(SCARLETTX_CARGO_LINKER_ENV "SCARLETTX_CARGO_LINKER=default")
+        else()
+            set(SCARLETTX_CARGO_LINKER_ENV
+                "CARGO_TARGET_${SCARLETTX_CARGO_TARGET_KEY}_LINKER=${CMAKE_C_COMPILER}")
+        endif()
 
         add_custom_command(
             OUTPUT "${SCARLETTX_VICTORY_BRIDGE_LIBRARY}"
