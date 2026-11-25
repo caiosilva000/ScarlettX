@@ -250,6 +250,15 @@ SCARLETTX_D3D12_API int32_t D3D12XboxDestroyDevice(uint64_t device_handle);
 SCARLETTX_D3D12_API int32_t D3D12XboxGetNativeDevice(
     uint64_t device_handle,
     void** out_id3d12_device);
+// The host object behind an object this shim handed to a title in real-title mode: the
+// ID3D12Device of a device, or the ID3D12Object of a root signature or pipeline state. The
+// caller owns one reference. 0 on success, -1 bad arguments, -2 not one of those objects.
+SCARLETTX_D3D12_API int32_t D3D12XboxGetNativeObject(
+    void* shim_object,
+    void** out_native_object);
+// How many graphics pipelines this shim has created with blending switched off for a render
+// target the host cannot blend into (scarlettx/gpu/blend_normalize.h).
+SCARLETTX_D3D12_API uint64_t D3D12XboxBlendAdjustedPipelineCount(void);
 SCARLETTX_D3D12_API int32_t D3D12XboxQueryCapabilities(
     uint64_t device_handle,
     D3D12XBOX_CAPABILITIES* out_caps);

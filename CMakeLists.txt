@@ -28,6 +28,7 @@ add_library(scarlettx_core STATIC
     src/kernel/xstorage.cpp
     src/gpu/d3d12_backend.cpp
     src/gpu/rt_bvh.cpp
+    src/gpu/blend_normalize.cpp
     src/gpu/shader_ir.cpp
     src/gpu/victory_shader_bridge.cpp
     src/gpu/xg_layout.cpp
@@ -416,6 +417,11 @@ target_link_libraries(test_d3d12_frame_pacing PRIVATE d3d12_xs)
 set_tests_properties(test_d3d12_frame_pacing PROPERTIES ENVIRONMENT "SCARLETTX_REAL_TITLE=1")
 scarlettx_add_test(test_d3d12_xs_abi tests/test_d3d12_xs_abi.cpp)
 target_link_libraries(test_d3d12_xs_abi PRIVATE d3d12_xs XboxBvhBuilder)
+# Blending into render targets the host cannot blend into (integer formats): unit rules, then a
+# two-target pipeline created through the shim, drawn and read back.
+scarlettx_add_test(test_blend_normalize tests/test_blend_normalize.cpp)
+scarlettx_add_test(test_d3d12_blend_mrt tests/test_d3d12_blend_mrt.cpp)
+target_link_libraries(test_d3d12_blend_mrt PRIVATE d3d12_xs)
 scarlettx_add_test(test_rt_pipeline tests/test_rt_pipeline.cpp)
 scarlettx_add_test(test_dstorage_xvd tests/test_dstorage_xvd.cpp)
 target_link_libraries(test_dstorage_xvd PRIVATE dstorage)
