@@ -842,6 +842,7 @@ struct GuestTextureMemory {
     uint32_t quiet_flushes = 0;           // flushes in a row without a change, while hot
     std::vector<uint64_t> uploaded_sum;   // by subresource: checksum of the memory last uploaded
     std::vector<uint8_t> has_sum;         // by subresource: uploaded_sum is valid
+    std::vector<UINT> pending;            // subresources the next flush uploads whatever the watch says
 };
 constexpr uint32_t kQuietFlushesBeforeRearm = 4;
 
@@ -1180,6 +1181,52 @@ void UploadGuestTextureBatch(ID3D12CommandQueue* queue,
     device->Release();
 }
 
+// The subresources of a texture that overlap any of the given written pages.
+std::vector<UINT> GuestSubresourcesOnPages(const GuestTextureMemory& mem, const D3D12_RESOURCE_DESC& d,
+                                           const std::vector<void*>& pages, DWORD granularity) {
+    std::vector<UINT> out;
+    for (UINT s = 0; s < static_cast<UINT>(d.MipLevels) * d.DepthOrArraySize; ++s) {
+        uint64_t offset = 0, size = 0;
+        if (!scarlettx::gpu::xg::SubresourceRange(mem.layout, s % d.MipLevels, s / d.MipLevels, &offset, &size)) {
+            continue;
+        }
+        const auto* first = static_cast<const uint8_t*>(mem.base) + offset;
+        const bool written = std::any_of(pages.begin(), pages.end(), [&](void* page) {
+            const auto* p = static_cast<const uint8_t*>(page);
+            return p + granularity > first && p < first + size;
+        });
+        if (written) out.push_back(s);
+    }
+    return out;
+}
+
+// A command list is about to copy into this texture. While a texture is hot, a guest write is
+// only seen if it changes the bytes, so a write that puts back what was last uploaded would be
+// missed and the copy would stay visible. From the moment a copy into it is recorded the texture
+// is armed again: every later write is a written page and is uploaded, as before the texture
+// became hot. Writes made before this call and not yet uploaded are kept for the next flush.
+void GuestTextureCopyTarget(XboxD3D12ResourceProxy* tex) {
+    if (!tex || !tex->guest_memory) return;
+    std::lock_guard<std::mutex> lock(g_guest_textures_mutex);
+    GuestTextureMemory& mem = *tex->guest_memory;
+    if (!mem.hot) return;
+    const D3D12_RESOURCE_DESC d = tex->pc_res->GetDesc();
+    std::vector<void*> pages(mem.size / 4096 + 1);
+    ULONG_PTR count = pages.size();
+    DWORD granularity = 0;
+    if (GetWriteWatch(WRITE_WATCH_FLAG_RESET, mem.base, mem.size, pages.data(), &count, &granularity) != 0) count = 0;
+    pages.resize(count);
+    mem.hot = false;
+    mem.written_streak = 0;
+    for (const UINT s : GuestSubresourcesOnPages(mem, d, pages, granularity)) {
+        uint64_t offset = 0, size = 0;
+        scarlettx::gpu::xg::SubresourceRange(mem.layout, s % d.MipLevels, s / d.MipLevels, &offset, &size);
+        const uint64_t sum =
+            GuestMemoryChecksum(static_cast<const uint8_t*>(mem.base) + offset, static_cast<size_t>(size));
+        if (!mem.has_sum[s] || mem.uploaded_sum[s] != sum) mem.pending.push_back(s);
+    }
+}
+
 // Uploads every guest-memory texture the title has written to since the last call.
 void FlushGuestTextureWrites(ID3D12CommandQueue* queue) {
     std::lock_guard<std::mutex> lock(g_guest_textures_mutex);
@@ -1205,28 +1252,25 @@ void FlushGuestTextureWrites(ID3D12CommandQueue* queue) {
         // resetting: an armed texture with no written page has nothing to reset.
         const bool reset = !mem.hot && mem.written_streak == 0;
         if (GetWriteWatch(reset ? WRITE_WATCH_FLAG_RESET : 0, mem.base, mem.size, pages.data(), &count,
-                          &granularity) != 0 ||
-            count == 0) {
+                          &granularity) != 0) {
+            count = 0;
+        }
+        if (count == 0) {
             mem.written_streak = 0;
+            if (mem.pending.empty()) continue;
+            // Writes kept from before a copy into the texture (GuestTextureCopyTarget).
+            GuestTextureUpload u;
+            u.tex = tex;
+            u.dirty = std::move(mem.pending);
+            mem.pending.clear();
+            uploads.push_back(std::move(u));
             continue;
         }
         pages.resize(count);
         // Only the subresources the title wrote to: the others may hold data
         // that arrived through command-list copies.
-        dirty.clear();
+        dirty = GuestSubresourcesOnPages(mem, d, pages, granularity);
         sums.clear();
-        for (UINT s = 0; s < subresources; ++s) {
-            uint64_t offset = 0, size = 0;
-            if (!scarlettx::gpu::xg::SubresourceRange(mem.layout, s % d.MipLevels, s / d.MipLevels, &offset, &size)) {
-                continue;
-            }
-            const auto* first = static_cast<const uint8_t*>(mem.base) + offset;
-            const bool written = std::any_of(pages.begin(), pages.end(), [&](void* page) {
-                const auto* p = static_cast<const uint8_t*>(page);
-                return p + granularity > first && p < first + size;
-            });
-            if (written) dirty.push_back(s);
-        }
         if (!mem.hot) {
             if (reset) {
                 mem.written_streak = 1;
@@ -1265,6 +1309,12 @@ void FlushGuestTextureWrites(ID3D12CommandQueue* queue) {
                 sums.clear();  // no longer hot: nothing to remember
             }
             dirty = std::move(differs);
+        }
+        if (!mem.hot && !mem.pending.empty()) {
+            for (const UINT s : mem.pending) {
+                if (std::find(dirty.begin(), dirty.end(), s) == dirty.end()) dirty.push_back(s);
+            }
+            mem.pending.clear();
         }
         if (dirty.empty()) continue;
         GuestTextureUpload u;
@@ -1705,6 +1755,7 @@ intptr_t SCARLETTX_GDK_CALLBACK CmdListCopyTextureRegion(
         }
         std::cerr << "), box=" << reinterpret_cast<void*>(pSrcBox) << ")\n";
     }
+    if (dst.pResource) GuestTextureCopyTarget(reinterpret_cast<XboxD3D12ResourceProxy*>(dst.pResource));
     if (dst.pResource) dst.pResource = reinterpret_cast<XboxD3D12ResourceProxy*>(dst.pResource)->pc_res;
     if (src.pResource) src.pResource = reinterpret_cast<XboxD3D12ResourceProxy*>(src.pResource)->pc_res;
     if (dst.pResource && src.pResource) {
@@ -1930,6 +1981,7 @@ intptr_t SCARLETTX_GDK_CALLBACK CmdListCopyResource(void* self, uintptr_t pDst, 
         auto* dst = reinterpret_cast<XboxD3D12ResourceProxy*>(pDst);
         auto* src = reinterpret_cast<XboxD3D12ResourceProxy*>(pSrc);
         if (dst->pc_res && src->pc_res) {
+            GuestTextureCopyTarget(dst);
             obj->pc_list->CopyResource(dst->pc_res, src->pc_res);
         }
     }
