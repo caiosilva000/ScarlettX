@@ -284,6 +284,15 @@ struct D3D12XBOX_GRAPHICS_TRANSLATION_STATS {
     uint64_t draws_skipped;            // draws dropped because a binding was missing
 };
 SCARLETTX_D3D12_API int32_t D3D12XboxGetGraphicsTranslationStats(D3D12XBOX_GRAPHICS_TRANSLATION_STATS* out_stats);
+// What the command list put on the host list around translated draws: a translated pipeline
+// has a host root signature of its own, so its draws need that bound and the title's put back.
+struct D3D12XBOX_TRANSLATED_DRAW_BIND_STATS {
+    uint64_t host_root_binds;           // SetGraphicsRootSignature(host root of the translated pipeline)
+    uint64_t user_data_sets;            // SetGraphicsRoot32BitConstants of a stage's user data
+    uint64_t title_root_restores;       // SetGraphicsRootSignature(the title's root) after a translated draw
+    uint64_t title_arguments_replayed;  // the title's root constants and tables set again after it
+};
+SCARLETTX_D3D12_API int32_t D3D12XboxGetTranslatedDrawBindStats(D3D12XBOX_TRANSLATED_DRAW_BIND_STATS* out_stats);
 SCARLETTX_D3D12_API int32_t D3D12XboxQueryCapabilities(
     uint64_t device_handle,
     D3D12XBOX_CAPABILITIES* out_caps);

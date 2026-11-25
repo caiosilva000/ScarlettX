@@ -231,6 +231,11 @@ std::atomic<uint64_t> g_graphics_passed_through{0};
 std::atomic<uint64_t> g_graphics_rejected{0};
 std::atomic<uint64_t> g_draws_translated{0};
 std::atomic<uint64_t> g_draws_skipped{0};
+// See D3D12XBOX_TRANSLATED_DRAW_BIND_STATS.
+std::atomic<uint64_t> g_host_root_binds{0};
+std::atomic<uint64_t> g_user_data_sets{0};
+std::atomic<uint64_t> g_title_root_restores{0};
+std::atomic<uint64_t> g_title_arguments_replayed{0};
 
 #if defined(_WIN32)
 // A compute pipeline made from translated native code. The translated shader does not use the
@@ -1554,6 +1559,8 @@ bool BindTranslatedGraphics(XboxD3D12GraphicsCommandListProxy* obj) {
         obj->pc_list->SetGraphicsRoot32BitConstants(stage, static_cast<UINT>(user_data[stage].size()),
                                                     user_data[stage].data(), 0);
     }
+    g_host_root_binds.fetch_add(1, std::memory_order_relaxed);
+    g_user_data_sets.fetch_add(2, std::memory_order_relaxed);
     g_draws_translated.fetch_add(1, std::memory_order_relaxed);
     return true;
 }
@@ -1562,14 +1569,19 @@ bool BindTranslatedGraphics(XboxD3D12GraphicsCommandListProxy* obj) {
 void RestoreTitleGraphics(XboxD3D12GraphicsCommandListProxy* obj) {
     if (!obj->title_graphics_root) return;
     obj->pc_list->SetGraphicsRootSignature(obj->title_graphics_root);
+    uint64_t replayed = 0;
     for (const auto& [slot, values] : obj->graphics_constants) {
         if (!values.empty()) {
             obj->pc_list->SetGraphicsRoot32BitConstants(slot, static_cast<UINT>(values.size()), values.data(), 0);
+            ++replayed;
         }
     }
     for (const auto& [slot, handle] : obj->graphics_tables) {
         obj->pc_list->SetGraphicsRootDescriptorTable(slot, D3D12_GPU_DESCRIPTOR_HANDLE{handle});
+        ++replayed;
     }
+    g_title_root_restores.fetch_add(1, std::memory_order_relaxed);
+    g_title_arguments_replayed.fetch_add(replayed, std::memory_order_relaxed);
 }
 
 // Runs a dispatch of a translated compute pipeline: the host root signature, the user data built
@@ -5058,6 +5070,15 @@ int32_t D3D12XboxGetGraphicsTranslationStats(D3D12XBOX_GRAPHICS_TRANSLATION_STAT
     out_stats->graphics_rejected = g_graphics_rejected.load(std::memory_order_relaxed);
     out_stats->draws_translated = g_draws_translated.load(std::memory_order_relaxed);
     out_stats->draws_skipped = g_draws_skipped.load(std::memory_order_relaxed);
+    return 0;
+}
+
+int32_t D3D12XboxGetTranslatedDrawBindStats(D3D12XBOX_TRANSLATED_DRAW_BIND_STATS* out_stats) {
+    if (!out_stats) return -1;
+    out_stats->host_root_binds = g_host_root_binds.load(std::memory_order_relaxed);
+    out_stats->user_data_sets = g_user_data_sets.load(std::memory_order_relaxed);
+    out_stats->title_root_restores = g_title_root_restores.load(std::memory_order_relaxed);
+    out_stats->title_arguments_replayed = g_title_arguments_replayed.load(std::memory_order_relaxed);
     return 0;
 }
 

@@ -15,6 +15,15 @@
 //                     --variant pertable   SetGraphicsRootDescriptorTable before every draw,
 //                                          cycling over --textures textures with equal contents,
 //                                          so the picture is the same as `fixed`
+//   --mode tdraws   the draw path with a translated pipeline: --draws draws per frame, each a
+//                   scissored full-target triangle (vertex id only, colour in four root
+//                   constants), 4x4 pixels. The shaders are the synthetic native vertex and pixel
+//                   programs of tests/test_victory_draw_guest.cpp, translated inside the shim's
+//                   CreateGraphicsPipelineState, or the same two programs in HLSL.
+//                     --variant translated-same      root constants set once per frame
+//                     --variant translated-changing  root constants set before every draw
+//                     --variant desktop-same, desktop-changing   the HLSL pipeline, same draws
+//                   Reports the host root-signature binds and argument replays the shim made.
 //   --mode pixel    pixel shading: a fixed scene (floor + 24 beacons) at --width x --height.
 //                     --variant light      one integer hash per pixel
 //                     --variant heavy      the same hash followed by --rounds xorshift rounds
@@ -66,6 +75,7 @@
 #include <dxgi1_4.h>
 
 #include "scarlettx/gpu/d3d12_xs_abi.h"
+#include "scarlettx/gpu/victory_shader_bridge.h"
 #include "scarlettx/gpu/xg_layout.h"
 
 namespace xg = scarlettx::gpu::xg;
@@ -105,6 +115,7 @@ constexpr int kFenceGetCompletedValue = 8;
 constexpr int kFenceSetEventOnCompletion = 9;
 constexpr int kListClose = 9;
 constexpr int kListReset = 10;
+constexpr int kListDrawInstanced = 12;
 constexpr int kListDrawIndexedInstanced = 13;
 constexpr int kListCopyTextureRegion = 16;
 constexpr int kListIASetPrimitiveTopology = 20;
@@ -199,6 +210,14 @@ void PixelScene(uint32_t w, uint32_t h, uint32_t seed, uint32_t frame, std::vect
 // Draws mode: draw j of a frame covers this cell (the pattern shifts by 37 cells per frame).
 uint32_t DrawCell(uint32_t j, uint32_t frame, uint32_t cells) { return (j + (frame % cells) * 37u) % cells; }
 
+// tdraws mode: the colour in the four root constants, as bytes R, G, B, A in a dword.
+// `pair` (the switch probe) gives two consecutive draws one colour.
+uint32_t TDrawColor(bool changing, bool pair, uint32_t j, uint32_t frame) {
+    if (!changing) return 0xFF400000u | (frame & 0xFFFFu);
+    const uint32_t k = pair ? (j & ~1u) : j;
+    return 0xFF000000u | ((frame & 0xFFu) << 16) | (k & 0xFFFFu);
+}
+
 // The frame-number markers of the windowed path: squares of w/32 along the bottom edge.
 // 16 bits of the frame number (white = 1), a block that alternates magenta and cyan, then a red
 // and a green block that never change (for whoever decodes a capture).
@@ -226,6 +245,15 @@ uint32_t HeavyRounds(uint32_t v, uint32_t rounds) {
     }
     return v;
 }
+
+// tdraws mode, desktop variants: the same two programs as the translated fixtures.
+const char* kTDrawHlsl = R"(
+cbuffer Draw : register(b0) { float4 colour; };
+float4 VSMain(uint vid : SV_VertexID) : SV_POSITION {
+    return float4(float((vid << 1) & 2) * 2.0f - 1.0f, float(vid & 2) * 2.0f - 1.0f, 0.0f, 1.0f);
+}
+float4 PSMain() : SV_TARGET { return colour; }
+)";
 
 const char* kHlslTemplate = R"(
 cbuffer Draw : register(b0) {
@@ -331,6 +359,7 @@ struct FrameSample {
     int64_t present_tick = 0;  // when PresentX was called
     uint64_t completed_after = 0;  // fence value completed when the frame's calls returned
     uint32_t draws = 0;
+    uint32_t constant_sets = 0;
     uint32_t table_binds = 0;
     uint32_t submissions = 0;
     uint32_t uploads = 0;
@@ -369,6 +398,9 @@ struct Bench {
     void* root = nullptr;
     void* pso_main = nullptr;   // the mode's pipeline
     void* pso_solid = nullptr;  // markers
+    void* troot = nullptr;           // tdraws: the title's root signature (four root constants)
+    void* pso_t_desktop = nullptr;   // tdraws: HLSL pipeline
+    void* pso_t_translated = nullptr;  // tdraws: translated native pipeline (null without the bridge)
     void* vb = nullptr;
     void* ib = nullptr;
     D3D12_VERTEX_BUFFER_VIEW vbv{};
@@ -394,6 +426,8 @@ struct Bench {
     uint32_t grid_cols = 0;
 
     bool Upload() const { return a.mode == "upload"; }
+    bool TDraws() const { return a.mode == "tdraws"; }
+    bool TChanging() const { return a.variant.find("changing") != std::string::npos; }
     bool PerCopy() const { return a.variant == "percopy" || a.variant == "reuse"; }
     bool Reuse() const { return a.variant == "reuse" || a.variant == "batched-reuse"; }
     bool GuestMem() const { return a.variant == "guestmem"; }
@@ -618,7 +652,6 @@ struct Bench {
 
         void* heaps[] = {srv_heap};
         Call(list, kListSetDescriptorHeaps, uintptr_t{1}, P(heaps), uintptr_t{0});
-        Call(list, kListSetGraphicsRootSignature, P(root), uintptr_t{0}, uintptr_t{0});
         const D3D12_VIEWPORT vp{0.0f, 0.0f, static_cast<float>(rt_w), static_cast<float>(rt_h), 0.0f, 1.0f};
         const D3D12_RECT scissor{0, 0, static_cast<LONG>(rt_w), static_cast<LONG>(rt_h)};
         Call(list, kListRSSetViewports, uintptr_t{1}, P(&vp), uintptr_t{0});
@@ -629,9 +662,50 @@ struct Bench {
         Call(list, kListClearRenderTargetView, slot.rtv, P(clear), uintptr_t{0}, uintptr_t{0});
         Call(list, kListIASetPrimitiveTopology, static_cast<uintptr_t>(D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST), uintptr_t{0},
              uintptr_t{0});
+        if (TDraws()) {
+            // The title's root signature and pipeline, then per draw: a scissor rectangle, the
+            // colour (once per frame, or before every draw), three vertices. The probe switches
+            // between the translated and the desktop pipeline and changes the colour every
+            // second draw, so one list holds reused, changed and switched bindings.
+            const uint32_t cols = rt_w / kCell;
+            const uint32_t cells = cols * (rt_h / kCell);
+            const bool changing = probe || TChanging();
+            void* base_pso = a.variant.rfind("translated", 0) == 0 ? pso_t_translated : pso_t_desktop;
+            Call(list, kListSetGraphicsRootSignature, P(troot), uintptr_t{0}, uintptr_t{0});
+            Call(list, kListSetPipelineState, P(base_pso), uintptr_t{0}, uintptr_t{0});
+            void* bound = base_pso;
+            auto set_colour = [&](uint32_t j) {
+                const uint32_t v = TDrawColor(changing, probe, j, frame);
+                const float colour[4] = {static_cast<float>(v & 255u) / 255.0f, static_cast<float>((v >> 8) & 255u) / 255.0f,
+                                         static_cast<float>((v >> 16) & 255u) / 255.0f, static_cast<float>(v >> 24) / 255.0f};
+                Call(list, kListSetGraphicsRoot32BitConstants, uintptr_t{0}, uintptr_t{4}, P(colour), uintptr_t{0});
+                ++s.constant_sets;
+            };
+            if (!changing) set_colour(0);
+            for (uint32_t j = 0; j < a.draws; ++j) {
+                const uint32_t cell = DrawCell(j, frame, cells);
+                const LONG x = static_cast<LONG>((cell % cols) * kCell), y = static_cast<LONG>((cell / cols) * kCell);
+                const D3D12_RECT r{x, y, x + static_cast<LONG>(kCell), y + static_cast<LONG>(kCell)};
+                Call(list, kListRSSetScissorRects, uintptr_t{1}, P(&r), uintptr_t{0});
+                if (probe) {
+                    void* want = (j % 3 == 2) ? pso_t_desktop : pso_t_translated;
+                    if (want != bound) {
+                        Call(list, kListSetPipelineState, P(want), uintptr_t{0}, uintptr_t{0});
+                        bound = want;
+                    }
+                    if ((j & 1u) == 0) set_colour(j);
+                } else if (changing) {
+                    set_colour(j);
+                }
+                Call(list, kListDrawInstanced, uintptr_t{3}, uintptr_t{1}, uintptr_t{0}, uintptr_t{0});
+                ++s.draws;
+            }
+            Call(list, kListRSSetScissorRects, uintptr_t{1}, P(&scissor), uintptr_t{0});
+        }
+        Call(list, kListSetGraphicsRootSignature, P(root), uintptr_t{0}, uintptr_t{0});
         Call(list, kListIASetVertexBuffers, uintptr_t{0}, uintptr_t{1}, P(&vbv));
         Call(list, kListIASetIndexBuffer, P(&ibv), uintptr_t{0}, uintptr_t{0});
-        Call(list, kListSetPipelineState, P(pso_main), uintptr_t{0}, uintptr_t{0});
+        if (!TDraws()) Call(list, kListSetPipelineState, P(pso_main), uintptr_t{0}, uintptr_t{0});
 
         DrawConstants c{};
         c.target[0] = rt_w;
@@ -663,6 +737,8 @@ struct Bench {
                 DrawQuad(list);
                 ++s.draws;
             }
+        } else if (TDraws()) {
+            // drawn above, with the title's own root signature
         } else if (a.mode == "pixel") {
             static std::vector<Rect> scene;
             PixelScene(rt_w, rt_h, a.seed, frame, scene);
@@ -696,6 +772,7 @@ struct Bench {
             }
         }
         if (a.markers) {
+            if (TDraws()) Call(list, kListSetGraphicsRootDescriptorTable, uintptr_t{1}, SrvGpu(0), uintptr_t{0});
             Call(list, kListSetPipelineState, P(pso_solid), uintptr_t{0}, uintptr_t{0});
             for (uint32_t k = 0; k < MarkerCount(); ++k) {
                 const Rect r = MarkerRect(rt_w, rt_h, k);
@@ -762,6 +839,17 @@ struct Bench {
                     if (j >= a.draws) continue;
                     const uint32_t texel = probe ? Hash3(77 + j % a.textures, x & 15u, y & 15u) : Hash3(7, x & 15u, y & 15u);
                     img[static_cast<size_t>(y) * rt_w + x] = (texel & 0xFFFFu) | ((j & 0xFFFFu) << 16);
+                }
+            }
+        } else if (TDraws()) {
+            const uint32_t cols = rt_w / kCell;
+            const uint32_t cells = cols * (rt_h / kCell);
+            const uint32_t shift = ((frame % cells) * 37u) % cells;
+            for (uint32_t y = 0; y < rt_h; ++y) {
+                for (uint32_t x = 0; x < rt_w; ++x) {
+                    const uint32_t cell = (y / kCell) * cols + x / kCell;
+                    const uint32_t j = (cell + cells - shift) % cells;
+                    if (j < a.draws) img[static_cast<size_t>(y) * rt_w + x] = TDrawColor(probe || TChanging(), probe, j, frame);
                 }
             }
         } else if (a.mode == "pixel") {
@@ -895,6 +983,8 @@ bool ParseArgs(int argc, char** argv, Args& a) {
     const bool mode_ok =
         (a.mode == "draws" && (a.variant == "fixed" || a.variant == "pertable")) ||
         (a.mode == "pixel" && (a.variant == "light" || a.variant == "heavy")) ||
+        (a.mode == "tdraws" && (a.variant == "translated-same" || a.variant == "translated-changing" ||
+                                a.variant == "desktop-same" || a.variant == "desktop-changing")) ||
         (a.mode == "upload" && (a.variant == "percopy" || a.variant == "batched" || a.variant == "reuse" ||
                                 a.variant == "batched-reuse" || a.variant == "guestmem"));
     const bool path_ok = a.path == "offscreen" || a.path == "serialized" || a.path == "windowed";
@@ -911,7 +1001,7 @@ int main(int argc, char** argv) {
     Args& a = b.a;
     if (!ParseArgs(argc, argv, a)) {
         std::fprintf(stderr,
-                     "usage: bench_sx_fps --mode draws|pixel|upload --variant <see the top of bench_sx_fps.cpp>\n"
+                     "usage: bench_sx_fps --mode draws|tdraws|pixel|upload --variant <see the top of bench_sx_fps.cpp>\n"
                      "  [--path offscreen|serialized|windowed] [--shader-source desktop|translated]\n"
                      "  [--frames N] [--warmup N] [--inflight N] [--check-frames N] [--seed N]\n"
                      "  [--width N --height N] [--draws N] [--textures N] [--rounds N]\n"
@@ -924,17 +1014,18 @@ int main(int argc, char** argv) {
     g_qpc_freq = freq.QuadPart;
     if (a.path == "serialized") a.inflight = 1;
     if (a.path == "windowed") a.markers = true;
-    const char* shader_path = "desktop HLSL -> D3DCompile -> shim CreateGraphicsPipelineState (guest-facing route)";
-
-    // ---- TRANSLATED VARIANT GOES HERE --------------------------------------------------------
-    // When the shim's CreateGraphicsPipelineState accepts native RDNA2 vertex and pixel programs
-    // (as CreateComputePipelineState does today), build the same five programs as synthetic GFX10
-    // containers here and hand them to MakePipeline below instead of the DXBC blobs. Nothing else
-    // in this file needs to change: the scene, the loop and the checks do not look at the shaders.
+    const bool translated_variant = a.mode == "tdraws" && a.variant.rfind("translated", 0) == 0;
+    const char* shader_path = translated_variant
+                                  ? "synthetic native VS/PS -> shim CreateGraphicsPipelineState (translated by the "
+                                    "victory-shader bridge) -> shim command list (guest-facing route)"
+                                  : "desktop HLSL -> D3DCompile -> shim CreateGraphicsPipelineState (guest-facing route)";
+    // The translated route supports root constants only, so the modes that bind a descriptor
+    // table or a vertex buffer (draws, pixel, upload) have no translated form yet: tdraws is the
+    // translated workload.
     if (a.shader_source == "translated") {
-        std::printf("[fps] shader_source=translated NOT AVAILABLE: the shim's CreateGraphicsPipelineState does not "
-                    "translate native graphics shaders at this commit. The translated draw that exists is "
-                    "backend-only (bench_victory_prewarm --workload draw) and is not this route.\n");
+        std::printf("[fps] shader_source=translated is not available for --mode %s: the shim's translated graphics route "
+                    "supports root constants only. Use --mode tdraws --variant translated-same|translated-changing.\n",
+                    a.mode.c_str());
         return 5;
     }
 
@@ -998,7 +1089,7 @@ int main(int argc, char** argv) {
         b.rt_h = a.height;
     }
     b.rt_pitch = (b.rt_w * 4 + 255u) & ~255u;
-    if (a.mode == "draws" && a.draws > (b.rt_w / kCell) * (b.rt_h / kCell)) {
+    if ((a.mode == "draws" || a.mode == "tdraws") && a.draws > (b.rt_w / kCell) * (b.rt_h / kCell)) {
         std::fprintf(stderr, "bench_sx_fps: --draws %u does not fit %ux%u\n", a.draws, b.rt_w, b.rt_h);
         return 64;
     }
@@ -1012,7 +1103,7 @@ int main(int argc, char** argv) {
     if (hr != 0 || !b.srv_heap) return Fail("shim CreateDescriptorHeap(CBV_SRV_UAV) (slot 14)", hr);
     // Checked frames get slots of their own, after the in-flight ones, so they can run straight
     // after the timed loop without overwriting what the loop left in its render targets.
-    const uint32_t check_slots = std::min<uint32_t>(a.check_frames, 8) + (a.mode == "draws" ? 1 : 0);
+    const uint32_t check_slots = std::min<uint32_t>(a.check_frames, 8) + (a.mode == "draws" || a.mode == "tdraws" ? 1 : 0);
     const uint32_t rt_count = a.inflight + check_slots;
     heap_desc.Type = D3D12_DESCRIPTOR_HEAP_TYPE_RTV;
     heap_desc.NumDescriptors = rt_count;
@@ -1054,7 +1145,7 @@ int main(int argc, char** argv) {
 
     std::string hlsl(std::strlen(kHlslTemplate) + 32, '\0');
     hlsl.resize(static_cast<size_t>(std::snprintf(hlsl.data(), hlsl.size(), kHlslTemplate, a.rounds)));
-    const char* ps_entry = a.mode == "draws" ? "PSTex" : (a.mode == "upload" ? "PSCopy" : (a.variant == "heavy" ? "PSHeavy" : "PSLight"));
+    const char* ps_entry = a.mode == "draws" || a.mode == "tdraws" ? "PSTex" : (a.mode == "upload" ? "PSCopy" : (a.variant == "heavy" ? "PSHeavy" : "PSLight"));
     ID3DBlob* vs = nullptr;
     ID3DBlob* ps = nullptr;
     ID3DBlob* ps_solid = nullptr;
@@ -1090,6 +1181,68 @@ int main(int argc, char** argv) {
     const double pso_ms = Us(pso_start, Ticks()) / 1000.0;
     hr = make_pipeline(ps_solid, &b.pso_solid);
     if (hr != 0 || !b.pso_solid) return Fail("shim CreateGraphicsPipelineState, markers (slot 10)", hr);
+
+    // ---- tdraws: the title's root signature (four root constants) and the two pipelines -------
+    bool have_translated = false;
+    double translated_pso_ms = 0;
+    if (a.mode == "tdraws") {
+        D3D12_ROOT_PARAMETER tparam{};
+        tparam.ParameterType = D3D12_ROOT_PARAMETER_TYPE_32BIT_CONSTANTS;
+        tparam.Constants.Num32BitValues = 4;
+        D3D12_ROOT_SIGNATURE_DESC trs{};
+        trs.NumParameters = 1;
+        trs.pParameters = &tparam;
+        ID3DBlob* trs_blob = nullptr;
+        if (FAILED(D3D12SerializeRootSignature(&trs, D3D_ROOT_SIGNATURE_VERSION_1, &trs_blob, &rs_err))) {
+            return Fail("D3D12SerializeRootSignature(tdraws)", E_FAIL);
+        }
+        hr = Call(b.dev, kDevCreateRootSignature, uintptr_t{0}, P(trs_blob->GetBufferPointer()),
+                  static_cast<uintptr_t>(trs_blob->GetBufferSize()), uintptr_t{0}, P(&b.troot));
+        if (hr != 0 || !b.troot) return Fail("shim CreateRootSignature, tdraws (slot 16)", hr);
+        auto make_tdraw = [&](const void* vsb, size_t vsn, const void* psb, size_t psn, void** out) -> intptr_t {
+            D3D12_GRAPHICS_PIPELINE_STATE_DESC d{};
+            d.pRootSignature = static_cast<ID3D12RootSignature*>(b.troot);
+            d.VS = {vsb, vsn};
+            d.PS = {psb, psn};
+            d.BlendState.RenderTarget[0].RenderTargetWriteMask = D3D12_COLOR_WRITE_ENABLE_ALL;
+            d.SampleMask = 0xFFFFFFFFu;
+            d.RasterizerState.FillMode = D3D12_FILL_MODE_SOLID;
+            d.RasterizerState.CullMode = D3D12_CULL_MODE_NONE;
+            d.RasterizerState.DepthClipEnable = TRUE;
+            d.PrimitiveTopologyType = D3D12_PRIMITIVE_TOPOLOGY_TYPE_TRIANGLE;
+            d.NumRenderTargets = 1;
+            d.RTVFormats[0] = DXGI_FORMAT_R8G8B8A8_UNORM;
+            d.SampleDesc.Count = 1;
+            *out = nullptr;
+            return Call(b.dev, kDevCreateGraphicsPipelineState, P(&d), uintptr_t{0}, P(out));
+        };
+        const std::string thlsl = kTDrawHlsl;
+        ID3DBlob* tvs = nullptr;
+        ID3DBlob* tps = nullptr;
+        if (!Compile(thlsl, "VSMain", "vs_5_0", &tvs) || !Compile(thlsl, "PSMain", "ps_5_0", &tps)) return 2;
+        hr = make_tdraw(tvs->GetBufferPointer(), tvs->GetBufferSize(), tps->GetBufferPointer(), tps->GetBufferSize(),
+                        &b.pso_t_desktop);
+        if (hr != 0 || !b.pso_t_desktop) return Fail("shim CreateGraphicsPipelineState, tdraws desktop (slot 10)", hr);
+        // The synthetic native vertex (9) and pixel (10) programs, as console-shaped containers.
+        std::vector<uint8_t> nvs, nps;
+        if (scarlettx::BuildVictorySyntheticContainer(9, nvs).ok() && scarlettx::BuildVictorySyntheticContainer(10, nps).ok()) {
+            const int64_t t0 = Ticks();
+            hr = make_tdraw(nvs.data(), nvs.size(), nps.data(), nps.size(), &b.pso_t_translated);
+            translated_pso_ms = Us(t0, Ticks()) / 1000.0;
+            if (hr != 0 || !b.pso_t_translated) return Fail("shim CreateGraphicsPipelineState, translated (slot 10)", hr);
+            D3D12XBOX_GRAPHICS_TRANSLATION_STATS gs{};
+            D3D12XboxGetGraphicsTranslationStats(&gs);
+            if (gs.graphics_translated != 1) {
+                std::printf("[fps] FAILED the shim did not translate the native pipeline (graphics_translated=%llu)\n",
+                            static_cast<unsigned long long>(gs.graphics_translated));
+                return 2;
+            }
+            have_translated = true;
+        } else if (translated_variant) {
+            std::printf("[fps] translated variant NOT AVAILABLE: this build has no victory-shader bridge\n");
+            return 5;
+        }
+    }
 
     // ---- geometry: one unit quad -------------------------------------------------------------
     const float corners[8] = {0, 0, 1, 0, 0, 1, 1, 1};
@@ -1139,7 +1292,7 @@ int main(int argc, char** argv) {
     srv.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE2D;
     srv.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
     srv.Texture2D.MipLevels = 1;
-    if (a.mode == "draws" || a.mode == "pixel") {
+    if (a.mode == "draws" || a.mode == "pixel" || a.mode == "tdraws") {
         // 16x16 textures filled once: `textures` with equal contents, then as many with contents
         // of their own for the binding probe. Pixel mode binds one and does not sample it.
         const uint32_t count = a.mode == "draws" ? a.textures * 2 : 1;
@@ -1304,6 +1457,10 @@ int main(int argc, char** argv) {
     std::vector<FrameSample> samples(a.frames);
     const uint64_t fence_before = b.fence_value;
     const uint64_t waits_before = b.fence_waits;
+    D3D12XBOX_TRANSLATED_DRAW_BIND_STATS bind0{}, bind1{};
+    D3D12XBOX_GRAPHICS_TRANSLATION_STATS gfx0{}, gfx1{};
+    D3D12XboxGetTranslatedDrawBindStats(&bind0);
+    D3D12XboxGetGraphicsTranslationStats(&gfx0);
     const unsigned long long loop_unix_us = UnixMicros();
     const int64_t loop_start = Ticks();
     for (uint32_t f = 0; f < a.frames; ++f) {
@@ -1313,6 +1470,8 @@ int main(int argc, char** argv) {
     const int64_t loop_submitted = Ticks();
     b.WaitFor(b.fence_value);  // drain
     const int64_t loop_end = Ticks();
+    D3D12XboxGetTranslatedDrawBindStats(&bind1);
+    D3D12XboxGetGraphicsTranslationStats(&gfx1);
     const uint64_t fence_after = b.fence_value;
     const uint64_t completed_after = b.Completed();
     const uint64_t loop_waits = b.fence_waits - waits_before;
@@ -1332,7 +1491,8 @@ int main(int argc, char** argv) {
     }
     // 2. Draws mode: a frame with a table change per draw over textures that differ, to show
     //    that the per-draw binding reaches the draw.
-    if (a.mode == "draws") {
+    const bool has_probe = a.mode == "draws" || (a.mode == "tdraws" && have_translated);
+    if (has_probe) {
         Slot& slot = b.slots[a.inflight + extra];
         FrameSample s{};
         run_frame(next++, true, slot.readback, s, &slot);
@@ -1340,8 +1500,12 @@ int main(int argc, char** argv) {
     b.WaitFor(b.fence_value);
     for (uint32_t i = 0; i < check_slots; ++i) {
         const Slot& slot = b.slots[a.inflight + i];
-        const bool probe = a.mode == "draws" && i == extra;
-        exact += b.Compare(slot.readback, slot.last_frame, probe, probe ? "binding probe (distinct textures)" : "checked frame");
+        const bool probe = i == extra;
+        if (probe && !has_probe) continue;
+        exact += b.Compare(slot.readback, slot.last_frame, probe,
+                           !probe ? "checked frame"
+                                  : a.mode == "draws" ? "binding probe (distinct textures)"
+                                                      : "switch probe (translated and desktop pipelines, colour every second draw)");
         checked += pixels;
     }
     // 3. What the timed loop left in each in-flight slot's render target.
@@ -1363,7 +1527,7 @@ int main(int argc, char** argv) {
 
     // ---- results -----------------------------------------------------------------------------
     FILE* csv = a.csv.empty() ? nullptr : std::fopen(a.csv.c_str(), "a");
-    const std::string param = a.mode == "draws" ? "draws=" + std::to_string(a.draws)
+    const std::string param = a.mode == "draws" || a.mode == "tdraws" ? "draws=" + std::to_string(a.draws)
                               : a.mode == "pixel" ? std::to_string(b.rt_w) + "x" + std::to_string(b.rt_h)
                                                   : std::to_string(a.upload_count) + "x" + std::to_string(a.upload_size);
     auto metric = [&](const char* name, double value) {
@@ -1427,6 +1591,19 @@ int main(int argc, char** argv) {
     metric("submit_ms_total", submit_total / 1000.0);
     metric("draws_per_frame", static_cast<double>(draws) / n);
     metric("table_binds_per_frame", static_cast<double>(binds) / n);
+    if (a.mode == "tdraws") {
+        uint64_t csets = 0;
+        for (const FrameSample& fs : samples) csets += fs.constant_sets;
+        metric("constant_sets_per_frame", static_cast<double>(csets) / n);
+        metric("translated_draws_per_frame", static_cast<double>(gfx1.draws_translated - gfx0.draws_translated) / n);
+        metric("translated_draws_skipped", static_cast<double>(gfx1.draws_skipped - gfx0.draws_skipped));
+        metric("host_root_binds_per_frame", static_cast<double>(bind1.host_root_binds - bind0.host_root_binds) / n);
+        metric("user_data_sets_per_frame", static_cast<double>(bind1.user_data_sets - bind0.user_data_sets) / n);
+        metric("title_root_restores_per_frame", static_cast<double>(bind1.title_root_restores - bind0.title_root_restores) / n);
+        metric("title_arguments_replayed_per_frame",
+               static_cast<double>(bind1.title_arguments_replayed - bind0.title_arguments_replayed) / n);
+        metric("translated_pso_create_ms", translated_pso_ms);
+    }
     metric("submissions_per_frame", static_cast<double>(submissions) / n);
     metric("uploads_per_frame", static_cast<double>(uploads) / n);
     metric("upload_bytes_per_frame", static_cast<double>(upload_bytes) / n);

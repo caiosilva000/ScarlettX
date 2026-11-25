@@ -1406,7 +1406,7 @@ fn synthetic_pixel_program_with_table() -> NativeProgram {
     w.extend_from_slice(&buffer_store_dword(0, 8, 0));
     w.extend_from_slice(&exp(EXP_MRT0, [0, 1, 2, 3], true));
     w.push(S_ENDPGM);
-    let mut native = synthetic_pixel_program();
+    let mut native = synthetic_pixel_program(0);
     native.code = w.iter().flat_map(|w| w.to_le_bytes()).collect();
     native.vgprs = 16;
     native.layout.push(RootParam {
@@ -1458,7 +1458,7 @@ fn synthetic_container(variant: u32) -> Option<Vec<u8>> {
             Some(graphics_container(&native, vertex_signatures(), xbch(&fssm_program(&native))))
         }
         10 => {
-            let native = synthetic_pixel_program();
+            let native = synthetic_pixel_program(0);
             Some(graphics_container(&native, pixel_signatures(), xbch(&fssm_program(&native))))
         }
         11 => {

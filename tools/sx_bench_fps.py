@@ -52,7 +52,10 @@ KEY_METRICS = ["completed_fps", "serialized_frames_per_second", "serialized_subm
                "cpu_prep_ms_p95", "submit_ms_median", "submit_ms_p95", "fence_wait_ms_median", "fence_wait_ms_total",
                "draws_per_frame", "table_binds_per_frame", "submissions_per_frame", "uploads_per_frame",
                "upload_bytes_per_frame", "present_call_interval_ms_median", "present_call_interval_ms_p95",
-               "present_call_interval_ms_p99", "present_call_ms_median", "presented_fps"]
+               "present_call_interval_ms_p99", "present_call_ms_median", "presented_fps",
+               "constant_sets_per_frame", "translated_draws_per_frame", "host_root_binds_per_frame",
+               "user_data_sets_per_frame", "title_root_restores_per_frame", "title_arguments_replayed_per_frame",
+               "frame_interval_ms_p95", "fence_wait_ms_p95", "cpu_prep_ms_p99", "submit_ms_p99"]
 
 
 def sh(cmd, timeout=30):
@@ -439,7 +442,10 @@ def main() -> int:
     ap.add_argument("--upload-count", type=int, default=16)
     ap.add_argument("--upload-size", type=int, default=256)
     ap.add_argument("--interval-us", type=int, default=16667)
-    ap.add_argument("--modes", nargs="+", default=["draws", "pixel", "upload"], choices=["draws", "pixel", "upload"])
+    ap.add_argument("--modes", nargs="+", default=["draws", "pixel", "upload"],
+                    choices=["draws", "tdraws", "pixel", "upload"])
+    ap.add_argument("--tdraw-variants", nargs="+",
+                    default=["desktop-same", "desktop-changing", "translated-same", "translated-changing"])
     ap.add_argument("--ab-cells", nargs="+", default=["upload:guestmem", "upload:batched-reuse", "draws:fixed", "pixel:heavy"],
                     help="suite ab: mode:variant cells to run on both builds; add :windowed for the windowed path")
     ap.add_argument("--timeout", type=int, default=240)
@@ -502,6 +508,9 @@ def main() -> int:
         run.launch(build, "discard", cell("pixel", "heavy", frames=60))
         run.launch(build, "discard", cell("upload", "batched-reuse", frames=60))
         run.launch(build, "discard", cell("draws", "pertable", draws=1000, frames=60))
+        if "tdraws" in args.modes or any(c.startswith("tdraws") for c in args.ab_cells):
+            for v in args.tdraw_variants:
+                run.launch(build, "discard", cell("tdraws", v, draws=1000, frames=60))
 
     capture_report = None
     if args.suite == "offscreen":
@@ -509,6 +518,9 @@ def main() -> int:
             for count in args.draw_counts:
                 run.group(a, "offscreen", [cell("draws", "fixed", draws=count), cell("draws", "pertable", draws=count)],
                           args.repetitions)
+        if "tdraws" in args.modes:
+            for count in args.draw_counts:
+                run.group(a, "offscreen", [cell("tdraws", v, draws=count) for v in args.tdraw_variants], args.repetitions)
         if "pixel" in args.modes:
             for res in args.resolutions:
                 run.group(a, "offscreen", [cell("pixel", "light", **size(res)), cell("pixel", "heavy", **size(res))],
@@ -520,6 +532,8 @@ def main() -> int:
         serial = []
         if "draws" in args.modes:
             serial.append(cell("draws", "fixed", draws=4000, path="serialized"))
+        if "tdraws" in args.modes:
+            serial += [cell("tdraws", v, draws=4000, path="serialized") for v in args.tdraw_variants]
         if "pixel" in args.modes:
             serial.append(cell("pixel", "heavy", path="serialized", **size(args.resolutions[-1])))
         if "upload" in args.modes:
@@ -532,16 +546,25 @@ def main() -> int:
         paced = {"path": "windowed", "interval-us": args.interval_us}
         free = {"path": "windowed", "interval-us": 0}
         cells = []
-        for res in args.resolutions:  # the window's client size stays 1280x720 for every one of these
-            cells += [cell("pixel", "light", **size(res), **paced), cell("pixel", "heavy", **size(res), **paced)]
-        cells += [cell("draws", "fixed", draws=4000, **paced), cell("upload", "batched-reuse", **paced),
-                  cell("upload", "guestmem", **paced)]
+        if "pixel" in args.modes:
+            for res in args.resolutions:  # the window's client size stays 1280x720 for every one of these
+                cells += [cell("pixel", "light", **size(res), **paced), cell("pixel", "heavy", **size(res), **paced)]
+        if "draws" in args.modes:
+            cells += [cell("draws", "fixed", draws=4000, **paced), cell("draws", "pertable", draws=4000, **paced)]
+        if "tdraws" in args.modes:
+            cells += [cell("tdraws", v, draws=4000, **paced) for v in args.tdraw_variants]
+        if "upload" in args.modes:
+            cells += [cell("upload", "batched-reuse", **paced), cell("upload", "guestmem", **paced)]
         for r in range(args.repetitions):
             order = cells[r % len(cells):] + cells[:r % len(cells)]
             for c in order:
                 run.launch(a, "windowed-paced", c, capture=capturer)
-        uncapped = [cell("pixel", "light", **size(args.resolutions[-1]), **free),
-                    cell("pixel", "heavy", **size(args.resolutions[-1]), **free)]
+        uncapped = []
+        if "pixel" in args.modes:
+            uncapped += [cell("pixel", "light", **size(args.resolutions[-1]), **free),
+                         cell("pixel", "heavy", **size(args.resolutions[-1]), **free)]
+        if "tdraws" in args.modes:
+            uncapped += [cell("tdraws", v, draws=16000, **free) for v in args.tdraw_variants if v.startswith("translated")]
         for r in range(max(2, args.repetitions // 2)):
             for c in (uncapped if r % 2 == 0 else uncapped[::-1]):
                 run.launch(a, "windowed-uncapped", c, capture=capturer)
@@ -550,8 +573,11 @@ def main() -> int:
         cells = []
         for spec in args.ab_cells:
             mode, variant, *rest = spec.split(":")
-            kw = {"draws": 4000} if mode == "draws" else (size(args.resolutions[-1]) if mode == "pixel" else {})
-            if rest and rest[0] == "windowed":
+            kw = {"draws": 4000} if mode in ("draws", "tdraws") else (size(args.resolutions[-1]) if mode == "pixel" else {})
+            for extra in rest:
+                if extra.startswith("draws="):
+                    kw["draws"] = int(extra.split("=")[1])
+            if "windowed" in rest:
                 kw.update({"path": "windowed", "interval-us": args.interval_us})
             cells.append(cell(mode, variant, **kw))
         flip = False
