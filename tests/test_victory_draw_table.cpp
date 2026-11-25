@@ -28,6 +28,11 @@
 //      ranges, into slots at nonzero offsets                  -> the copied slots and their neighbours
 //  13  a buffer's unordered access view copied over a
 //      sampled slot, by each call                             -> draw dropped, target untouched
+//  14  which descriptor writes make a draw check its view
+//      again: other slots and heaps (never), the sampled
+//      slot by each call, a heap switch, a reset list, a
+//      slot reused after its texture was released, a UAV
+//      copied over the sampled slot                           -> exact frames; views validated as counted
 //  10  released in flight, each with objects of its own:
 //      the pipeline, the descriptor heap, the title's root
 //      signature, the texture                                 -> the draw still shows the texture
@@ -275,6 +280,14 @@ struct Rig {
                         uintptr_t{0}, uintptr_t{0}, P(&list)) == 0 && list);
         return list;
     }
+    // A list together with its allocator, for a title that resets and records again.
+    void* NewListKeepingAllocator(void** out_allocator) {
+        void* list = nullptr;
+        SX_REQUIRE(Call(shim_device, 9, static_cast<uintptr_t>(D3D12_COMMAND_LIST_TYPE_DIRECT), uintptr_t{0}, P(out_allocator)) == 0);
+        SX_REQUIRE(Call(shim_device, 12, uintptr_t{0}, static_cast<uintptr_t>(D3D12_COMMAND_LIST_TYPE_DIRECT), P(*out_allocator),
+                        uintptr_t{0}, uintptr_t{0}, P(&list)) == 0 && list);
+        return list;
+    }
     ID3D12GraphicsCommandList* Native(void* shim_list) {
         ID3D12GraphicsCommandList* list = nullptr;
         SX_REQUIRE(D3D12XboxGetNativeObject(shim_list, reinterpret_cast<void**>(&list)) == 0 && list);
@@ -488,6 +501,12 @@ D3D12XBOX_GRAPHICS_TRANSLATION_STATS Stats() {
 D3D12XBOX_TRANSLATED_DRAW_BIND_STATS Binds() {
     D3D12XBOX_TRANSLATED_DRAW_BIND_STATS s{};
     SX_REQUIRE(D3D12XboxGetTranslatedDrawBindStats(&s) == 0);
+    return s;
+}
+
+D3D12XBOX_TRANSLATED_VIEW_CHECK_STATS ViewChecks() {
+    D3D12XBOX_TRANSLATED_VIEW_CHECK_STATS s{};
+    SX_REQUIRE(D3D12XboxGetTranslatedViewCheckStats(&s) == 0);
     return s;
 }
 
@@ -811,6 +830,180 @@ int main() {
         // And the slot beside the overwritten one still holds its texture.
         if (!draw_slot(10)) return 5;
         frame_check({{kWhole, 0, {0, 0, 0, 0}}}, "13 slot 10, beside the overwritten slot 9, still views A");
+    }
+
+    // 14. Which descriptor writes make a translated draw look at its binding again. A draw whose
+    //     arguments did not change must check its view again only when a descriptor it uses was
+    //     written, not when any other descriptor was.
+    {
+        Rig::Heap src = r.ViewHeap(4);
+        Rig::Heap own = r.ViewHeap(12);
+        Rig::Heap other = r.ViewHeap(12);
+        r.TextureView(src, 0, tex_a);
+        r.TextureView(src, 1, tex_b);
+        {
+            D3D12_HEAP_PROPERTIES hp{};
+            hp.Type = D3D12_HEAP_TYPE_DEFAULT;
+            D3D12_RESOURCE_DESC bd{};
+            bd.Dimension = D3D12_RESOURCE_DIMENSION_BUFFER;
+            bd.Width = 256;
+            bd.Height = 1;
+            bd.DepthOrArraySize = 1;
+            bd.MipLevels = 1;
+            bd.SampleDesc.Count = 1;
+            bd.Layout = D3D12_TEXTURE_LAYOUT_ROW_MAJOR;
+            bd.Flags = D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS;
+            void* buffer = nullptr;
+            SX_REQUIRE(Call(r.shim_device, 27, P(&hp), uintptr_t{0}, P(&bd), static_cast<uintptr_t>(D3D12_RESOURCE_STATE_UNORDERED_ACCESS),
+                            uintptr_t{0}, uintptr_t{0}, P(&buffer)) == 0 && buffer);
+            D3D12_UNORDERED_ACCESS_VIEW_DESC view{};
+            view.Format = DXGI_FORMAT_R32_TYPELESS;
+            view.ViewDimension = D3D12_UAV_DIMENSION_BUFFER;
+            view.Buffer.NumElements = 64;
+            view.Buffer.Flags = D3D12_BUFFER_UAV_FLAG_RAW;
+            Call(r.shim_device, 19, P(buffer), uintptr_t{0}, P(&view), src.cpu + static_cast<uintptr_t>(2) * r.increment);
+        }
+        const uintptr_t kViews = static_cast<uintptr_t>(D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV);
+        auto at = [&](const Rig::Heap& h, UINT slot) { return h.cpu + static_cast<uintptr_t>(slot) * r.increment; };
+        auto copy_simple = [&](const Rig::Heap& h, UINT dst_slot, UINT src_slot) {
+            Call(r.shim_device, 24, uintptr_t{1}, at(h, dst_slot), at(src, src_slot), kViews);
+        };
+        // CopyDescriptors with two destination ranges, {first} and {second, second + 1}, from the
+        // source ranges {src_first} and {src_second, src_second} (the last two one at a time).
+        auto copy_ranges = [&](const Rig::Heap& h, UINT first, UINT second, UINT src_first, UINT src_second) {
+            const D3D12_CPU_DESCRIPTOR_HANDLE dst_starts[2] = {{at(h, first)}, {at(h, second)}};
+            const UINT dst_sizes[2] = {1, 2};
+            const D3D12_CPU_DESCRIPTOR_HANDLE src_starts[3] = {{at(src, src_first)}, {at(src, src_second)}, {at(src, src_second)}};
+            const UINT src_sizes[3] = {1, 1, 1};
+            Call(r.shim_device, 23, uintptr_t{2}, P(dst_starts), P(dst_sizes), uintptr_t{3}, P(src_starts), P(src_sizes), kViews);
+        };
+        const Region kNothing{0, 0, 0, 0};  // a draw that shades no pixel: it only makes the binding
+        auto cell = [](int i) { return Region{16 * (i % 4), 32 * (i / 4), 16 * (i % 4) + 16, 32 * (i / 4) + 32}; };
+        auto begin = [&](void* list, const Rig::Heap& h, UINT slot) {
+            r.Begin(list, &h, root);
+            r.Pipeline(list, pso);
+            r.Constants(list, zero);
+            r.Table(list, h, slot);
+        };
+        auto validated_since = [&](const D3D12XBOX_TRANSLATED_VIEW_CHECK_STATS& before_checks) {
+            return static_cast<long long>(ViewChecks().views_validated - before_checks.views_validated);
+        };
+
+        // 14a. Unrelated descriptors written between draws, three ways: the binding stands.
+        r.TextureView(own, 2, tex_a);
+        {
+            const auto checks = ViewChecks();
+            void* list = r.NewList();
+            begin(list, own, 2);
+            r.DrawIn(list, cell(0));
+            r.TextureView(own, 7, tex_b);          // CreateShaderResourceView into another slot
+            r.DrawIn(list, cell(1));
+            copy_simple(own, 8, 1);                // CopyDescriptorsSimple into another slot
+            r.DrawIn(list, cell(2));
+            copy_ranges(own, 5, 9, 1, 2);          // CopyDescriptors into 5 and 9, 10 (a UAV among them)
+            r.DrawIn(list, cell(3));
+            r.TextureView(other, 2, tex_b);        // the same index in another heap
+            r.DrawIn(list, cell(4));
+            if (!r.Wait(r.End(list))) return 5;
+            frame_check({{cell(0), 0, {0, 0, 0, 0}}, {cell(1), 0, {0, 0, 0, 0}}, {cell(2), 0, {0, 0, 0, 0}}, {cell(3), 0, {0, 0, 0, 0}},
+                         {cell(4), 0, {0, 0, 0, 0}}},
+                        "14a five draws of A with other descriptors written in between");
+            const long long validated = validated_since(checks);
+            std::printf("%s 14a views validated: %lld (want 1: the first draw)\n", kTag, validated);
+            r.Check(validated == 1, "14a writes to descriptors the draw does not use leave its binding alone");
+        }
+        // 14b. The sampled descriptor overwritten with B's view, three ways: checked again, and B.
+        for (int way = 0; way < 3; ++way) {
+            static const char* const kWays[] = {"14b the sampled slot rewritten by CreateShaderResourceView",
+                                                "14b the sampled slot rewritten by CopyDescriptorsSimple",
+                                                "14b the sampled slot rewritten by CopyDescriptors (second range)"};
+            const UINT slot = 3;
+            r.TextureView(own, slot, tex_a);
+            r.TextureView(own, slot + 1, tex_a);
+            const auto checks = ViewChecks();
+            void* list = r.NewList();
+            begin(list, own, slot);
+            r.DrawIn(list, kNothing);              // the binding is made, and found to be A's view
+            if (way == 0) r.TextureView(own, slot, tex_b);
+            else if (way == 1) copy_simple(own, slot, 1);
+            else copy_ranges(own, 11, slot, 0, 1); // 11 <- A; slot and slot + 1 <- B
+            r.DrawIn(list, kWhole);
+            if (!r.Wait(r.End(list))) return 5;
+            frame_check({{kWhole, 1, {0, 0, 0, 0}}}, kWays[way]);
+            const long long validated = validated_since(checks);
+            std::printf("%s %s: views validated %lld (want 2)\n", kTag, kWays[way], validated);
+            r.Check(validated == 2, "14b a write to the sampled descriptor is checked again");
+        }
+        // 14c. A heap switch in one list: the same index in another heap is another view.
+        r.TextureView(own, 2, tex_a);
+        r.TextureView(other, 2, tex_b);
+        {
+            const auto checks = ViewChecks();
+            void* list = r.NewList();
+            begin(list, own, 2);
+            r.DrawIn(list, kLeft);
+            void* heaps[] = {other.proxy};
+            Call(list, 32, uintptr_t{1}, P(heaps), uintptr_t{0});  // SetDescriptorHeaps
+            r.Table(list, other, 2);
+            r.DrawIn(list, kRight);
+            if (!r.Wait(r.End(list))) return 5;
+            frame_check({{kLeft, 0, {0, 0, 0, 0}}, {kRight, 1, {0, 0, 0, 0}}}, "14c the heap switched between two draws, same index");
+            r.Check(validated_since(checks) == 2, "14c a heap switch is checked again");
+        }
+        // 14d. The list reset and recorded again with the same state: checked again.
+        {
+            void* allocator = nullptr;
+            void* list = r.NewListKeepingAllocator(&allocator);
+            begin(list, own, 2);
+            r.DrawIn(list, kWhole);
+            if (!r.Wait(r.End(list))) return 5;
+            frame_check({{kWhole, 0, {0, 0, 0, 0}}}, "14d before the reset: A");
+            r.TextureView(own, 2, tex_b);
+            const auto checks = ViewChecks();
+            SX_REQUIRE(Call(allocator, 8) == 0);                                   // ID3D12CommandAllocator::Reset
+            SX_REQUIRE(Call(list, 10, P(allocator), uintptr_t{0}) == 0);           // ID3D12GraphicsCommandList::Reset
+            begin(list, own, 2);
+            r.DrawIn(list, kWhole);
+            if (!r.Wait(r.End(list))) return 5;
+            frame_check({{kWhole, 1, {0, 0, 0, 0}}}, "14d the list reset, the slot now B's view");
+            r.Check(validated_since(checks) == 1, "14d a reset list checks its view again");
+        }
+        // 14e. A slot reused after its texture was retired.
+        {
+            void* retired = r.Texture(0);
+            r.TextureView(own, 6, retired);
+            void* list = r.NewList();
+            begin(list, own, 6);
+            r.DrawIn(list, kWhole);
+            if (!r.Wait(r.End(list))) return 5;
+            frame_check({{kWhole, 0, {0, 0, 0, 0}}}, "14e slot 6 views a texture of its own");
+            SX_REQUIRE(Call(retired, 2) == 0);     // the title's last reference
+            r.TextureView(own, 6, tex_b);          // the slot is given another texture's view
+            list = r.NewList();
+            begin(list, own, 6);
+            r.DrawIn(list, kWhole);
+            if (!r.Wait(r.End(list))) return 5;
+            frame_check({{kWhole, 1, {0, 0, 0, 0}}}, "14e slot 6 reused for B after that texture was released");
+        }
+        // 14f. A buffer's unordered access view copied over the sampled slot after the binding
+        //      was made: the next draw is dropped.
+        for (int way = 0; way < 2; ++way) {
+            static const char* const kWays[] = {"14f a UAV copied over the sampled slot by CopyDescriptorsSimple",
+                                                "14f a UAV copied over the sampled slot by CopyDescriptors (second range)"};
+            r.TextureView(own, 3, tex_a);
+            r.TextureView(own, 4, tex_a);
+            const auto stats_before = Stats();
+            void* list = r.NewList();
+            begin(list, own, 3);
+            r.DrawIn(list, kNothing);
+            if (way == 0) copy_simple(own, 3, 2);
+            else copy_ranges(own, 11, 3, 0, 2);
+            r.DrawIn(list, kWhole);
+            if (!r.Wait(r.End(list))) return 5;
+            const auto stats = Stats();
+            frame_check({}, kWays[way]);
+            r.Check(stats.draws_skipped - stats_before.draws_skipped == 1, "14f the draw after the copy was dropped");
+        }
     }
 
     // 10. Objects released while the draw that uses them is in flight. Each case has objects of

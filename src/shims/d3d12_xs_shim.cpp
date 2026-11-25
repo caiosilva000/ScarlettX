@@ -237,6 +237,10 @@ std::atomic<uint64_t> g_host_root_binds{0};
 std::atomic<uint64_t> g_user_data_sets{0};
 std::atomic<uint64_t> g_title_root_restores{0};
 std::atomic<uint64_t> g_title_arguments_replayed{0};
+// See D3D12XBOX_TRANSLATED_VIEW_CHECK_STATS.
+std::atomic<uint64_t> g_view_bindings_built{0};
+std::atomic<uint64_t> g_views_validated{0};
+std::atomic<uint64_t> g_view_slot_rechecks{0};
 // The same four for translated compute dispatches.
 std::atomic<uint64_t> g_compute_host_root_binds{0};
 std::atomic<uint64_t> g_compute_user_data_sets{0};
@@ -1871,6 +1875,7 @@ bool BindTranslatedGraphics(XboxD3D12GraphicsCommandListProxy* obj) {
         g_draws_translated.fetch_add(1, std::memory_order_relaxed);
         return true;
     }
+    g_view_bindings_built.fetch_add(1, std::memory_order_relaxed);
     const scarlettx::VictoryComputeBinding* stages[2] = {&pipeline.vs, &pipeline.ps};
     std::vector<uint32_t>* user_data = obj->scratch_user_data;
     auto drop = [](const std::string& why, int stage) {
@@ -1898,6 +1903,7 @@ bool BindTranslatedGraphics(XboxD3D12GraphicsCommandListProxy* obj) {
                 const uint32_t index = static_cast<uint32_t>((table_it->second - start) / increment);
                 // The one view this route maps is a 2D texture read as a shader resource.
                 GuestViewRecord record;
+                g_views_validated.fetch_add(1, std::memory_order_relaxed);
                 if (obj->view_heap_records) {
                     std::lock_guard<std::mutex> lock(g_view_heaps_mutex);
                     if (index < obj->view_heap_records->views.size()) record = obj->view_heap_records->views[index];
@@ -5703,6 +5709,14 @@ int32_t D3D12XboxGetTranslatedDrawBindStats(D3D12XBOX_TRANSLATED_DRAW_BIND_STATS
     out_stats->user_data_sets = g_user_data_sets.load(std::memory_order_relaxed);
     out_stats->title_root_restores = g_title_root_restores.load(std::memory_order_relaxed);
     out_stats->title_arguments_replayed = g_title_arguments_replayed.load(std::memory_order_relaxed);
+    return 0;
+}
+
+int32_t D3D12XboxGetTranslatedViewCheckStats(D3D12XBOX_TRANSLATED_VIEW_CHECK_STATS* out_stats) {
+    if (!out_stats) return -1;
+    out_stats->bindings_built = g_view_bindings_built.load(std::memory_order_relaxed);
+    out_stats->views_validated = g_views_validated.load(std::memory_order_relaxed);
+    out_stats->slot_rechecks = g_view_slot_rechecks.load(std::memory_order_relaxed);
     return 0;
 }
 

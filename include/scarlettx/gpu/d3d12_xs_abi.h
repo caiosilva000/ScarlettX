@@ -293,6 +293,13 @@ struct D3D12XBOX_TRANSLATED_DRAW_BIND_STATS {
     uint64_t title_arguments_replayed;  // the title's root constants and tables set again after it
 };
 SCARLETTX_D3D12_API int32_t D3D12XboxGetTranslatedDrawBindStats(D3D12XBOX_TRANSLATED_DRAW_BIND_STATS* out_stats);
+// How often translated draws looked at the descriptors their tables name.
+struct D3D12XBOX_TRANSLATED_VIEW_CHECK_STATS {
+    uint64_t bindings_built;   // draws that built their user data again (arguments, heap or a used descriptor changed)
+    uint64_t views_validated;  // descriptor records read and checked against what the shader samples
+    uint64_t slot_rechecks;    // draws that only compared the change counts of the descriptors they use
+};
+SCARLETTX_D3D12_API int32_t D3D12XboxGetTranslatedViewCheckStats(D3D12XBOX_TRANSLATED_VIEW_CHECK_STATS* out_stats);
 // The same counts for translated compute dispatches (the compute root signature and arguments).
 SCARLETTX_D3D12_API int32_t D3D12XboxGetTranslatedDispatchBindStats(D3D12XBOX_TRANSLATED_DRAW_BIND_STATS* out_stats);
 SCARLETTX_D3D12_API int32_t D3D12XboxQueryCapabilities(
