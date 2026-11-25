@@ -13,8 +13,10 @@
 // sentinel. The adapter's wave capability is printed, and each lane case says whether the host
 // could have run it as real waves of that size.
 //
-// A lane case whose pipeline the host refuses is an explicit SKIP (the host cannot run that wave
-// size); `groups` and `lanes32` must pass. Exit codes: 0 pass, 1 a required check failed,
+// A case whose translated shader expects a wave size outside the adapter's lane range must be
+// refused by the shim (0x80004001) and is then an explicit SKIP; refused any other way it fails.
+// A lane case whose pipeline the host refuses is a SKIP too; `groups` and `lanes32` must pass.
+// The last line names the cases that ran and the ones skipped. Exit codes: 0 pass, 1 a required check failed,
 // 2 a call failed, 3 no device, 4 a fixture could not be built.
 #include "victory_guest_rig.h"
 
@@ -95,6 +97,8 @@ int main(int argc, char** argv) {
                 have_caps ? options1.TotalLaneCount : 0);
 
     int failures = 0;
+    std::string ran;      // cases that were dispatched and compared
+    std::string skipped;  // cases refused for a reason the adapter gives
     for (const auto& test : cases) {
         std::vector<uint8_t> container;
         if (!scarlettx::BuildVictorySyntheticContainer(test.variant, container).ok()) {
@@ -103,6 +107,29 @@ int main(int argc, char** argv) {
         }
         const bool host_has_wave = have_caps && options1.WaveOps && options1.WaveLaneCountMin <= test.lanes &&
                                    test.lanes <= options1.WaveLaneCountMax;
+        // What wave size the translated shader expects, from the bridge directly: a case the
+        // adapter cannot run as that wave is refused by the shim, and that is a skip, not a failure.
+        std::string wave_why;
+        bool wave_supported = true;
+        {
+            scarlettx::VictoryShaderInfo wave_info;
+            scarlettx::VictoryComputeBinding wave_binding;
+            std::vector<uint8_t> dxil;
+            uint32_t expect_min = 0;
+            uint32_t expect_max = 0xFFFFFFFFu;
+            if (scarlettx::TranslateVictoryCompute(container.data(), container.size(), wave_info, wave_binding, dxil) ==
+                    scarlettx::VictoryComputeOutcome::Translated &&
+                scarlettx::DxilExpectedWaveLanes(dxil.data(), dxil.size(), expect_min, expect_max) && have_caps) {
+                wave_supported = scarlettx::WaveLanesSupported(expect_min, expect_max, options1.WaveOps != FALSE,
+                                                               options1.WaveLaneCountMin, options1.WaveLaneCountMax, wave_why);
+            }
+            if (expect_min == 0 && expect_max == 0xFFFFFFFFu) {
+                std::printf("[victory-conf] case=%s expects waves of any size\n", test.name);
+            } else {
+                std::printf("[victory-conf] case=%s expects waves of %u..%u lanes: %s\n", test.name, expect_min, expect_max,
+                            wave_supported ? "the adapter runs that" : "the adapter does not run that");
+            }
+        }
         const auto before = sxrig::Stats();
         void* pso = nullptr;
         const HRESULT hr = rig.CreatePipeline(rig.title_root, container, &pso);
@@ -111,17 +138,33 @@ int main(int argc, char** argv) {
                     test.name, container.size(), static_cast<uint32_t>(hr),
                     static_cast<unsigned long long>(after.compute_translated - before.compute_translated),
                     static_cast<unsigned long long>(after.compute_rejected - before.compute_rejected));
+        if (!wave_supported) {
+            // The shim must refuse it, with "not implemented", before the host sees it.
+            const bool refused_by_shim = (FAILED(hr) || !pso) && after.compute_rejected - before.compute_rejected == 1 &&
+                                         hr == static_cast<HRESULT>(0x80004001u);
+            if (refused_by_shim) {
+                std::printf("[victory-conf] case=%s verdict=SKIP (unsupported wave size, refused by the shim with 0x80004001: %s)\n",
+                            test.name, wave_why.c_str());
+                skipped += std::string(skipped.empty() ? "" : ",") + test.name;
+            } else {
+                std::printf("[victory-conf] case=%s verdict=FAIL (a wave size the adapter does not run was not refused by the shim: "
+                            "hr=0x%08x)\n", test.name, static_cast<uint32_t>(hr));
+                ++failures;
+            }
+            continue;
+        }
         if (FAILED(hr) || !pso) {
             const bool translator_refused = after.compute_rejected != before.compute_rejected &&
                                             hr == static_cast<HRESULT>(0x80004001u);
             if (test.required || translator_refused) {
                 std::printf("[victory-conf] case=%s verdict=FAIL (%s)\n", test.name,
-                            translator_refused ? "the translator refused the program" : "the host refused a required pipeline");
+                            translator_refused ? "the shim refused a program the adapter should run" : "the host refused a required pipeline");
                 ++failures;
             } else {
                 std::printf("[victory-conf] case=%s verdict=SKIP (the host refused the pipeline: it does not run "
                             "waves of %u lanes; adapter range %u..%u)\n",
                             test.name, test.lanes, options1.WaveLaneCountMin, options1.WaveLaneCountMax);
+                skipped += std::string(skipped.empty() ? "" : ",") + test.name;
             }
             continue;
         }
@@ -162,8 +205,11 @@ int main(int argc, char** argv) {
                         options1.WaveLaneCountMin, options1.WaveLaneCountMax,
                         pass && !host_has_wave ? "; the exact result is the translation's per-thread form, not a genuine wave of that size" : "");
         }
+        ran += std::string(ran.empty() ? "" : ",") + test.name;
         if (!pass) ++failures;
     }
+    std::printf("[victory-conf] adapter lanes %u..%u; ran: %s; skipped: %s\n", options1.WaveLaneCountMin,
+                options1.WaveLaneCountMax, ran.empty() ? "none" : ran.c_str(), skipped.empty() ? "none" : skipped.c_str());
     std::printf("[victory-conf] %s (%d failed)\n", failures == 0 ? "PASS" : "FAIL", failures);
     return failures == 0 ? 0 : 1;
 }
