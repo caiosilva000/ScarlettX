@@ -832,7 +832,40 @@ struct GuestTextureMemory {
     void* base = nullptr;
     size_t size = 0;
     XG_RESOURCE_LAYOUT layout{};
+    // Reading the write watch with a reset arms every page again, and under Wine each first write
+    // to an armed page is a fault (about 22 microseconds a page on an M4 Max: 22 ms for 4 MiB).
+    // A texture written in two flushes running is therefore left unarmed ("hot"): its written
+    // pages are compared by checksum with what was last uploaded instead. After
+    // kQuietFlushesBeforeRearm flushes without a change the watch is armed again.
+    bool hot = false;
+    uint32_t written_streak = 0;          // flushes in a row that found writes, while armed
+    uint32_t quiet_flushes = 0;           // flushes in a row without a change, while hot
+    std::vector<uint64_t> uploaded_sum;   // by subresource: checksum of the memory last uploaded
+    std::vector<uint8_t> has_sum;         // by subresource: uploaded_sum is valid
 };
+constexpr uint32_t kQuietFlushesBeforeRearm = 4;
+
+// A 64-bit checksum of texture memory (four multiply-xorshift lanes over 8-byte words; a change
+// to any one word always changes it). Tells whether a hot texture differs from its last upload.
+uint64_t GuestMemoryChecksum(const uint8_t* p, size_t n) {
+    uint64_t h[4] = {0x9E3779B97F4A7C15ull, 0xC2B2AE3D27D4EB4Full, 0x165667B19E3779F9ull, 0x27D4EB2F165667C5ull};
+    size_t i = 0;
+    for (; i + 32 <= n; i += 32) {
+        uint64_t w[4];
+        std::memcpy(w, p + i, 32);
+        for (int k = 0; k < 4; ++k) {
+            h[k] = (h[k] ^ w[k]) * 0x9FB21C651E98DF25ull;
+            h[k] ^= h[k] >> 32;
+        }
+    }
+    for (; i < n; ++i) h[i & 3] = (h[i & 3] ^ p[i]) * 0x9FB21C651E98DF25ull;
+    uint64_t out = n;
+    for (int k = 0; k < 4; ++k) {
+        out = (out ^ h[k]) * 0x9FB21C651E98DF25ull;
+        out ^= out >> 29;
+    }
+    return out;
+}
 std::mutex g_guest_textures_mutex;
 std::vector<XboxD3D12ResourceProxy*> g_guest_textures;
 std::atomic<uint64_t> g_upload_textures{0};
@@ -1034,6 +1067,7 @@ void UploadGuestTexture(ID3D12CommandQueue* queue, XboxD3D12ResourceProxy* tex, 
 struct GuestTextureUpload {
     XboxD3D12ResourceProxy* tex = nullptr;
     std::vector<UINT> dirty;
+    std::vector<uint64_t> sums;  // hot textures: checksum of each dirty subresource before the copy
     D3D12_RESOURCE_DESC desc{};
     std::vector<D3D12_PLACED_SUBRESOURCE_FOOTPRINT> fps;
     uint64_t offset = 0;
@@ -1153,22 +1187,35 @@ void FlushGuestTextureWrites(ID3D12CommandQueue* queue) {
     std::vector<GuestTextureUpload> uploads;
     std::vector<void*> pages;
     std::vector<UINT> dirty;
+    std::vector<uint64_t> sums;
     for (XboxD3D12ResourceProxy* tex : g_guest_textures) {
         GuestTextureMemory& mem = *tex->guest_memory;
+        const D3D12_RESOURCE_DESC d = tex->pc_res->GetDesc();
+        const UINT subresources = static_cast<UINT>(d.MipLevels) * d.DepthOrArraySize;
+        auto checksum = [&](UINT s) {
+            uint64_t offset = 0, size = 0;
+            scarlettx::gpu::xg::SubresourceRange(mem.layout, s % d.MipLevels, s / d.MipLevels, &offset, &size);
+            return GuestMemoryChecksum(static_cast<const uint8_t*>(mem.base) + offset, static_cast<size_t>(size));
+        };
         pages.resize(mem.size / 4096 + 1);
         ULONG_PTR count = pages.size();
         DWORD granularity = 0;
-        // Reading resets the watch: a write that lands during the copy is picked up next time.
-        if (GetWriteWatch(WRITE_WATCH_FLAG_RESET, mem.base, mem.size, pages.data(), &count, &granularity) != 0 ||
+        // Armed and not written last time: read and reset, so a write that lands during the copy
+        // is picked up next time. Written last time, or hot: read only. Nothing is lost by not
+        // resetting: an armed texture with no written page has nothing to reset.
+        const bool reset = !mem.hot && mem.written_streak == 0;
+        if (GetWriteWatch(reset ? WRITE_WATCH_FLAG_RESET : 0, mem.base, mem.size, pages.data(), &count,
+                          &granularity) != 0 ||
             count == 0) {
+            mem.written_streak = 0;
             continue;
         }
         pages.resize(count);
         // Only the subresources the title wrote to: the others may hold data
         // that arrived through command-list copies.
-        const D3D12_RESOURCE_DESC d = tex->pc_res->GetDesc();
         dirty.clear();
-        for (UINT s = 0; s < static_cast<UINT>(d.MipLevels) * d.DepthOrArraySize; ++s) {
+        sums.clear();
+        for (UINT s = 0; s < subresources; ++s) {
             uint64_t offset = 0, size = 0;
             if (!scarlettx::gpu::xg::SubresourceRange(mem.layout, s % d.MipLevels, s / d.MipLevels, &offset, &size)) {
                 continue;
@@ -1180,13 +1227,69 @@ void FlushGuestTextureWrites(ID3D12CommandQueue* queue) {
             });
             if (written) dirty.push_back(s);
         }
+        if (!mem.hot) {
+            if (reset) {
+                mem.written_streak = 1;
+            } else {
+                // Written in two flushes running, and the watch was not reset: hot from here on.
+                mem.hot = true;
+                mem.quiet_flushes = 0;
+                mem.uploaded_sum.assign(subresources, 0);
+                mem.has_sum.assign(subresources, 0);
+            }
+        }
+        if (mem.hot) {
+            // The pages read as written from the first write on. What has changed since the last
+            // upload is what differs from it.
+            auto changed = [&] {
+                std::vector<UINT> out;
+                sums.clear();
+                for (const UINT s : dirty) {
+                    const uint64_t sum = checksum(s);
+                    if (mem.has_sum[s] && mem.uploaded_sum[s] == sum) continue;
+                    out.push_back(s);
+                    sums.push_back(sum);
+                }
+                return out;
+            };
+            std::vector<UINT> differs = changed();
+            if (!differs.empty()) {
+                mem.quiet_flushes = 0;
+            } else if (++mem.quiet_flushes >= kQuietFlushesBeforeRearm) {
+                // The title has stopped writing. Arm the watch, then look once more: a write
+                // that landed before the reset shows as a difference, one after it as a page.
+                ResetWriteWatch(mem.base, mem.size);
+                mem.hot = false;
+                mem.written_streak = 0;
+                differs = changed();
+                sums.clear();  // no longer hot: nothing to remember
+            }
+            dirty = std::move(differs);
+        }
         if (dirty.empty()) continue;
         GuestTextureUpload u;
         u.tex = tex;
         u.dirty = dirty;
+        if (mem.hot) u.sums = sums;
         uploads.push_back(std::move(u));
     }
     UploadGuestTextureBatch(queue, uploads);
+    // A hot subresource is remembered as uploaded only if its memory was the same after the copy
+    // as before it; otherwise the next flush uploads it again.
+    for (const GuestTextureUpload& u : uploads) {
+        GuestTextureMemory& mem = *u.tex->guest_memory;
+        if (!mem.hot || u.sums.size() != u.dirty.size()) continue;
+        const UINT mips = u.tex->pc_res->GetDesc().MipLevels;
+        for (size_t i = 0; i < u.dirty.size(); ++i) {
+            const UINT s = u.dirty[i];
+            uint64_t offset = 0, size = 0;
+            scarlettx::gpu::xg::SubresourceRange(mem.layout, s % mips, s / mips, &offset, &size);
+            const uint64_t after =
+                GuestMemoryChecksum(static_cast<const uint8_t*>(mem.base) + offset, static_cast<size_t>(size));
+            mem.has_sum[s] = after == u.sums[i] ? 1 : 0;
+            mem.uploaded_sum[s] = after;
+        }
+    }
     if (TraceEnabled() && !uploads.empty()) {
         std::cerr << "[ScarlettX][d3d12_xs] uploaded " << uploads.size()
                   << " guest texture(s) in one batch\n";

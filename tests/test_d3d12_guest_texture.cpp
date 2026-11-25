@@ -270,6 +270,24 @@ int main() {
         ReadBackAndCompare(c, mips, false);
     }
 
+    // A texture the title rewrites for several submissions running, then leaves alone, then
+    // writes again. The shim stops re-arming the write watch of such a texture and compares its
+    // memory with the last upload instead, then arms the watch again once the writes have
+    // stopped; whichever of the two is in force, every read-back must show the latest write.
+    for (int step = 0; step < 15; ++step) {
+        if (step < 5 || step == 11) {  // every mip: 0-4 in a row, 11 after a pause
+            Fill(mips, static_cast<uint8_t>(40 + step * 7));
+            for (uint32_t m = 0; m < kMips; ++m) {
+                SX_REQUIRE(xg::CopyIntoSubresource(*layout, memory, m, 0, mips[m].pixels.data(), mips[m].width * 4));
+            }
+        } else if (step == 5 || step == 13) {  // one mip only: 5 while written every time, 13 after a pause
+            const uint32_t m = step == 5 ? 2 : 0;
+            for (size_t i = 0; i < mips[m].pixels.size(); ++i) mips[m].pixels[i] = static_cast<uint8_t>(i * 11 + step);
+            SX_REQUIRE(xg::CopyIntoSubresource(*layout, memory, m, 0, mips[m].pixels.data(), mips[m].width * 4));
+        }  // steps 6-10, 12 and 14: nothing written
+        ReadBackAndCompare(c, mips, false);
+    }
+
     // A planar format has no single-plane console layout here: no guest
     // memory is handed out (when the adapter can create such a texture at all).
     D3D12_RESOURCE_DESC nv12 = td;
