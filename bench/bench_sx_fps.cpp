@@ -766,10 +766,15 @@ struct Bench {
                 }
                 if (per_constants && j) c0 = set_constants(j);
                 Call(list, kListDispatch, static_cast<uintptr_t>(kDispatchDwords / 32), uintptr_t{1}, uintptr_t{1});
-                // A UAV barrier: the next dispatch that writes the same buffer comes after this one.
-                D3D12_RESOURCE_BARRIER uav{};
-                uav.Type = D3D12_RESOURCE_BARRIER_TYPE_UAV;
-                Call(list, kListResourceBarrier, uintptr_t{1}, P(&uav), uintptr_t{0});
+                if (per_constants) {
+                    // Every dispatch writes the same buffer with different values, so each needs a
+                    // UAV barrier to come after the one before. The other two variants write equal
+                    // values wherever they write twice and go without. The barrier is most of
+                    // this variant's frame on this host.
+                    D3D12_RESOURCE_BARRIER uav{};
+                    uav.Type = D3D12_RESOURCE_BARRIER_TYPE_UAV;
+                    Call(list, kListResourceBarrier, uintptr_t{1}, P(&uav), uintptr_t{0});
+                }
                 ubuf_c0[slot_index] = c0;
                 ubuf_written[slot_index] = 1;
                 ++s.draws;
