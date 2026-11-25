@@ -1,0 +1,12 @@
+[package]
+name = "scarlettx-victory-bridge"
+version = "0.1.0"
+edition = "2024"
+license = "GPL-3.0-or-later"
+publish = false
+
+[lib]
+crate-type = ["staticlib"]
+
+[dependencies]
+victory-shader = { path = "../victory-belobug-amd/crates/victory-shader" }

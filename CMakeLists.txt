@@ -7,6 +7,12 @@ set(CMAKE_CXX_EXTENSIONS OFF)
 
 enable_testing()
 
+# Research-only, GPL-3.0-or-later bridge to the separately pinned
+# victory-belobug-amd submodule.  Keeping this off by default preserves the
+# established MSVC/CI build and makes the licensing boundary explicit.
+option(SCARLETTX_VICTORY_SHADER_BRIDGE
+    "Build the GPL victory-shader Rust bridge (research builds only)" OFF)
+
 # Core emulator static library
 add_library(scarlettx_core STATIC
     src/core/status.cpp
@@ -23,6 +29,7 @@ add_library(scarlettx_core STATIC
     src/gpu/d3d12_backend.cpp
     src/gpu/rt_bvh.cpp
     src/gpu/shader_ir.cpp
+    src/gpu/victory_shader_bridge.cpp
     src/gpu/xg_layout.cpp
     src/runtime/emulator.cpp
     src/runtime/virtual_drive.cpp
@@ -57,6 +64,54 @@ if(WIN32)
         # Also the thread runtime (libwinpthread): a shim that needs a DLL from
         # the toolchain only loads while the toolchain is on PATH.
         add_link_options(-static -static-libgcc -static-libstdc++)
+    endif()
+
+    if(SCARLETTX_VICTORY_SHADER_BRIDGE)
+        find_program(CARGO_EXECUTABLE cargo REQUIRED)
+        if(MSVC)
+            set(SCARLETTX_RUST_TARGET x86_64-pc-windows-msvc)
+        else()
+            set(SCARLETTX_RUST_TARGET x86_64-pc-windows-gnullvm)
+        endif()
+
+        set(SCARLETTX_VICTORY_BRIDGE_DIR
+            "${CMAKE_CURRENT_SOURCE_DIR}/third_party/scarlettx-victory-bridge")
+        set(SCARLETTX_VICTORY_BRIDGE_LIBRARY
+            "${SCARLETTX_VICTORY_BRIDGE_DIR}/target/${SCARLETTX_RUST_TARGET}/release/libscarlettx_victory_bridge.a")
+        string(TOUPPER "${SCARLETTX_RUST_TARGET}" SCARLETTX_CARGO_TARGET_KEY)
+        string(REPLACE "-" "_" SCARLETTX_CARGO_TARGET_KEY "${SCARLETTX_CARGO_TARGET_KEY}")
+        set(SCARLETTX_CARGO_LINKER_ENV
+            "CARGO_TARGET_${SCARLETTX_CARGO_TARGET_KEY}_LINKER=${CMAKE_C_COMPILER}")
+
+        add_custom_command(
+            OUTPUT "${SCARLETTX_VICTORY_BRIDGE_LIBRARY}"
+            COMMAND ${CMAKE_COMMAND} -E env "${SCARLETTX_CARGO_LINKER_ENV}"
+                "${CARGO_EXECUTABLE}" build --manifest-path
+                "${SCARLETTX_VICTORY_BRIDGE_DIR}/Cargo.toml"
+                --target "${SCARLETTX_RUST_TARGET}" --release
+            DEPENDS
+                "${SCARLETTX_VICTORY_BRIDGE_DIR}/Cargo.toml"
+                "${SCARLETTX_VICTORY_BRIDGE_DIR}/src/lib.rs"
+                "${CMAKE_CURRENT_SOURCE_DIR}/third_party/victory-belobug-amd/Cargo.toml"
+            WORKING_DIRECTORY "${SCARLETTX_VICTORY_BRIDGE_DIR}"
+            COMMENT "Building pinned victory-shader research bridge"
+            VERBATIM)
+        add_custom_target(scarlettx_victory_shader_bridge
+            DEPENDS "${SCARLETTX_VICTORY_BRIDGE_LIBRARY}")
+        add_library(scarlettx_victory_shader_bridge_static STATIC IMPORTED GLOBAL)
+        set_target_properties(scarlettx_victory_shader_bridge_static PROPERTIES
+            IMPORTED_LOCATION "${SCARLETTX_VICTORY_BRIDGE_LIBRARY}")
+        # `staticlib` bypasses rustc's usual final link step, so preserve the
+        # Windows libraries reported by `cargo rustc -- --print
+        # native-static-libs`.  The MinGW target also needs libunwind.
+        target_link_libraries(scarlettx_victory_shader_bridge_static INTERFACE
+            ntdll userenv ws2_32 dbghelp)
+        if(NOT MSVC)
+            target_link_libraries(scarlettx_victory_shader_bridge_static INTERFACE unwind)
+        endif()
+        add_dependencies(scarlettx_victory_shader_bridge_static scarlettx_victory_shader_bridge)
+        target_link_libraries(scarlettx_core PUBLIC scarlettx_victory_shader_bridge_static)
+        target_compile_definitions(scarlettx_core PRIVATE SCARLETTX_VICTORY_SHADER_BRIDGE=1)
     endif()
 endif()
 
@@ -372,6 +427,10 @@ target_link_libraries(test_gameinput PRIVATE GameInput)
 
 scarlettx_add_test(test_shader_pipeline tests/test_shader_pipeline.cpp)
 target_link_libraries(test_shader_pipeline PRIVATE d3d12_xs)
+
+if(SCARLETTX_VICTORY_SHADER_BRIDGE)
+    scarlettx_add_test(test_victory_shader_bridge tests/test_victory_shader_bridge.cpp)
+endif()
 
 # Offscreen D3D12Backend probe: exact render-target clear, then an indexed draw, each with fence
 # completion and full pixel readback. The bare test runs both; the two entries below run them
