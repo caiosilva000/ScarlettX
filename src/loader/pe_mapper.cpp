@@ -501,6 +501,27 @@ Status MappedPeImage::MapFile(const std::string& pe_path,
                 mod = LoadLibraryA(candidate.string().c_str());
             }
         }
+        // A DLL the title ships next to its executable (middleware, third-party
+        // libraries). Windows would find it in the application directory, but for an
+        // image mapped in-process that directory is the emulator's, so look in the
+        // guest's own folder. A module of that name already in the process wins, as
+        // it would for the Windows loader, which keeps host system DLLs in place.
+        if (!mod && !is_hle && !GetModuleHandleA(target_dll.c_str())) {
+            std::error_code ec;
+            const auto candidate =
+                std::filesystem::absolute(pe_path, ec).parent_path() / target_dll;
+            if (!ec && std::filesystem::is_regular_file(candidate, ec)) {
+                // Altered search path: the DLL's own dependencies come from its folder too.
+                mod = AdoptHostModule(
+                    LoadLibraryExA(candidate.string().c_str(), nullptr, LOAD_WITH_ALTERED_SEARCH_PATH));
+                if (mod) {
+                    std::printf("[ScarlettX][loader] Bound package DLL %s\n", candidate.string().c_str());
+                } else {
+                    std::fprintf(stderr, "[ScarlettX][loader] Package DLL %s failed to load (error %lu)\n",
+                                 candidate.string().c_str(), GetLastError());
+                }
+            }
+        }
         if (!mod) {
             mod = LoadLibraryA(target_dll.c_str());
         }

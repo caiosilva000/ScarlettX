@@ -103,6 +103,7 @@ int main() {
     bool resolved_host_xgr = false;
     bool resolved_stub_named = false;
     bool resolved_stub_ord = false;
+    bool resolved_package_dll = false;
     for (const auto& r : mapped.Resolutions()) {
         const std::string dll = ToLower(r.dll_name);
         if (dll == "xordinal_hle.dll" && r.by_ordinal && r.ordinal == 7) {
@@ -111,6 +112,10 @@ int main() {
         } else if (dll == "xgameruntime.dll" && r.symbol_name == "XGameRuntimeInitialize") {
             SX_REQUIRE(r.kind == scarlettx::ImportResolutionKind::HostDll);
             resolved_host_xgr = true;
+        } else if (dll == "pkg_local.dll" && r.symbol_name == "PkgLocalCombine") {
+            // Bound from the package folder, not left as a stub.
+            SX_REQUIRE(r.kind == scarlettx::ImportResolutionKind::HostDll);
+            resolved_package_dll = true;
         } else if (dll == "xgameoverlay_missing.dll" && r.symbol_name == "XOverlayShowNotice") {
             SX_REQUIRE(r.kind == scarlettx::ImportResolutionKind::StubThunk);
             resolved_stub_named = true;
@@ -123,6 +128,7 @@ int main() {
     SX_REQUIRE(resolved_host_xgr);
     SX_REQUIRE(resolved_stub_named);
     SX_REQUIRE(resolved_stub_ord);
+    SX_REQUIRE(resolved_package_dll);
 
     // 4. Execute relocated global pointer probe.
     using ProbeRelocFn = uint64_t (*)();
@@ -223,6 +229,10 @@ int main() {
     auto probe_ord = reinterpret_cast<ProbeOrdFn>(mapped.GetExportAddress("ProbeOrdinalHle"));
     SX_REQUIRE(probe_ord != nullptr);
     SX_REQUIRE(probe_ord(42, 99) == 42106ull);
+
+    auto probe_pkg = reinterpret_cast<ProbeOrdFn>(mapped.GetExportAddress("ProbePackageDll"));
+    SX_REQUIRE(probe_pkg != nullptr);
+    SX_REQUIRE(probe_pkg(12, 30) == 12037ull);
 
     // 6. Execute auto-stubbed named and ordinal imports and verify captured args + return values.
     auto probe_named_stub =

@@ -236,11 +236,19 @@ if(WIN32)
         tests/synthetic_games/iat_probe/xtelemetry_missing.def
     )
 
+    # A real DLL placed only in the package folder (see pkg_local.c).
+    add_library(pkg_local SHARED tests/synthetic_games/iat_probe/pkg_local.c)
+    set_target_properties(pkg_local PROPERTIES
+        PREFIX ""
+        RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/packages/iat_probe"
+    )
+
     add_library(iat_probe SHARED
         tests/synthetic_games/iat_probe/iat_probe.cpp
     )
     target_link_libraries(iat_probe PRIVATE
         xgameruntime
+        pkg_local
         xordinal_hle
         xgameoverlay_missing
         xtelemetry_missing

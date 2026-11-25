@@ -13,6 +13,9 @@ __declspec(dllimport) uint64_t XOverlayShowNotice(uint64_t a, uint64_t b, uint64
 
 // Imported by ordinal #42 from xtelemetry_missing.dll (auto-stubbed via x86-64 thunk).
 __declspec(dllimport) uint64_t XTelemetryRecord(uint64_t a, uint64_t b, uint64_t c, uint64_t d);
+
+// Imported by name from pkg_local.dll, which exists only in the package folder.
+__declspec(dllimport) uint64_t PkgLocalCombine(uint64_t a, uint64_t b);
 }
 
 namespace {
@@ -68,6 +71,10 @@ __declspec(dllexport) uint64_t ProbeMissingNamedStub() {
 
 __declspec(dllexport) uint64_t ProbeMissingOrdinalStub() {
     return XTelemetryRecord(0xAAAAull, 0xBBBBull, 0xCCCCull, 0xDDDDull);
+}
+
+__declspec(dllexport) uint64_t ProbePackageDll(uint64_t a, uint64_t b) {
+    return PkgLocalCombine(a, b);
 }
 
 __declspec(dllexport) int ScarlettGuestMain() {
