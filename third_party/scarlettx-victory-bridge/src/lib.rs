@@ -1731,7 +1731,7 @@ mod tests {
         let (direct_vs, direct_ps) = translate_synthetic_draw().unwrap();
         for (variant, native, direct, stage) in [
             (9u32, synthetic_vertex_program(), &direct_vs, HwStage::Vs),
-            (10, synthetic_pixel_program(), &direct_ps, HwStage::Ps),
+            (10, synthetic_pixel_program(0), &direct_ps, HwStage::Ps),
         ] {
             let bytes = synthetic_container(variant).unwrap();
             let container = Container::parse(&bytes).unwrap();
