@@ -9,4 +9,4 @@ publish = false
 crate-type = ["staticlib"]
 
 [dependencies]
-victory-shader = { path = "../victory-belobug-amd/crates/victory-shader" }
+victory-shader = { path = "../victory/crates/victory-shader" }

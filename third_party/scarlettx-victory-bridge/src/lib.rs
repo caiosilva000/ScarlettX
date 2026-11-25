@@ -6,7 +6,7 @@
 use std::ffi::c_char;
 use std::slice;
 
-use victory_shader::{Container, FourCC, HwStage, container_programs};
+use victory_shader::{Container, FourCC, HwStage, native_programs};
 
 const MESSAGE_CAPACITY: usize = 192;
 
@@ -89,7 +89,11 @@ fn inspect(data: &[u8], info: &mut SxVictoryShaderInfo) {
             info.has_xbop = u32::from(extras.xbop);
         }
     }
-    match container_programs(&container) {
+    let Some(dxil) = container.part(FourCC::DXIL) else {
+        message(info, "no DXIL part in this container");
+        return;
+    };
+    match native_programs(dxil.data) {
         Ok(programs) => {
             info.native_program_count = programs.len() as u32;
             if programs.is_empty() {

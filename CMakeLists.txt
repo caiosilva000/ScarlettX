@@ -92,7 +92,7 @@ if(WIN32)
             DEPENDS
                 "${SCARLETTX_VICTORY_BRIDGE_DIR}/Cargo.toml"
                 "${SCARLETTX_VICTORY_BRIDGE_DIR}/src/lib.rs"
-                "${CMAKE_CURRENT_SOURCE_DIR}/third_party/victory-belobug-amd/Cargo.toml"
+                "${CMAKE_CURRENT_SOURCE_DIR}/third_party/victory/Cargo.toml"
             WORKING_DIRECTORY "${SCARLETTX_VICTORY_BRIDGE_DIR}"
             COMMENT "Building pinned victory-shader research bridge"
             VERBATIM)

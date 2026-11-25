@@ -1,3 +1,3 @@
 [submodule "third_party/victory-belobug-amd"]
-	path = third_party/victory-belobug-amd
-	url = https://github.com/caiosilva000/victory-belobug-amd.git
+	path = third_party/victory
+	url = https://github.com/caiosilva000/VIctory.git
