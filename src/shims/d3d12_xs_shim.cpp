@@ -1518,6 +1518,14 @@ struct XboxD3D12GraphicsCommandListProxy {
     ID3D12RootSignature* title_graphics_root = nullptr;
     std::unordered_map<uint32_t, std::vector<uint32_t>> graphics_constants;
     std::unordered_map<uint32_t, uint64_t> graphics_tables;
+    // What is on the host list for graphics. While `host_bound` is set the host list carries
+    // that translated pipeline's root signature and the user data in `bound_user_data`, not the
+    // title's root signature: consecutive translated draws reuse it, and the title's own state
+    // is put back only when something needs it (EnsureTitleGraphics).
+    std::shared_ptr<TranslatedGraphicsPipeline> host_bound;
+    std::vector<uint32_t> bound_user_data[2];
+    std::vector<uint32_t> scratch_user_data[2];
+    bool graphics_constants_changed = true;  // since bound_user_data was built
 #endif
 };
 #if defined(_WIN32)
@@ -1531,6 +1539,8 @@ void ResetComputeShadow(XboxD3D12GraphicsCommandListProxy* obj) {
     obj->title_graphics_root = nullptr;
     obj->graphics_constants.clear();
     obj->graphics_tables.clear();
+    obj->host_bound.reset();
+    obj->graphics_constants_changed = true;
 }
 
 // Puts the host root signature and both stages' user data on the list for a draw with a
@@ -1538,8 +1548,14 @@ void ResetComputeShadow(XboxD3D12GraphicsCommandListProxy* obj) {
 // the draw is then dropped with a diagnostic rather than run on garbage.
 bool BindTranslatedGraphics(XboxD3D12GraphicsCommandListProxy* obj) {
     const TranslatedGraphicsPipeline& pipeline = *obj->graphics_translated;
+    const bool same_root = obj->host_bound == obj->graphics_translated;
+    if (same_root && !obj->graphics_constants_changed) {
+        // The previous translated draw's bindings still stand: nothing to put on the list.
+        g_draws_translated.fetch_add(1, std::memory_order_relaxed);
+        return true;
+    }
     const scarlettx::VictoryComputeBinding* stages[2] = {&pipeline.vs, &pipeline.ps};
-    std::vector<uint32_t> user_data[2];
+    std::vector<uint32_t>* user_data = obj->scratch_user_data;
     for (int stage = 0; stage < 2; ++stage) {
         user_data[stage].assign(std::max<uint32_t>(stages[stage]->user_data_dwords, 1), 0);
         for (const auto& entry : stages[stage]->user_data) {
@@ -1554,19 +1570,30 @@ bool BindTranslatedGraphics(XboxD3D12GraphicsCommandListProxy* obj) {
             user_data[stage][entry.index] = it->second[entry.dword];
         }
     }
-    obj->pc_list->SetGraphicsRootSignature(pipeline.host_root);
+    if (!same_root) {
+        obj->pc_list->SetGraphicsRootSignature(pipeline.host_root);
+        obj->host_bound = obj->graphics_translated;
+        g_host_root_binds.fetch_add(1, std::memory_order_relaxed);
+    }
     for (UINT stage = 0; stage < 2; ++stage) {
+        // A stage whose user data is what the list already has is left alone.
+        if (same_root && user_data[stage] == obj->bound_user_data[stage]) continue;
         obj->pc_list->SetGraphicsRoot32BitConstants(stage, static_cast<UINT>(user_data[stage].size()),
                                                     user_data[stage].data(), 0);
+        obj->bound_user_data[stage] = user_data[stage];
+        g_user_data_sets.fetch_add(1, std::memory_order_relaxed);
     }
-    g_host_root_binds.fetch_add(1, std::memory_order_relaxed);
-    g_user_data_sets.fetch_add(2, std::memory_order_relaxed);
+    obj->graphics_constants_changed = false;
     g_draws_translated.fetch_add(1, std::memory_order_relaxed);
     return true;
 }
 
-// After such a draw: the title's own root signature and arguments again.
-void RestoreTitleGraphics(XboxD3D12GraphicsCommandListProxy* obj) {
+// Puts the title's own root signature and arguments back on the host list, if a translated
+// draw left its host root signature there. Called before anything that needs the title's root
+// on the host list: a draw with a desktop pipeline, or a root argument that is not shadowed.
+void EnsureTitleGraphics(XboxD3D12GraphicsCommandListProxy* obj) {
+    if (!obj->host_bound) return;
+    obj->host_bound.reset();
     if (!obj->title_graphics_root) return;
     obj->pc_list->SetGraphicsRootSignature(obj->title_graphics_root);
     uint64_t replayed = 0;
@@ -1927,6 +1954,7 @@ intptr_t SCARLETTX_GDK_CALLBACK CmdListClearState(void* self, uintptr_t pPso, ui
             pc_pso = reinterpret_cast<ID3D12PipelineState*>(pso->pc_obj);
         }
         obj->pc_list->ClearState(pc_pso);
+        obj->host_bound.reset();  // the host list has no root signature now
     }
 #endif
     return 0;
@@ -2022,9 +2050,9 @@ intptr_t SCARLETTX_GDK_CALLBACK CmdListDrawInstanced(
         if (BindTranslatedGraphics(obj)) {
             obj->pc_list->DrawInstanced(static_cast<UINT>(vCount), static_cast<UINT>(iCount),
                                         static_cast<UINT>(startV), static_cast<UINT>(startI));
-            RestoreTitleGraphics(obj);
         }
     } else if (obj->pc_list) {
+        EnsureTitleGraphics(obj);
         obj->pc_list->DrawInstanced(static_cast<UINT>(vCount), static_cast<UINT>(iCount),
                                     static_cast<UINT>(startV), static_cast<UINT>(startI));
     }
@@ -2062,9 +2090,9 @@ intptr_t SCARLETTX_GDK_CALLBACK CmdListDrawIndexedInstanced(
             obj->pc_list->DrawIndexedInstanced(static_cast<UINT>(idxCount), static_cast<UINT>(instCount),
                                                static_cast<UINT>(startIdx), static_cast<INT>(baseVertex),
                                                static_cast<UINT>(startInst));
-            RestoreTitleGraphics(obj);
         }
     } else if (obj->pc_list) {
+        EnsureTitleGraphics(obj);
         obj->pc_list->DrawIndexedInstanced(static_cast<UINT>(idxCount), static_cast<UINT>(instCount),
                                            static_cast<UINT>(startIdx), static_cast<INT>(baseVertex),
                                            static_cast<UINT>(startInst));
@@ -2216,8 +2244,16 @@ intptr_t SCARLETTX_GDK_CALLBACK CmdListSetGraphicsRootSignature(void* self, uint
             obj->graphics_constants.clear();
             obj->graphics_tables.clear();
             obj->title_graphics_root = pc_rs;
+            obj->graphics_constants_changed = true;
         }
-        obj->pc_list->SetGraphicsRootSignature(pc_rs);
+        if (obj->host_bound) {
+            // A translated draw's root signature is on the host list; the title's goes back with
+            // the arguments the title still holds on it.
+            EnsureTitleGraphics(obj);
+            if (!pc_rs) obj->pc_list->SetGraphicsRootSignature(nullptr);
+        } else {
+            obj->pc_list->SetGraphicsRootSignature(pc_rs);
+        }
     }
 #endif
     return 0;
@@ -2246,7 +2282,9 @@ intptr_t SCARLETTX_GDK_CALLBACK CmdListSetGraphicsRootDescriptorTable(
     if (obj->pc_list) {
         D3D12_GPU_DESCRIPTOR_HANDLE h{static_cast<UINT64>(baseDesc)};
         obj->graphics_tables[static_cast<uint32_t>(rootParamIdx)] = h.ptr;
-        obj->pc_list->SetGraphicsRootDescriptorTable(static_cast<UINT>(rootParamIdx), h);
+        // With a translated draw's root signature on the host list the table waits in the
+        // shadow; EnsureTitleGraphics sets it.
+        if (!obj->host_bound) obj->pc_list->SetGraphicsRootDescriptorTable(static_cast<UINT>(rootParamIdx), h);
     }
 #endif
     return 0;
@@ -2277,8 +2315,12 @@ intptr_t SCARLETTX_GDK_CALLBACK CmdListSetGraphicsRoot32BitConstant(
             if (shadow.size() <= destOffset) shadow.resize(destOffset + 1, 0);
             shadow[destOffset] = static_cast<uint32_t>(srcData);
         }
-        obj->pc_list->SetGraphicsRoot32BitConstant(
-            static_cast<UINT>(rootParamIdx), static_cast<UINT>(srcData), static_cast<UINT>(destOffset));
+        obj->graphics_constants_changed = true;
+        if (obj->host_bound && destOffset >= 64) EnsureTitleGraphics(obj);  // not shadowed
+        if (!obj->host_bound) {
+            obj->pc_list->SetGraphicsRoot32BitConstant(
+                static_cast<UINT>(rootParamIdx), static_cast<UINT>(srcData), static_cast<UINT>(destOffset));
+        }
     }
 #endif
     return 0;
@@ -2309,10 +2351,15 @@ intptr_t SCARLETTX_GDK_CALLBACK CmdListSetGraphicsRoot32BitConstants(
             auto& shadow = obj->graphics_constants[static_cast<uint32_t>(rootParamIdx)];
             if (shadow.size() < destOffset + numVals) shadow.resize(destOffset + numVals, 0);
             std::memcpy(shadow.data() + destOffset, reinterpret_cast<const void*>(pSrcData), numVals * 4);
+        } else {
+            EnsureTitleGraphics(obj);  // not shadowed: it has to go to the title's root now
         }
-        obj->pc_list->SetGraphicsRoot32BitConstants(
-            static_cast<UINT>(rootParamIdx), static_cast<UINT>(numVals),
-            reinterpret_cast<const void*>(pSrcData), static_cast<UINT>(destOffset));
+        obj->graphics_constants_changed = true;
+        if (!obj->host_bound) {
+            obj->pc_list->SetGraphicsRoot32BitConstants(
+                static_cast<UINT>(rootParamIdx), static_cast<UINT>(numVals),
+                reinterpret_cast<const void*>(pSrcData), static_cast<UINT>(destOffset));
+        }
     }
 #endif
     return 0;
@@ -2327,7 +2374,10 @@ intptr_t SCARLETTX_GDK_CALLBACK CmdListSetComputeRootCBV(void* self, uintptr_t i
 intptr_t SCARLETTX_GDK_CALLBACK CmdListSetGraphicsRootCBV(void* self, uintptr_t idx, uintptr_t loc, uintptr_t) {
 #if defined(_WIN32)
     auto* obj = static_cast<XboxD3D12GraphicsCommandListProxy*>(self);
-    if (obj->pc_list) obj->pc_list->SetGraphicsRootConstantBufferView(static_cast<UINT>(idx), static_cast<D3D12_GPU_VIRTUAL_ADDRESS>(loc));
+    if (obj->pc_list) {
+        EnsureTitleGraphics(obj);  // root views are not shadowed
+        obj->pc_list->SetGraphicsRootConstantBufferView(static_cast<UINT>(idx), static_cast<D3D12_GPU_VIRTUAL_ADDRESS>(loc));
+    }
 #endif
     return 0;
 }
@@ -2341,7 +2391,10 @@ intptr_t SCARLETTX_GDK_CALLBACK CmdListSetComputeRootSRV(void* self, uintptr_t i
 intptr_t SCARLETTX_GDK_CALLBACK CmdListSetGraphicsRootSRV(void* self, uintptr_t idx, uintptr_t loc, uintptr_t) {
 #if defined(_WIN32)
     auto* obj = static_cast<XboxD3D12GraphicsCommandListProxy*>(self);
-    if (obj->pc_list) obj->pc_list->SetGraphicsRootShaderResourceView(static_cast<UINT>(idx), static_cast<D3D12_GPU_VIRTUAL_ADDRESS>(loc));
+    if (obj->pc_list) {
+        EnsureTitleGraphics(obj);  // root views are not shadowed
+        obj->pc_list->SetGraphicsRootShaderResourceView(static_cast<UINT>(idx), static_cast<D3D12_GPU_VIRTUAL_ADDRESS>(loc));
+    }
 #endif
     return 0;
 }
@@ -2355,7 +2408,10 @@ intptr_t SCARLETTX_GDK_CALLBACK CmdListSetComputeRootUAV(void* self, uintptr_t i
 intptr_t SCARLETTX_GDK_CALLBACK CmdListSetGraphicsRootUAV(void* self, uintptr_t idx, uintptr_t loc, uintptr_t) {
 #if defined(_WIN32)
     auto* obj = static_cast<XboxD3D12GraphicsCommandListProxy*>(self);
-    if (obj->pc_list) obj->pc_list->SetGraphicsRootUnorderedAccessView(static_cast<UINT>(idx), static_cast<D3D12_GPU_VIRTUAL_ADDRESS>(loc));
+    if (obj->pc_list) {
+        EnsureTitleGraphics(obj);  // root views are not shadowed
+        obj->pc_list->SetGraphicsRootUnorderedAccessView(static_cast<UINT>(idx), static_cast<D3D12_GPU_VIRTUAL_ADDRESS>(loc));
+    }
 #endif
     return 0;
 }

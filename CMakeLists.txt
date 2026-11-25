@@ -473,6 +473,11 @@ if(SCARLETTX_VICTORY_SHADER_BRIDGE)
     # root bindings, command list and draw, with controls.
     scarlettx_add_test(test_victory_draw_guest tests/test_victory_draw_guest.cpp)
     target_link_libraries(test_victory_draw_guest PRIVATE d3d12_xs)
+    # A translated pipeline's bindings from one draw to the next: reused, changed, and given
+    # back to the title's root signature when a desktop pipeline draws.
+    scarlettx_add_test(test_victory_draw_reuse tests/test_victory_draw_reuse.cpp)
+    target_link_libraries(test_victory_draw_reuse PRIVATE d3d12_xs)
+    set_tests_properties(test_victory_draw_reuse PROPERTIES ENVIRONMENT "SCARLETTX_REAL_TITLE=1")
     # Group ids, offset stores and lane masks (wave32, wave64) on the same route.
     scarlettx_add_test(test_victory_compute_conformance tests/test_victory_compute_conformance.cpp)
     target_link_libraries(test_victory_compute_conformance PRIVATE d3d12_xs)
