@@ -116,7 +116,11 @@ if(WIN32)
         # native-static-libs`.  The MinGW target also needs libunwind.
         target_link_libraries(scarlettx_victory_shader_bridge_static INTERFACE
             ntdll userenv ws2_32 dbghelp)
-        if(NOT MSVC)
+        if(MSVC)
+            # Rust's standard library waits on addresses (WaitOnAddress, WakeByAddress*), which
+            # MSVC only resolves through this import library.
+            target_link_libraries(scarlettx_victory_shader_bridge_static INTERFACE synchronization)
+        else()
             target_link_libraries(scarlettx_victory_shader_bridge_static INTERFACE unwind)
         endif()
         add_dependencies(scarlettx_victory_shader_bridge_static scarlettx_victory_shader_bridge)
