@@ -65,7 +65,15 @@ Status Emulator::BootPackage(const std::string& package_dir) {
         return st;
     }
 
-    if (!report.config.IsNativeScarlett()) {
+    if (report.config.IsPcDesktop()) {
+        if (!config_.allow_pc_target) {
+            return Status::Error(StatusCode::UnsupportedFormat,
+                                 "Package is a PC (desktop GDK) target, not XboxGen9/Scarlett; "
+                                 "pass --allow-pc-target to boot it anyway");
+        }
+        std::cout << "[ScarlettX][boot] PC-target package accepted (--allow-pc-target): it uses the "
+                     "desktop d3d12.dll, so the d3d12_xs shim, --frames and frame dumps do not apply\n";
+    } else if (!report.config.IsNativeScarlett()) {
         return Status::Error(StatusCode::UnsupportedFormat,
                              "Package is not a native XboxGen9/Scarlett Game Core target");
     }

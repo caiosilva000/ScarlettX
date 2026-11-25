@@ -31,6 +31,12 @@ struct GameConfig {
         return console_target == ConsoleTarget::XboxGen9Scarlett;
     }
 
+    // A GDK package built for PC. It links the desktop d3d12.dll, not d3d12_xs.dll,
+    // so only the loader and the non-graphics shims take part in running it.
+    bool IsPcDesktop() const noexcept {
+        return console_target == ConsoleTarget::PcDesktop;
+    }
+
     const GameExecutableEntry* PrimaryExecutable() const noexcept;
 };
 

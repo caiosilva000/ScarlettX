@@ -206,6 +206,7 @@ Status ParseGameConfigXml(const std::string& xml_content, GameConfig& out_config
     bool has_gen9 = false;
     bool has_gen9_aware = false;
     bool has_xbox_one = false;
+    bool has_pc = false;
 
     for (const auto& exe : out_config.executables) {
         const std::string tdf = ToLower(exe.target_device_family);
@@ -215,6 +216,8 @@ Status ParseGameConfigXml(const std::string& xml_content, GameConfig& out_config
             has_gen9_aware = true;
         } else if (tdf == "xboxone" || tdf == "durango") {
             has_xbox_one = true;
+        } else if (tdf == "pc") {
+            has_pc = true;
         }
     }
 
@@ -225,6 +228,8 @@ Status ParseGameConfigXml(const std::string& xml_content, GameConfig& out_config
         out_config.console_target = ConsoleTarget::XboxOneGen9Aware;
     } else if (has_xbox_one || lower_xml.find("xboxone") != std::string::npos) {
         out_config.console_target = ConsoleTarget::XboxOne;
+    } else if (has_pc) {
+        out_config.console_target = ConsoleTarget::PcDesktop;
     }
 
     if (out_config.executables.empty()) {

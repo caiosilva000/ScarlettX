@@ -61,6 +61,23 @@ int main() {
     SX_REQUIRE(!old_cfg.IsNativeScarlett());
     SX_REQUIRE(old_cfg.console_target == scarlettx::ConsoleTarget::XboxOneGen9Aware);
 
+    const std::string pc_xml = R"(
+<Game configVersion="1">
+  <Identity Name="TestStudio.DesktopGame" Publisher="CN=Test" Version="1.0.0.0" />
+  <ExecutableList>
+    <Executable Name="DesktopGame.exe" Alias="DesktopGame.exe" TargetDeviceFamily="PC" Id="Game" />
+  </ExecutableList>
+</Game>
+)";
+    scarlettx::GameConfig pc_cfg;
+    st = scarlettx::ParseGameConfigXml(pc_xml, pc_cfg);
+    SX_REQUIRE(st.ok());
+    SX_REQUIRE(pc_cfg.IsPcDesktop());
+    SX_REQUIRE(!pc_cfg.IsNativeScarlett());
+    SX_REQUIRE(!cfg.IsPcDesktop());
+    SX_REQUIRE(pc_cfg.PrimaryExecutable() != nullptr);
+    SX_REQUIRE(pc_cfg.PrimaryExecutable()->name == "DesktopGame.exe");
+
     scarlettx::GameConfig bad_cfg;
     st = scarlettx::ParseGameConfigXml("<NotAGame/>", bad_cfg);
     SX_REQUIRE(!st.ok());

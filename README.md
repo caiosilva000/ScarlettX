@@ -127,7 +127,7 @@ ctest --test-dir build --output-on-failure
 scarlettx boot "<extracted package>\Mount" --in-process --gpu --stats
 ```
 
-- `--in-process` maps the title into the emulator process (the path used for real titles). `--gpu` renders on the hardware adapter, which is the default; `--warp` selects the software rasterizer. `--stats` prints fps and D3D12 call counts once per second, `--fcap N` holds N frames per second instead of the title's own rate (for example `--fcap 144`; `--fcap 0` removes the cap), and `--trace` logs the shim calls.
+- `--in-process` maps the title into the emulator process (the path used for real titles). `--allow-pc-target` also boots a GDK package built for PC (`TargetDeviceFamily="PC"`), which is refused otherwise; such a title uses the desktop `d3d12.dll`, so only the loader and the non-graphics shims take part and `--frames` does not apply. `--gpu` renders on the hardware adapter, which is the default; `--warp` selects the software rasterizer. `--stats` prints fps and D3D12 call counts once per second, `--fcap N` holds N frames per second instead of the title's own rate (for example `--fcap 144`; `--fcap 0` removes the cap), and `--trace` logs the shim calls.
 - Input: the keyboard while the window has focus (arrows = D-pad, WASD = left stick, IJKL = right stick, Enter/Space = A, Escape/Backspace = B, X = X, Y = Y, Q/E = shoulders, 1/3 = triggers, Tab = View, P = Menu), and the first XInput controller when one is connected (checked with an Xbox controller; rumble is forwarded to it).
 - The window does not close from its title bar; stop the emulator with Ctrl+C in its console.
 - Save data goes to `%TEMP%\scarlettx_saves`; set `SCARLETTX_SAVE_ROOT` to use another directory.

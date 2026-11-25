@@ -12,7 +12,7 @@ void PrintUsage() {
     std::cout << "ScarlettX - Xbox Series X|S (Scarlett) HLE Emulator\n"
               << "Usage:\n"
               << "  scarlettx inspect <package_dir>\n"
-              << "  scarlettx boot <package_dir> [--headless] [--in-process] [--gpu|--warp] [--trace] [--stats] [--fcap N] [--force-relocate] [--frames N] [--rt-dump path.ppm] [--raster-dump path.ppm]\n"
+              << "  scarlettx boot <package_dir> [--headless] [--in-process] [--gpu|--warp] [--trace] [--stats] [--fcap N] [--force-relocate] [--allow-pc-target] [--frames N] [--rt-dump path.ppm] [--raster-dump path.ppm]\n"
               << "  scarlettx diag\n";
 }
 
@@ -50,7 +50,8 @@ int main(int argc, char** argv) {
         }
         std::cout << "Title: " << rep.config.display_name << " (" << rep.config.title_id << ")\n"
                   << "Identity: " << rep.config.identity_name << " v" << rep.config.version << "\n"
-                  << "Scarlett Native: " << (rep.config.IsNativeScarlett() ? "YES (XboxGen9)" : "NO") << "\n"
+                  << "Scarlett Native: " << (rep.config.IsNativeScarlett() ? "YES (XboxGen9)"
+                                         : rep.config.IsPcDesktop() ? "NO (PC desktop GDK target)" : "NO") << "\n"
                   << "Executable: " << rep.executable_path << " (PE64=" << (rep.main_pe.is_pe64 ? "yes" : "no") << ")\n"
                   << "Imports (" << rep.main_pe.imports.size() << " modules):\n";
         for (const auto& mod : rep.main_pe.imports) {
@@ -87,6 +88,8 @@ int main(int argc, char** argv) {
                 cfg.fps_cap = static_cast<int32_t>(cap);
             } else if (arg == "--force-relocate") {
                 cfg.force_relocate = true;
+            } else if (arg == "--allow-pc-target") {
+                cfg.allow_pc_target = true;
             } else if (arg == "--frames" && i + 1 < argc) {
                 char* end = nullptr;
                 const unsigned long frames = std::strtoul(argv[++i], &end, 10);

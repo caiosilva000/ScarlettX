@@ -16,6 +16,7 @@ struct EmulatorConfig {
     int32_t fps_cap = -1;  // --fcap: frames per second, 0 = no cap, -1 = the title's own rate
     bool in_process = false;
     bool force_relocate = false;
+    bool allow_pc_target = false;  // --allow-pc-target: also boot GDK packages built for PC
     uint32_t render_width = 320;
     uint32_t render_height = 240;
     uint32_t max_frames = 0;  // 0 = unlimited / controlled by guest

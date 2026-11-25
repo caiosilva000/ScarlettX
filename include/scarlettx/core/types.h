@@ -15,6 +15,7 @@ enum class ConsoleTarget : uint32_t {
     XboxOne = 1,
     XboxOneGen9Aware = 2,
     XboxGen9Scarlett = 3,
+    PcDesktop = 4,  // GDK package built for PC (TargetDeviceFamily="PC")
 };
 
 enum class DeviceType : uint32_t {
