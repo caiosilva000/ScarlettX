@@ -140,11 +140,13 @@ void RoundTrip(const XG_TEXTURE2D_DESC& d) {
             std::vector<uint8_t> src(static_cast<size_t>(pitch) * m.HeightElements);
             for (size_t i = 0; i < src.size(); ++i) src[i] = static_cast<uint8_t>(i * 7 + mip * 31 + slice * 101 + 1);
             SX_REQUIRE(xg::CopyIntoSubresource(*l, memory.data(), mip, slice, src.data(), pitch));
-            // No two elements of any subresource may share memory.
+            // No two elements of any subresource may share memory, and every element must be
+            // where the addressing says it is (the copy moves runs of elements, not single ones).
             for (uint32_t y = 0; y < m.HeightElements; ++y) {
                 for (uint32_t x = 0; x < m.WidthElements; ++x) {
                     const uint64_t off = Offset(*l, mip, slice, x, y);
                     SX_REQUIRE(off + bpe <= memory.size());
+                    SX_REQUIRE(std::memcmp(memory.data() + off, src.data() + static_cast<size_t>(y) * pitch + x * bpe, bpe) == 0);
                     ++id;
                     for (uint32_t b = 0; b < bpe; ++b) {
                         SX_REQUIRE(owner[off + b] == 0);
@@ -176,6 +178,10 @@ void TestRoundTrip() {
     RoundTrip(Desc(100, 60, 7, kRgba8));
     RoundTrip(Desc(256, 256, 9, kBc1));
     RoundTrip(Desc(64, 64, 7, kBc3, 3));
+    RoundTrip(Desc(131, 77, 8, kR8));
+    RoundTrip(Desc(90, 50, 7, 49));   // R8G8: two bytes an element
+    RoundTrip(Desc(70, 33, 7, 10));   // R16G16B16A16_FLOAT: eight bytes an element
+    RoundTrip(Desc(256, 256, 1, kRgba8));
     RoundTrip(Desc(40, 24, 6, kR8, 2));
     RoundTrip(Desc(128, 64, 8, 49));  // R8G8
     RoundTrip(Desc(48, 80, 7, 10));   // R16G16B16A16_FLOAT

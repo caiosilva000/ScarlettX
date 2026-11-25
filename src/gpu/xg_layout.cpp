@@ -132,17 +132,45 @@ uint64_t YOffset(const MipView& v, uint32_t y) {
            AxisOffset(*v.eq, 'y', y % v.block_h);
 }
 
-template <typename Fn>
-bool ForEachElement(const XG_RESOURCE_LAYOUT& layout, uint32_t mip, uint32_t slice, Fn&& fn) {
+// Copies a subresource between linear rows and resource memory. Along x the block equations keep
+// 16 bytes together (four 4-byte elements, two 8-byte ones, ...), so a row is a list of runs
+// that are contiguous on both sides; each run is one copy, and the common 16-byte run a
+// fixed-size one. Element-by-element copying cost about 4 ns an element.
+bool CopySubresource(const XG_RESOURCE_LAYOUT& layout, uint32_t mip, uint32_t slice, uint8_t* resource,
+                     uint8_t* linear, uint32_t linear_pitch, bool into_resource) {
     MipView v;
     if (!ViewMip(layout, mip, slice, &v)) return false;
+    const uint32_t bpe = layout.Plane[0].BytesPerElement;
     const uint32_t w = v.ml->WidthElements;
     const uint32_t h = v.ml->HeightElements;
-    std::vector<uint64_t> xoff(w);
-    for (uint32_t x = 0; x < w; ++x) xoff[x] = XOffset(v, x);
+    struct Run {
+        uint64_t resource_offset;
+        uint32_t linear_offset;
+        uint32_t bytes;
+    };
+    std::vector<Run> runs;
+    for (uint32_t x = 0; x < w;) {
+        const uint64_t start = XOffset(v, x);
+        uint32_t n = 1;
+        while (x + n < w && XOffset(v, x + n) == start + static_cast<uint64_t>(n) * bpe) ++n;
+        runs.push_back({start, x * bpe, n * bpe});
+        x += n;
+    }
     for (uint32_t y = 0; y < h; ++y) {
-        const uint64_t row = v.base + YOffset(v, y);
-        for (uint32_t x = 0; x < w; ++x) fn(x, y, row + xoff[x]);
+        uint8_t* res_row = resource + v.base + YOffset(v, y);
+        uint8_t* lin_row = linear + static_cast<uint64_t>(y) * linear_pitch;
+        for (const Run& r : runs) {
+            uint8_t* res = res_row + r.resource_offset;
+            uint8_t* lin = lin_row + r.linear_offset;
+            if (r.bytes == 16) {
+                if (into_resource) std::memcpy(res, lin, 16);
+                else std::memcpy(lin, res, 16);
+            } else if (into_resource) {
+                std::memcpy(res, lin, r.bytes);
+            } else {
+                std::memcpy(lin, res, r.bytes);
+            }
+        }
     }
     return true;
 }
@@ -220,23 +248,15 @@ bool SubresourceRange(const XG_RESOURCE_LAYOUT& layout, uint32_t mip, uint32_t s
 bool CopyIntoSubresource(const XG_RESOURCE_LAYOUT& layout, void* resource_base, uint32_t mip,
                          uint32_t slice, const void* src, uint32_t src_row_pitch) {
     if (!resource_base || !src) return false;
-    const uint32_t bpe = layout.Plane[0].BytesPerElement;
-    auto* dst_bytes = static_cast<uint8_t*>(resource_base);
-    const auto* src_bytes = static_cast<const uint8_t*>(src);
-    return ForEachElement(layout, mip, slice, [&](uint32_t x, uint32_t y, uint64_t off) {
-        std::memcpy(dst_bytes + off, src_bytes + static_cast<uint64_t>(y) * src_row_pitch + x * bpe, bpe);
-    });
+    return CopySubresource(layout, mip, slice, static_cast<uint8_t*>(resource_base),
+                           const_cast<uint8_t*>(static_cast<const uint8_t*>(src)), src_row_pitch, true);
 }
 
 bool CopyFromSubresource(const XG_RESOURCE_LAYOUT& layout, const void* resource_base, uint32_t mip,
                          uint32_t slice, void* dst, uint32_t dst_row_pitch) {
     if (!resource_base || !dst) return false;
-    const uint32_t bpe = layout.Plane[0].BytesPerElement;
-    const auto* src_bytes = static_cast<const uint8_t*>(resource_base);
-    auto* dst_bytes = static_cast<uint8_t*>(dst);
-    return ForEachElement(layout, mip, slice, [&](uint32_t x, uint32_t y, uint64_t off) {
-        std::memcpy(dst_bytes + static_cast<uint64_t>(y) * dst_row_pitch + x * bpe, src_bytes + off, bpe);
-    });
+    return CopySubresource(layout, mip, slice, const_cast<uint8_t*>(static_cast<const uint8_t*>(resource_base)),
+                           static_cast<uint8_t*>(dst), dst_row_pitch, false);
 }
 
 void ComputeTexture2DLayout(const XG_TEXTURE2D_DESC& desc, XG_RESOURCE_LAYOUT* out_ptr) {
