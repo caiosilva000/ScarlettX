@@ -3670,6 +3670,20 @@ intptr_t SCARLETTX_GDK_CALLBACK ProxyCreateComputePipelineState(
             if (!scarlettx::VictoryComputeBindingSupported(binding, why)) {
                 return reject(E_NOTIMPL, "its bindings are not supported yet: " + why);
             }
+            // A shader that depends on the console's wave size declares it. D3D12 refuses such a
+            // pipeline on an adapter that cannot run that size; a host that accepts it anyway
+            // runs nothing (D3DMetal: the dispatch completes and writes nothing), so the adapter's
+            // range is checked here. Without a readable range on either side the host decides.
+            uint32_t lanes_min = 0;
+            uint32_t lanes_max = 0;
+            D3D12_FEATURE_DATA_D3D12_OPTIONS1 wave_caps{};
+            if (scarlettx::DxilExpectedWaveLanes(translated.data(), translated.size(), lanes_min, lanes_max) &&
+                SUCCEEDED(obj->pc_device->CheckFeatureSupport(D3D12_FEATURE_D3D12_OPTIONS1, &wave_caps,
+                                                              sizeof(wave_caps))) &&
+                !scarlettx::WaveLanesSupported(lanes_min, lanes_max, wave_caps.WaveOps != FALSE,
+                                               wave_caps.WaveLaneCountMin, wave_caps.WaveLaneCountMax, why)) {
+                return reject(E_NOTIMPL, "its wave size is not available: " + why);
+            }
             // The host root signature: the user data, and views by heap index.
             D3D12_ROOT_PARAMETER user_data{};
             user_data.ParameterType = D3D12_ROOT_PARAMETER_TYPE_32BIT_CONSTANTS;

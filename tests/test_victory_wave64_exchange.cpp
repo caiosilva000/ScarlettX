@@ -19,14 +19,19 @@
 // Each case ends in one class:
 //   native_exact     exact, and the adapter reports waves of L lanes
 //   emulated_exact   exact, although the adapter does not report waves of L lanes
-//   unsupported      the translator or the host refused the pipeline; nothing was dispatched
+//   unsupported      the shim (translation, binding or wave size) or the host refused the
+//                    pipeline; nothing was dispatched
 //   incorrect        the pipeline was accepted and the result is wrong, or the dispatch did not
 //                    complete
 //   hang             a call did not return within the watchdog's time
 //
-// Exit codes: 0 every case is exact or unsupported, and exchange32 is exact where the adapter
-// reports waves of 32; 1 a case is incorrect or hung; 2 a call failed; 3 no device; 4 a fixture
-// could not be built.
+// A case whose translated shader expects a wave size outside the adapter's range must be refused
+// by the shim at pipeline creation (0x80004001, counted as rejected): a host that accepts such a
+// pipeline may run nothing and report nothing.
+//
+// Exit codes: 0 every case is exact or unsupported, exchange32 is exact where the adapter
+// reports waves of 32, and a wave size out of the adapter's range was refused by the shim;
+// 1 otherwise, or a case hung; 2 a call failed; 3 no device; 4 a fixture could not be built.
 #include "victory_guest_rig.h"
 
 #include <array>
@@ -78,7 +83,8 @@ bool ExpectedWaveLanes(const std::vector<uint8_t>& dxil, uint32_t& min, uint32_t
 
 // What the translated form of a fixture expects of the host's waves, from the bridge directly
 // (the shim translates the same container again at pipeline creation).
-void PrintExpectedWaves(const char* label, const std::vector<uint8_t>& container) {
+void PrintExpectedWaves(const char* label, const std::vector<uint8_t>& container, uint32_t* out_min = nullptr,
+                        uint32_t* out_max = nullptr) {
     scarlettx::VictoryShaderInfo info;
     scarlettx::VictoryComputeBinding binding;
     std::vector<uint8_t> dxil;
@@ -90,6 +96,8 @@ void PrintExpectedWaves(const char* label, const std::vector<uint8_t>& container
                     scarlettx::VictoryComputeOutcomeName(outcome));
         return;
     }
+    if (out_min) *out_min = min;
+    if (out_max) *out_max = max;
     if (min == 0 && max == 0xFFFFFFFFu) {
         std::printf("[victory-wave] %s translated: %zu bytes of DXIL, threads %u,%u,%u, expects waves of any size\n",
                     label, dxil.size(), binding.threads[0], binding.threads[1], binding.threads[2]);
@@ -103,10 +111,13 @@ struct Work {
     sxrig::GuestRig* rig;
     const Case* test;
     bool host_has_wave;
+    bool have_caps;  // the adapter answered the wave capability query
     uint32_t lanes_min;
     uint32_t lanes_max;
     const char* cls = "hang";
     int rc = 0;
+    bool out_of_range = false;  // the translated shader expects a wave size the adapter does not run
+    bool shim_refused = false;  // refused by the shim with 0x80004001
 };
 
 DWORD WINAPI RunCase(void* raw) {
@@ -121,7 +132,11 @@ DWORD WINAPI RunCase(void* raw) {
         work.rc = 4;
         return 0;
     }
-    PrintExpectedWaves((std::string("case=") + test.name).c_str(), container);
+    uint32_t expect_min = 0;
+    uint32_t expect_max = 0xFFFFFFFFu;
+    PrintExpectedWaves((std::string("case=") + test.name).c_str(), container, &expect_min, &expect_max);
+    work.out_of_range = work.have_caps && !(expect_min == 0 && expect_max == 0xFFFFFFFFu) &&
+                        (expect_min > work.lanes_max || expect_max < work.lanes_min);
     const auto before = sxrig::Stats();
     void* pso = nullptr;
     const HRESULT hr = rig.CreatePipeline(rig.title_root, container, &pso);
@@ -133,8 +148,9 @@ DWORD WINAPI RunCase(void* raw) {
     if (FAILED(hr) || !pso) {
         const bool translator = after.compute_rejected != before.compute_rejected;
         std::printf("[victory-wave] case=%s refused by=%s hr=0x%08x\n", test.name,
-                    translator ? "the shim (translation or binding)" : "the host (pipeline creation)",
+                    translator ? "the shim (translation, binding or wave size)" : "the host (pipeline creation)",
                     static_cast<uint32_t>(hr));
+        work.shim_refused = translator && hr == static_cast<HRESULT>(0x80004001u);
         work.cls = "unsupported";
         return 0;
     }
@@ -243,6 +259,7 @@ int main(int argc, char** argv) {
         work.test = &test;
         work.lanes_min = lanes_min;
         work.lanes_max = lanes_max;
+        work.have_caps = have_caps;
         work.host_has_wave = have_caps && options1.WaveOps && lanes_min <= test.lanes && test.lanes <= lanes_max;
         // A host that takes a wave size it cannot run may never return; the case runs on its own
         // thread so that this is a result, not a stuck test.
@@ -255,7 +272,12 @@ int main(int argc, char** argv) {
         std::printf("[victory-wave] case=%s lanes=%u adapter_range=%u..%u host_reports_wave=%s class=%s\n", test.name,
                     test.lanes, lanes_min, lanes_max, work.host_has_wave ? "yes" : "no", cls);
         const std::string c = cls;
-        const bool bad = c == "incorrect" || c == "hang" || (work.host_has_wave && c != "native_exact");
+        const bool unguarded = !hung && work.out_of_range && !(c == "unsupported" && work.shim_refused);
+        if (!hung && work.out_of_range) {
+            std::printf("[victory-wave] case=%s wave size out of the adapter's range: %s\n", test.name,
+                        unguarded ? "NOT refused by the shim" : "refused by the shim");
+        }
+        const bool bad = c == "incorrect" || c == "hang" || unguarded || (work.host_has_wave && c != "native_exact");
         if (bad) ++failures;
         if (hung) {
             // The stuck call holds the device; nothing after it can be trusted.

@@ -100,6 +100,17 @@ bool VictoryGraphicsBindingSupported(const VictoryComputeBinding& binding, std::
 // `why` names the first thing it cannot do.
 bool VictoryComputeBindingSupported(const VictoryComputeBinding& binding, std::string& why);
 
+// The wave lane range a DXIL container says it expects: MinimumExpectedWaveLaneCount and
+// MaximumExpectedWaveLaneCount of the runtime info in its PSV0 part. A shader that does not depend
+// on the wave size says 0 and 0xFFFFFFFF. False when the container has no readable PSV0 part.
+bool DxilExpectedWaveLanes(const uint8_t* data, size_t size, uint32_t& out_min, uint32_t& out_max) noexcept;
+
+// Whether an adapter that runs waves of adapter_min to adapter_max lanes can run a shader that
+// expects expected_min to expected_max, as D3D12 specifies for a declared wave size. `why` says
+// what is missing. A shader without a requirement (0 to 0xFFFFFFFF) runs anywhere.
+bool WaveLanesSupported(uint32_t expected_min, uint32_t expected_max, bool adapter_wave_ops, uint32_t adapter_min,
+                        uint32_t adapter_max, std::string& why);
+
 // Test fixtures: console-shaped containers written by the bridge, no title data.
 //   0 the synthetic compute fixture   1 the same, native stream cut short (malformed)
 //   2 console index without native code   3 a native program the translator refuses

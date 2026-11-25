@@ -332,6 +332,51 @@ bool VictoryComputeBindingSupported(const VictoryComputeBinding& binding, std::s
     return why.empty();
 }
 
+bool DxilExpectedWaveLanes(const uint8_t* data, size_t size, uint32_t& out_min, uint32_t& out_max) noexcept {
+    // A DXBC container: magic, 16 bytes of hash, version, total size, part count, part offsets.
+    // Each part: four characters, its size, its data. PSV0's data starts with the size of the
+    // runtime info, whose dwords 4 and 5 are the two lane counts.
+    auto read32 = [&](size_t at, uint32_t& value) {
+        if (!data || at > size || size - at < 4) return false;
+        std::memcpy(&value, data + at, 4);
+        return true;
+    };
+    if (!data || size < 32 || std::memcmp(data, "DXBC", 4) != 0) return false;
+    uint32_t parts = 0;
+    if (!read32(28, parts) || parts > 256) return false;
+    for (uint32_t i = 0; i < parts; ++i) {
+        uint32_t at = 0;
+        uint32_t part_size = 0;
+        if (!read32(32 + 4 * static_cast<size_t>(i), at) || !read32(static_cast<size_t>(at) + 4, part_size)) return false;
+        if (at > size || size - at < 8 || std::memcmp(data + at, "PSV0", 4) != 0) continue;
+        const size_t body = static_cast<size_t>(at) + 8;
+        uint32_t info_size = 0;
+        if (part_size < 4 || part_size > size - body || !read32(body, info_size)) return false;
+        if (info_size < 24 || info_size > part_size - 4) return false;
+        return read32(body + 4 + 16, out_min) && read32(body + 4 + 20, out_max);
+    }
+    return false;
+}
+
+bool WaveLanesSupported(uint32_t expected_min, uint32_t expected_max, bool adapter_wave_ops, uint32_t adapter_min,
+                        uint32_t adapter_max, std::string& why) {
+    why.clear();
+    if (expected_min == 0 && expected_max == 0xFFFFFFFFu) return true;
+    const std::string wants = expected_min == expected_max
+                                  ? "waves of " + std::to_string(expected_min) + " lanes"
+                                  : "waves of " + std::to_string(expected_min) + " to " + std::to_string(expected_max) + " lanes";
+    if (!adapter_wave_ops) {
+        why = "the shader needs " + wants + "; the adapter has no wave operations";
+        return false;
+    }
+    if (expected_min > adapter_max || expected_max < adapter_min) {
+        why = "the shader needs " + wants + "; the adapter runs waves of " + std::to_string(adapter_min) + " to " +
+              std::to_string(adapter_max);
+        return false;
+    }
+    return true;
+}
+
 Status BuildVictorySyntheticContainer(uint32_t variant, std::vector<uint8_t>& out_bytes) {
     out_bytes.clear();
 #if !defined(SCARLETTX_VICTORY_SHADER_BRIDGE)

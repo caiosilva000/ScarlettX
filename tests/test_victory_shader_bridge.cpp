@@ -4,6 +4,7 @@
 #include <cstdint>
 #include <cstring>
 #include <iostream>
+#include <string>
 #include <vector>
 
 namespace {
@@ -50,6 +51,49 @@ int main() {
     // for this test.
     SX_REQUIRE(info.native_status != 0);
     SX_REQUIRE(info.native_program_count == 0);
+    // The wave size a translated shader expects, read from its PSV0 part.
+    struct WaveCase {
+        uint32_t variant;
+        uint32_t min;
+        uint32_t max;
+    };
+    for (const WaveCase& c : {WaveCase{13, 32, 32}, WaveCase{14, 64, 64}, WaveCase{7, 0, 0xFFFFFFFFu}}) {
+        std::vector<uint8_t> container;
+        SX_REQUIRE(scarlettx::BuildVictorySyntheticContainer(c.variant, container).ok());
+        scarlettx::VictoryShaderInfo wave_info;
+        scarlettx::VictoryComputeBinding binding;
+        std::vector<uint8_t> dxil;
+        SX_REQUIRE(scarlettx::TranslateVictoryCompute(container.data(), container.size(), wave_info, binding, dxil) ==
+                   scarlettx::VictoryComputeOutcome::Translated);
+        uint32_t min = 1;
+        uint32_t max = 1;
+        SX_REQUIRE(scarlettx::DxilExpectedWaveLanes(dxil.data(), dxil.size(), min, max));
+        SX_REQUIRE(min == c.min && max == c.max);
+        // Cut anywhere, the container is refused, not read past its end.
+        for (size_t cut = 0; cut < dxil.size(); cut += 7) {
+            uint32_t a = 0;
+            uint32_t b = 0;
+            (void)scarlettx::DxilExpectedWaveLanes(dxil.data(), cut, a, b);
+        }
+        std::cout << "[test_victory_shader_bridge] variant " << c.variant << " expects waves " << min << ".." << max
+                  << "\n";
+    }
+    {
+        uint32_t min = 0;
+        uint32_t max = 0;
+        SX_REQUIRE(!scarlettx::DxilExpectedWaveLanes(nullptr, 0, min, max));
+        SX_REQUIRE(!scarlettx::DxilExpectedWaveLanes(envelope.data(), envelope.size(), min, max));  // no PSV0 part
+        std::string why;
+        SX_REQUIRE(scarlettx::WaveLanesSupported(0, 0xFFFFFFFFu, false, 0, 0, why));   // no requirement
+        SX_REQUIRE(scarlettx::WaveLanesSupported(32, 32, true, 32, 32, why));
+        SX_REQUIRE(scarlettx::WaveLanesSupported(64, 64, true, 4, 128, why));
+        SX_REQUIRE(scarlettx::WaveLanesSupported(16, 64, true, 32, 32, why));          // a range that includes 32
+        SX_REQUIRE(!scarlettx::WaveLanesSupported(64, 64, true, 32, 32, why));
+        SX_REQUIRE(why.find("64") != std::string::npos && why.find("32") != std::string::npos);
+        SX_REQUIRE(!scarlettx::WaveLanesSupported(8, 16, true, 32, 64, why));
+        SX_REQUIRE(!scarlettx::WaveLanesSupported(32, 32, false, 0, 0, why));          // no wave operations at all
+        std::cout << "[test_victory_shader_bridge] wave ranges: " << why << "\n";
+    }
     std::cout << "[test_victory_shader_bridge] DXBC parts=" << info.part_count
               << " native=" << info.native_program_count << " message=" << info.message << "\n";
     return 0;

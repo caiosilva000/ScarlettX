@@ -505,6 +505,10 @@ def check_victory_wave(stdout: str) -> dict:
                                           boundary_exact=int(b_ok), boundary_total=int(b_total))
     for name, text in re.findall(r"\[victory-wave\] case=(\S+) translated: (.*)", stdout):
         cases.setdefault(name, {})["translated"] = text
+    for name, verdict in re.findall(
+            r"\[victory-wave\] case=(\S+) wave size out of the adapter's range: (NOT refused|refused) by the shim",
+            stdout):
+        cases.setdefault(name, {})["out_of_range_refused_by_shim"] = verdict == "refused"
     fences = [(int(s_), int(c), int(w)) for s_, c, w in
               re.findall(r"\[victory-wave\] fence signaled=(\d+) completed=(\d+) wait_result=(\d+)", stdout)]
     info = {
@@ -524,7 +528,8 @@ def check_victory_wave(stdout: str) -> dict:
             return c.get("host_reports_wave") and c.get("dwords_exact") == c.get("dwords_total")
         if c.get("class") == "emulated_exact":
             return not c.get("host_reports_wave") and c.get("dwords_exact") == c.get("dwords_total")
-        return c.get("class") == "unsupported" and not c.get("host_reports_wave")
+        return (c.get("class") == "unsupported" and not c.get("host_reports_wave")
+                and c.get("out_of_range_refused_by_shim", True))
     info["requirements_met"] = bool(
         caps and set(cases) == {"exchange32", "exchange64"} and all(acceptable(c) for c in cases.values())
         and info["fences_completed"] == info["fences"]
