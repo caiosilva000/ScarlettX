@@ -154,10 +154,7 @@ pub unsafe extern "C" fn sx_victory_shader_translate(
     }
     match victory_shader::emit::translate(input) {
         Ok(shader) => {
-            let mut dxil = shader.dxil;
-            output.size = dxil.len();
-            output.data = dxil.as_mut_ptr();
-            std::mem::forget(dxil);
+            hand_over(output, shader.dxil);
             0
         }
         Err(err) => {
@@ -167,6 +164,15 @@ pub unsafe extern "C" fn sx_victory_shader_translate(
     }
 }
 
+/// Gives `bytes` to the C++ caller. A boxed slice's allocation is exactly its
+/// length, so `sx_victory_buffer_free` can rebuild it from `data` and `size`
+/// alone (a `Vec` may hold more capacity than its length).
+fn hand_over(out: &mut SxVictoryByteBuffer, bytes: Vec<u8>) {
+    let boxed = bytes.into_boxed_slice();
+    out.size = boxed.len();
+    out.data = Box::into_raw(boxed).cast::<u8>();
+}
+
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn sx_victory_buffer_free(buffer: *mut SxVictoryByteBuffer) {
     if buffer.is_null() {
@@ -174,8 +180,8 @@ pub unsafe extern "C" fn sx_victory_buffer_free(buffer: *mut SxVictoryByteBuffer
     }
     let buffer = unsafe { &mut *buffer };
     if !buffer.data.is_null() {
-        // `translate` allocated exactly `size` bytes and transferred the Vec.
-        unsafe { drop(Vec::from_raw_parts(buffer.data, buffer.size, buffer.size)) };
+        // SAFETY: `hand_over` leaked a boxed slice of exactly `size` bytes at `data`.
+        unsafe { drop(Box::from_raw(std::ptr::slice_from_raw_parts_mut(buffer.data, buffer.size))) };
     }
     buffer.data = std::ptr::null_mut();
     buffer.size = 0;
@@ -423,16 +429,29 @@ pub unsafe extern "C" fn sx_victory_synthetic_compute(
         | u32::from(shader.view_marks) << 5;
     binding.threads = threads;
 
-    let mut dxil = shader.dxil.into_boxed_slice();
-    output.size = dxil.len();
-    output.data = dxil.as_mut_ptr();
-    std::mem::forget(dxil);
+    hand_over(output, shader.dxil);
     0
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_buffer_with_spare_capacity_is_handed_over_and_freed_by_its_length() {
+        let mut bytes = Vec::with_capacity(4096);
+        bytes.extend_from_slice(&[1u8, 2, 3, 4, 5]);
+        let mut buffer = SxVictoryByteBuffer { data: std::ptr::null_mut(), size: 0 };
+        hand_over(&mut buffer, bytes);
+        assert_eq!(buffer.size, 5);
+        // SAFETY: `hand_over` just filled the buffer.
+        assert_eq!(unsafe { slice::from_raw_parts(buffer.data, buffer.size) }, [1, 2, 3, 4, 5]);
+        unsafe { sx_victory_buffer_free(&mut buffer) };
+        assert!(buffer.data.is_null() && buffer.size == 0);
+        // Freeing twice, or freeing nothing, is harmless.
+        unsafe { sx_victory_buffer_free(&mut buffer) };
+        unsafe { sx_victory_buffer_free(std::ptr::null_mut()) };
+    }
 
     #[test]
     fn synthetic_compute_translates_to_a_dxil_container() {

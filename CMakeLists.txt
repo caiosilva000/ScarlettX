@@ -68,16 +68,19 @@ if(WIN32)
 
     if(SCARLETTX_VICTORY_SHADER_BRIDGE)
         find_program(CARGO_EXECUTABLE cargo REQUIRED)
+        # rustc names a staticlib `<name>.lib` for MSVC targets and `lib<name>.a` for GNU ones.
         if(MSVC)
             set(SCARLETTX_RUST_TARGET x86_64-pc-windows-msvc)
+            set(SCARLETTX_VICTORY_BRIDGE_FILE scarlettx_victory_bridge.lib)
         else()
             set(SCARLETTX_RUST_TARGET x86_64-pc-windows-gnullvm)
+            set(SCARLETTX_VICTORY_BRIDGE_FILE libscarlettx_victory_bridge.a)
         endif()
 
         set(SCARLETTX_VICTORY_BRIDGE_DIR
             "${CMAKE_CURRENT_SOURCE_DIR}/third_party/scarlettx-victory-bridge")
         set(SCARLETTX_VICTORY_BRIDGE_LIBRARY
-            "${SCARLETTX_VICTORY_BRIDGE_DIR}/target/${SCARLETTX_RUST_TARGET}/release/libscarlettx_victory_bridge.a")
+            "${SCARLETTX_VICTORY_BRIDGE_DIR}/target/${SCARLETTX_RUST_TARGET}/release/${SCARLETTX_VICTORY_BRIDGE_FILE}")
         string(TOUPPER "${SCARLETTX_RUST_TARGET}" SCARLETTX_CARGO_TARGET_KEY)
         string(REPLACE "-" "_" SCARLETTX_CARGO_TARGET_KEY "${SCARLETTX_CARGO_TARGET_KEY}")
         set(SCARLETTX_CARGO_LINKER_ENV

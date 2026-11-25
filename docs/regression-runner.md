@@ -61,3 +61,14 @@ runner remains the reference: the local build uses Clang with the MinGW runtime.
 
 `regress` preflight on CrossOver also checks that the bottle has `xaudio2_9 = native` (BLOCKED with the
 command to set it otherwise) and records the bottle's `CX_GRAPHICS_BACKEND` setting in `summary.json`.
+
+## Translated compute (research builds with the Victory bridge)
+
+When the build has `test_victory_compute_e2e` (configured with `-DSCARLETTX_VICTORY_SHADER_BRIDGE=ON`), `regress`
+runs it as a GPU check and requires more than exit 0: all five dispatch fences completed without a timeout and
+20 of 20 read-back dwords exact. The result's `victory_compute` block names the shader path it exercises, the
+adapter and the first failing API if there was one.
+
+Every check also records `exe_sha256`. Without `--commit`, the summary takes the source revision from the
+build's own `build-info.txt` (`commit_source` says which), and carries that file as `build_info`: for a bridge
+build it holds the Victory gitlink, the bridge's `Cargo.lock` hash and the Rust toolchain.

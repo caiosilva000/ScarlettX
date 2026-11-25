@@ -45,7 +45,12 @@ GPU_TESTS = {
     "test_d3d12_warp", "test_rt_pipeline", "test_shader_pipeline", "test_d3d12_xs_abi", "test_d3d12_guest_texture",
     "test_d3d12_list_layout", "test_d3d12_frame_pacing", "test_d3d12_present_window", "test_d3d12_present_frames",
     "test_d3d12_offscreen_probe", "test_d3d12_offscreen_clear", "test_d3d12_offscreen_indexed",
+    "test_victory_compute_e2e",
 }
+# Translated compute (tests/test_victory_compute_e2e.cpp): five dispatches of four dwords each.
+VICTORY_COMPUTE_TEST = "test_victory_compute_e2e"
+VICTORY_COMPUTE_DISPATCHES = 5
+VICTORY_COMPUTE_DWORDS = 20
 PRESENT_TEST = "test_d3d12_present_frames"
 # Frame colours of tests/test_d3d12_present_frames.cpp, left and right half.
 PRESENT_COLOURS = {"red": (230, 30, 30), "green": (30, 200, 30), "blue": (30, 60, 230), "yellow": (240, 220, 30)}
@@ -375,13 +380,62 @@ def check_offscreen(stdout: str, mode: str) -> dict:
     return info
 
 
+def check_victory_compute(stdout: str) -> dict:
+    """The requirements of the translated-compute probe, read from its output: every dispatch's
+    fence completed without a timeout and every read-back dword exact."""
+    fences = [(int(s), int(c), int(w)) for s, c, w in
+              re.findall(r"\[victory-compute\] fence signaled=(\d+) completed=(\d+) wait_result=(\d+)", stdout)]
+    dwords = re.search(r"\[victory-compute\] dwords exact (\d+)/(\d+)", stdout)
+    translated = re.search(r"\[victory-compute\] translated: dxil=(\d+) bytes", stdout)
+    backend = re.search(r'\[victory-compute\] backend=(\S+) adapter="([^"]*)" vendor=(\S+) device=(\S+) warp=(\S+)',
+                        stdout)
+    failed = re.search(r"\[victory-compute\] FAILED api=(.*?) hr=(0x[0-9a-f]+)", stdout)
+    info = {
+        "shader_path": "synthetic GFX10 compute -> victory-shader bridge -> DXIL -> D3D12Backend::RunComputeProbe",
+        "dxil_bytes": int(translated.group(1)) if translated else None,
+        "fences_completed": sum(1 for s, c, w in fences if c >= s >= 1 and w == 0),
+        "fences_expected": VICTORY_COMPUTE_DISPATCHES,
+        "dwords_exact": int(dwords.group(1)) if dwords else None,
+        "dwords_total": int(dwords.group(2)) if dwords else None,
+        "backend": backend.group(1) if backend else None,
+        "adapter": backend.group(2) if backend else None,
+        "vendor": backend.group(3) if backend else None,
+        "device": backend.group(4) if backend else None,
+        "warp": backend.group(5) if backend else None,
+    }
+    if failed:
+        info["first_failing_api"] = {"api": failed.group(1), "hresult": failed.group(2)}
+    info["requirements_met"] = bool(
+        translated and dwords and len(fences) == VICTORY_COMPUTE_DISPATCHES
+        and info["fences_completed"] == VICTORY_COMPUTE_DISPATCHES
+        and info["dwords_exact"] == info["dwords_total"] == VICTORY_COMPUTE_DWORDS)
+    return info
+
+
+def read_build_info(build: Path) -> dict:
+    """build-info.txt as tools/macos_cross_build.sh writes it: `key=value` lines."""
+    info = {}
+    try:
+        for line in (build / "build-info.txt").read_text().splitlines():
+            key, sep, value = line.partition("=")
+            if sep:
+                info[key.strip()] = value.strip()
+    except OSError:
+        pass
+    return info
+
+
 def cmd_regress(args) -> int:
     out = Path(args.out).resolve()
     out.mkdir(parents=True, exist_ok=True)
     build = Path(args.build).resolve()
     host = Host(args.bottle, args.wine)
+    # The source revision: --commit, else what the build recorded about itself.
+    build_info = read_build_info(build)
     summary = {"tool": "sx_regress regress", "started": time.strftime("%Y-%m-%dT%H:%M:%S%z"), "build": str(build),
-               "commit": args.commit, "host": None, "graphics": {}, "checks": []}
+               "commit": args.commit or build_info.get("commit"),
+               "commit_source": "--commit" if args.commit else ("build-info.txt" if build_info.get("commit") else None),
+               "build_info": build_info, "host": None, "graphics": {}, "checks": []}
     checks = summary["checks"]
 
     def add(name, category, status, **details):
@@ -502,6 +556,16 @@ def cmd_regress(args) -> int:
             elif status == PASS:
                 note = (f"{probe['pixels_exact']}/{probe['pixels_total']} exact, fence {probe['fence_completed']}/"
                         f"{probe['fence_signaled']}, adapter {probe['adapter']}")
+        if name == VICTORY_COMPUTE_TEST:
+            probe = check_victory_compute(r["stdout"])
+            details["victory_compute"] = probe
+            if status == PASS and not probe["requirements_met"]:
+                status, note = FAIL, "exit 0 but a fence or the exact-dword requirement was not met"
+            elif status == PASS:
+                note = (f"{probe['dwords_exact']}/{probe['dwords_total']} dwords exact, fences "
+                        f"{probe['fences_completed']}/{probe['fences_expected']}, adapter {probe['adapter']}")
+        # The hash of what ran, so a result can be tied to one artifact.
+        details["exe_sha256"] = hashlib.sha256(exe.read_bytes()).hexdigest()
         add(name, category, status, note=note, **details)
 
     # Presentation: the API results above, plus what the window showed.

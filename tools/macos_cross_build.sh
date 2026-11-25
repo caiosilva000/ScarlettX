@@ -73,6 +73,17 @@ build() {
         printf 'toolchain=%s sha256=%s\n' "$toolchain_name" "$toolchain_sha256"
         printf 'compiler=%s\n' "$(x86_64-w64-mingw32-clang++ --version | head -1)"
         printf 'cmake=%s ninja=%s\n' "$(cmake --version | head -1)" "$(ninja --version)"
+        printf 'victory_shader_bridge=%s\n' "${SCARLETTX_VICTORY_SHADER_BRIDGE:-OFF}"
+        if [[ "${SCARLETTX_VICTORY_SHADER_BRIDGE:-OFF}" == ON ]]; then
+            printf 'victory_gitlink=%s\n' "$(git -C "$root" rev-parse HEAD:third_party/victory 2>/dev/null || echo unknown)"
+            printf 'victory_checkout=%s dirty_files=%s\n' \
+                "$(git -C "$root/third_party/victory" rev-parse HEAD 2>/dev/null || echo unknown)" \
+                "$(git -C "$root/third_party/victory" status --porcelain 2>/dev/null | wc -l | tr -d ' ')"
+            printf 'bridge_cargo_lock_sha256=%s\n' \
+                "$(shasum -a 256 "$root/third_party/scarlettx-victory-bridge/Cargo.lock" | cut -d' ' -f1)"
+            printf 'rustc=%s\n' "$(cd "$root/third_party/scarlettx-victory-bridge" && rustc --version)"
+            printf 'cargo=%s\n' "$(cd "$root/third_party/scarlettx-victory-bridge" && cargo --version)"
+        fi
     } > "$build_dir/build-info.txt"
     cat "$build_dir/build-info.txt"
     printf 'built: %s\n' "$build_dir"
