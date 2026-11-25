@@ -64,7 +64,8 @@ build() {
         -DCMAKE_SYSTEM_NAME=Windows -DCMAKE_SYSTEM_PROCESSOR=x86_64 \
         -DCMAKE_C_COMPILER=x86_64-w64-mingw32-clang -DCMAKE_CXX_COMPILER=x86_64-w64-mingw32-clang++ \
         -DCMAKE_RC_COMPILER=x86_64-w64-mingw32-windres \
-        -DSCARLETTX_VICTORY_SHADER_BRIDGE="${SCARLETTX_VICTORY_SHADER_BRIDGE:-OFF}"
+        -DSCARLETTX_VICTORY_SHADER_BRIDGE="${SCARLETTX_VICTORY_SHADER_BRIDGE:-OFF}" \
+        -DSCARLETTX_BENCHMARKS="${SCARLETTX_BENCHMARKS:-OFF}"
     cmake --build "$build_dir" --parallel
     ctest --test-dir "$build_dir" --show-only=json-v1 > "$build_dir/ctest-inventory.json"
     {

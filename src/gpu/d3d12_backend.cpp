@@ -4,6 +4,8 @@
 #include <fstream>
 #include <iostream>
 #include <sstream>
+#include <unordered_map>
+#include <utility>
 
 #if defined(_WIN32)
 #include <windows.h>
@@ -94,6 +96,39 @@ float4 PSMain(VSOut i) : SV_TARGET {
 
 }  // namespace
 
+// One prepared probe: see the probe-session functions below.
+struct D3D12Backend::ProbeSession {
+    bool compute = false;
+    ID3D12RootSignature* root = nullptr;
+    ID3D12PipelineState* pso = nullptr;
+    ID3D12DescriptorHeap* view_heap = nullptr;     // compute: the raw UAV at index 0; draw: the RTV
+    ID3D12DescriptorHeap* sampler_heap = nullptr;  // compute only
+    ID3D12Resource* target = nullptr;              // compute: the UAV buffer; draw: the render target
+    ID3D12Resource* readback = nullptr;
+    ID3D12QueryHeap* timestamps = nullptr;         // null when the host has no timestamp queries
+    ID3D12Resource* timestamp_readback = nullptr;
+    uint32_t dwords = 0;
+    uint32_t groups[3] = {1, 1, 1};
+    uint32_t constant_count = 0;                   // compute: b0; draw: the pixel stage's b0
+    std::vector<uint32_t> vs_constants;
+    uint32_t width = 0;
+    uint32_t height = 0;
+    uint32_t viewport_width = 0;
+    float clear_color[4] = {0, 0, 0, 0};
+    UINT row_pitch = 0;
+
+    void Release() {
+        SafeRelease(timestamp_readback);
+        SafeRelease(timestamps);
+        SafeRelease(readback);
+        SafeRelease(target);
+        SafeRelease(sampler_heap);
+        SafeRelease(view_heap);
+        SafeRelease(pso);
+        SafeRelease(root);
+    }
+};
+
 struct D3D12Backend::Impl {
     IDXGIFactory4* factory = nullptr;
     IDXGIAdapter1* adapter = nullptr;
@@ -105,10 +140,14 @@ struct D3D12Backend::Impl {
     ID3D12Fence* fence = nullptr;
     HANDLE fence_event = nullptr;
     uint64_t fence_value = 0;
+    std::unordered_map<uint32_t, ProbeSession> sessions;
+    uint32_t next_session = 1;
 
     ~Impl() { Cleanup(); }
 
     void Cleanup() {
+        for (auto& entry : sessions) entry.second.Release();
+        sessions.clear();
         if (fence_event) {
             CloseHandle(fence_event);
             fence_event = nullptr;
@@ -847,52 +886,129 @@ Status D3D12Backend::RenderOffscreenProbe(OffscreenProbeMode mode, uint32_t widt
     return Status::Ok();
 }
 
-Status D3D12Backend::RunComputeProbe(const ComputeProbeDesc& desc, std::vector<uint32_t>& out_dwords,
-                                     OffscreenProbeReport& report) {
+// ---------------------------------------------------------------------------
+// Probe sessions: a pipeline and its resources made once (Prepare*), then any number of work
+// submissions (SubmitProbeWork) and read-backs. RunComputeProbe and RunDrawProbe are one session
+// each; the benchmark keeps a session alive to time its steps apart.
+// ---------------------------------------------------------------------------
+
+namespace {
+
+double MsSince(const LARGE_INTEGER& start) {
+    LARGE_INTEGER now;
+    LARGE_INTEGER freq;
+    QueryPerformanceCounter(&now);
+    QueryPerformanceFrequency(&freq);
+    return static_cast<double>(now.QuadPart - start.QuadPart) * 1000.0 / static_cast<double>(freq.QuadPart);
+}
+
+LARGE_INTEGER Now() {
+    LARGE_INTEGER t;
+    QueryPerformanceCounter(&t);
+    return t;
+}
+
+}  // namespace
+
+namespace {
+
+// Signals the fence and waits for it; fills the report's fence fields.
+HRESULT WaitFence(ID3D12CommandQueue* queue, ID3D12Fence* fence, HANDLE event, uint64_t& fence_value,
+                  ID3D12Device* device, OffscreenProbeReport& report, const char** failed_api) {
+    const uint64_t target = ++fence_value;
+    report.fence_signaled = target;
+    HRESULT hr = queue->Signal(fence, target);
+    if (FAILED(hr)) {
+        *failed_api = "ID3D12CommandQueue::Signal";
+        return hr;
+    }
+    if (fence->GetCompletedValue() < target) {
+        hr = fence->SetEventOnCompletion(target, event);
+        if (FAILED(hr)) {
+            *failed_api = "ID3D12Fence::SetEventOnCompletion";
+            return hr;
+        }
+        report.wait_result = WaitForSingleObject(event, 10000);
+    }
+    report.fence_completed = fence->GetCompletedValue();
+    if (report.fence_completed < target) {
+        *failed_api = "ID3D12Fence::GetCompletedValue (fence not reached)";
+        const HRESULT removed = device->GetDeviceRemovedReason();
+        return FAILED(removed) ? removed : E_FAIL;
+    }
+    return S_OK;
+}
+
+Status ProbeFailure(OffscreenProbeReport& report, const char* api, HRESULT hr) {
+    report.failed_api = api;
+    report.failed_hr = static_cast<int32_t>(hr);
+    std::ostringstream msg;
+    msg << api << " failed, hr=0x" << std::hex << static_cast<uint32_t>(hr);
+    return Status::Error(StatusCode::DeviceError, msg.str());
+}
+
+HRESULT MakeProbeBuffer(ID3D12Device* device, D3D12_HEAP_TYPE type, UINT64 bytes, D3D12_RESOURCE_FLAGS flags,
+                        D3D12_RESOURCE_STATES state, ID3D12Resource** out) {
+    D3D12_HEAP_PROPERTIES heap{};
+    heap.Type = type;
+    D3D12_RESOURCE_DESC buffer{};
+    buffer.Dimension = D3D12_RESOURCE_DIMENSION_BUFFER;
+    buffer.Width = bytes;
+    buffer.Height = 1;
+    buffer.DepthOrArraySize = 1;
+    buffer.MipLevels = 1;
+    buffer.Format = DXGI_FORMAT_UNKNOWN;
+    buffer.SampleDesc.Count = 1;
+    buffer.Layout = D3D12_TEXTURE_LAYOUT_ROW_MAJOR;
+    buffer.Flags = flags;
+    return device->CreateCommittedResource(&heap, D3D12_HEAP_FLAG_NONE, &buffer, state, nullptr, IID_PPV_ARGS(out));
+}
+
+// Two timestamp queries and the buffer they resolve to; left null when the host refuses them.
+void MakeTimestampQueries(ID3D12Device* device, ID3D12QueryHeap** heap, ID3D12Resource** readback) {
+    D3D12_QUERY_HEAP_DESC desc{};
+    desc.Type = D3D12_QUERY_HEAP_TYPE_TIMESTAMP;
+    desc.Count = 2;
+    if (FAILED(device->CreateQueryHeap(&desc, IID_PPV_ARGS(heap)))) {
+        *heap = nullptr;
+        return;
+    }
+    if (FAILED(MakeProbeBuffer(device, D3D12_HEAP_TYPE_READBACK, 16, D3D12_RESOURCE_FLAG_NONE,
+                               D3D12_RESOURCE_STATE_COPY_DEST, readback))) {
+        SafeRelease(*heap);
+        *readback = nullptr;
+    }
+}
+
+}  // namespace
+
+Status D3D12Backend::PrepareComputeProbe(const ComputeProbeDesc& desc, uint32_t& out_session,
+                                         OffscreenProbeReport& report, ProbePrepareTiming* timing) {
     report = OffscreenProbeReport{};
-    out_dwords.clear();
+    out_session = 0;
     if (!IsInitialized()) {
         return Status::Error(StatusCode::DeviceError, "D3D12Backend is not initialized");
     }
     if (!desc.shader || desc.shader_size == 0 || desc.root_constants.empty() || desc.uav_dwords == 0) {
         return Status::Error(StatusCode::InvalidArgument, "Compute probe needs a shader, constants and a UAV");
     }
-
-    ID3DBlob* sig_blob = nullptr;
-    ID3DBlob* err_blob = nullptr;
-    ID3D12RootSignature* root_sig = nullptr;
-    ID3D12PipelineState* pso = nullptr;
-    ID3D12DescriptorHeap* view_heap = nullptr;
-    ID3D12DescriptorHeap* sampler_heap = nullptr;
-    ID3D12Resource* uav = nullptr;
-    ID3D12Resource* upload = nullptr;
-    ID3D12Resource* readback = nullptr;
-    auto cleanup = [&]() {
-        SafeRelease(readback);
-        SafeRelease(upload);
-        SafeRelease(uav);
-        SafeRelease(sampler_heap);
-        SafeRelease(view_heap);
-        SafeRelease(pso);
-        SafeRelease(root_sig);
-        SafeRelease(err_blob);
-        SafeRelease(sig_blob);
-    };
-    auto fail = [&](const char* api, HRESULT hr) -> Status {
-        report.failed_api = api;
-        report.failed_hr = static_cast<int32_t>(hr);
-        cleanup();
-        std::ostringstream msg;
-        msg << api << " failed, hr=0x" << std::hex << static_cast<uint32_t>(hr);
-        return Status::Error(StatusCode::DeviceError, msg.str());
+    ProbeSession session;
+    session.compute = true;
+    session.dwords = desc.uav_dwords;
+    session.constant_count = static_cast<uint32_t>(desc.root_constants.size());
+    for (int i = 0; i < 3; ++i) session.groups[i] = desc.groups[i];
+    auto fail = [&](const char* api, HRESULT hr) {
+        session.Release();
+        return ProbeFailure(report, api, hr);
     };
 
     // Root parameter 0: the user data. The shader takes its views from the heap by index.
+    LARGE_INTEGER start = Now();
     D3D12_ROOT_PARAMETER user_data{};
     user_data.ParameterType = D3D12_ROOT_PARAMETER_TYPE_32BIT_CONSTANTS;
     user_data.Constants.ShaderRegister = 0;
     user_data.Constants.RegisterSpace = 0;
-    user_data.Constants.Num32BitValues = static_cast<UINT>(desc.root_constants.size());
+    user_data.Constants.Num32BitValues = session.constant_count;
     user_data.ShaderVisibility = D3D12_SHADER_VISIBILITY_ALL;
     D3D12_ROOT_SIGNATURE_DESC rs_desc{};
     rs_desc.NumParameters = 1;
@@ -900,61 +1016,55 @@ Status D3D12Backend::RunComputeProbe(const ComputeProbeDesc& desc, std::vector<u
     rs_desc.Flags = static_cast<D3D12_ROOT_SIGNATURE_FLAGS>(
         D3D12_ROOT_SIGNATURE_FLAG_CBV_SRV_UAV_HEAP_DIRECTLY_INDEXED |
         D3D12_ROOT_SIGNATURE_FLAG_SAMPLER_HEAP_DIRECTLY_INDEXED);
+    ID3DBlob* sig_blob = nullptr;
+    ID3DBlob* err_blob = nullptr;
     HRESULT hr = D3D12SerializeRootSignature(&rs_desc, D3D_ROOT_SIGNATURE_VERSION_1, &sig_blob, &err_blob);
+    SafeRelease(err_blob);
     if (FAILED(hr)) return fail("D3D12SerializeRootSignature(compute)", hr);
     hr = impl_->device->CreateRootSignature(0, sig_blob->GetBufferPointer(), sig_blob->GetBufferSize(),
-                                            IID_PPV_ARGS(&root_sig));
+                                            IID_PPV_ARGS(&session.root));
+    SafeRelease(sig_blob);
     if (FAILED(hr)) return fail("ID3D12Device::CreateRootSignature(compute)", hr);
+    if (timing) timing->root_signature_ms = MsSince(start);
 
+    start = Now();
     D3D12_COMPUTE_PIPELINE_STATE_DESC pso_desc{};
-    pso_desc.pRootSignature = root_sig;
+    pso_desc.pRootSignature = session.root;
     pso_desc.CS.pShaderBytecode = desc.shader;
     pso_desc.CS.BytecodeLength = desc.shader_size;
-    hr = impl_->device->CreateComputePipelineState(&pso_desc, IID_PPV_ARGS(&pso));
+    hr = impl_->device->CreateComputePipelineState(&pso_desc, IID_PPV_ARGS(&session.pso));
     if (FAILED(hr)) return fail("ID3D12Device::CreateComputePipelineState", hr);
+    if (timing) timing->pipeline_ms = MsSince(start);
 
+    start = Now();
     D3D12_DESCRIPTOR_HEAP_DESC heap_desc{};
     heap_desc.NumDescriptors = 1;
     heap_desc.Type = D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV;
     heap_desc.Flags = D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE;
-    hr = impl_->device->CreateDescriptorHeap(&heap_desc, IID_PPV_ARGS(&view_heap));
+    hr = impl_->device->CreateDescriptorHeap(&heap_desc, IID_PPV_ARGS(&session.view_heap));
     if (FAILED(hr)) return fail("ID3D12Device::CreateDescriptorHeap(CBV_SRV_UAV)", hr);
     heap_desc.Type = D3D12_DESCRIPTOR_HEAP_TYPE_SAMPLER;
-    hr = impl_->device->CreateDescriptorHeap(&heap_desc, IID_PPV_ARGS(&sampler_heap));
+    hr = impl_->device->CreateDescriptorHeap(&heap_desc, IID_PPV_ARGS(&session.sampler_heap));
     if (FAILED(hr)) return fail("ID3D12Device::CreateDescriptorHeap(SAMPLER)", hr);
 
     const UINT64 bytes = static_cast<UINT64>(desc.uav_dwords) * 4;
-    auto make_buffer = [&](D3D12_HEAP_TYPE type, D3D12_RESOURCE_FLAGS flags, D3D12_RESOURCE_STATES state,
-                           ID3D12Resource** out) -> HRESULT {
-        D3D12_HEAP_PROPERTIES heap{};
-        heap.Type = type;
-        D3D12_RESOURCE_DESC buffer{};
-        buffer.Dimension = D3D12_RESOURCE_DIMENSION_BUFFER;
-        buffer.Width = bytes;
-        buffer.Height = 1;
-        buffer.DepthOrArraySize = 1;
-        buffer.MipLevels = 1;
-        buffer.Format = DXGI_FORMAT_UNKNOWN;
-        buffer.SampleDesc.Count = 1;
-        buffer.Layout = D3D12_TEXTURE_LAYOUT_ROW_MAJOR;
-        buffer.Flags = flags;
-        return impl_->device->CreateCommittedResource(&heap, D3D12_HEAP_FLAG_NONE, &buffer, state, nullptr,
-                                                      IID_PPV_ARGS(out));
-    };
-    hr = make_buffer(D3D12_HEAP_TYPE_DEFAULT, D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS,
-                     D3D12_RESOURCE_STATE_COPY_DEST, &uav);
+    ID3D12Resource* upload = nullptr;
+    hr = MakeProbeBuffer(impl_->device, D3D12_HEAP_TYPE_DEFAULT, bytes, D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS,
+                         D3D12_RESOURCE_STATE_COPY_DEST, &session.target);
     if (FAILED(hr)) return fail("ID3D12Device::CreateCommittedResource(UAV)", hr);
-    hr = make_buffer(D3D12_HEAP_TYPE_UPLOAD, D3D12_RESOURCE_FLAG_NONE, D3D12_RESOURCE_STATE_GENERIC_READ,
-                     &upload);
-    if (FAILED(hr)) return fail("ID3D12Device::CreateCommittedResource(Upload)", hr);
-    hr = make_buffer(D3D12_HEAP_TYPE_READBACK, D3D12_RESOURCE_FLAG_NONE, D3D12_RESOURCE_STATE_COPY_DEST,
-                     &readback);
+    hr = MakeProbeBuffer(impl_->device, D3D12_HEAP_TYPE_READBACK, bytes, D3D12_RESOURCE_FLAG_NONE,
+                         D3D12_RESOURCE_STATE_COPY_DEST, &session.readback);
     if (FAILED(hr)) return fail("ID3D12Device::CreateCommittedResource(Readback)", hr);
-
+    hr = MakeProbeBuffer(impl_->device, D3D12_HEAP_TYPE_UPLOAD, bytes, D3D12_RESOURCE_FLAG_NONE,
+                         D3D12_RESOURCE_STATE_GENERIC_READ, &upload);
+    if (FAILED(hr)) return fail("ID3D12Device::CreateCommittedResource(Upload)", hr);
     void* mapped = nullptr;
     D3D12_RANGE no_read{0, 0};
     hr = upload->Map(0, &no_read, &mapped);
-    if (FAILED(hr) || !mapped) return fail("ID3D12Resource::Map(Upload)", FAILED(hr) ? hr : E_POINTER);
+    if (FAILED(hr) || !mapped) {
+        SafeRelease(upload);
+        return fail("ID3D12Resource::Map(Upload)", FAILED(hr) ? hr : E_POINTER);
+    }
     for (uint32_t i = 0; i < desc.uav_dwords; ++i) {
         std::memcpy(static_cast<uint8_t*>(mapped) + static_cast<size_t>(i) * 4, &desc.uav_fill, 4);
     }
@@ -966,106 +1076,73 @@ Status D3D12Backend::RunComputeProbe(const ComputeProbeDesc& desc, std::vector<u
     view.ViewDimension = D3D12_UAV_DIMENSION_BUFFER;
     view.Buffer.NumElements = desc.uav_dwords;
     view.Buffer.Flags = D3D12_BUFFER_UAV_FLAG_RAW;
-    impl_->device->CreateUnorderedAccessView(uav, nullptr, &view,
-                                             view_heap->GetCPUDescriptorHandleForHeapStart());
+    impl_->device->CreateUnorderedAccessView(session.target, nullptr, &view,
+                                             session.view_heap->GetCPUDescriptorHandleForHeapStart());
 
+    // Fill the buffer; it then stays in the unordered-access state between submissions.
+    const char* failed_api = nullptr;
     hr = impl_->allocator->Reset();
-    if (FAILED(hr)) return fail("ID3D12CommandAllocator::Reset", hr);
-    hr = impl_->cmd_list->Reset(impl_->allocator, pso);
-    if (FAILED(hr)) return fail("ID3D12GraphicsCommandList::Reset", hr);
-
-    auto transition = [&](D3D12_RESOURCE_STATES before, D3D12_RESOURCE_STATES after) {
-        D3D12_RESOURCE_BARRIER barrier{};
-        barrier.Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
-        barrier.Transition.pResource = uav;
-        barrier.Transition.StateBefore = before;
-        barrier.Transition.StateAfter = after;
-        barrier.Transition.Subresource = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
-        impl_->cmd_list->ResourceBarrier(1, &barrier);
-    };
-    impl_->cmd_list->CopyBufferRegion(uav, 0, upload, 0, bytes);
-    transition(D3D12_RESOURCE_STATE_COPY_DEST, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
-    // The heaps go first: a directly indexed root signature reads whichever are set.
-    ID3D12DescriptorHeap* heaps[] = {view_heap, sampler_heap};
-    impl_->cmd_list->SetDescriptorHeaps(2, heaps);
-    impl_->cmd_list->SetComputeRootSignature(root_sig);
-    impl_->cmd_list->SetComputeRoot32BitConstants(0, static_cast<UINT>(desc.root_constants.size()),
-                                                  desc.root_constants.data(), 0);
-    impl_->cmd_list->Dispatch(desc.groups[0], desc.groups[1], desc.groups[2]);
-    transition(D3D12_RESOURCE_STATE_UNORDERED_ACCESS, D3D12_RESOURCE_STATE_COPY_SOURCE);
-    impl_->cmd_list->CopyBufferRegion(readback, 0, uav, 0, bytes);
+    if (SUCCEEDED(hr)) hr = impl_->cmd_list->Reset(impl_->allocator, nullptr);
+    if (FAILED(hr)) {
+        SafeRelease(upload);
+        return fail("ID3D12GraphicsCommandList::Reset", hr);
+    }
+    impl_->cmd_list->CopyBufferRegion(session.target, 0, upload, 0, bytes);
+    D3D12_RESOURCE_BARRIER barrier{};
+    barrier.Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
+    barrier.Transition.pResource = session.target;
+    barrier.Transition.StateBefore = D3D12_RESOURCE_STATE_COPY_DEST;
+    barrier.Transition.StateAfter = D3D12_RESOURCE_STATE_UNORDERED_ACCESS;
+    barrier.Transition.Subresource = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
+    impl_->cmd_list->ResourceBarrier(1, &barrier);
     hr = impl_->cmd_list->Close();
-    if (FAILED(hr)) return fail("ID3D12GraphicsCommandList::Close", hr);
-
-    ID3D12CommandList* lists[] = {impl_->cmd_list};
-    impl_->queue->ExecuteCommandLists(1, lists);
-
-    const uint64_t target = ++impl_->fence_value;
-    report.fence_signaled = target;
-    hr = impl_->queue->Signal(impl_->fence, target);
-    if (FAILED(hr)) return fail("ID3D12CommandQueue::Signal", hr);
-    if (impl_->fence->GetCompletedValue() < target) {
-        hr = impl_->fence->SetEventOnCompletion(target, impl_->fence_event);
-        if (FAILED(hr)) return fail("ID3D12Fence::SetEventOnCompletion", hr);
-        report.wait_result = WaitForSingleObject(impl_->fence_event, 10000);
+    if (SUCCEEDED(hr)) {
+        ID3D12CommandList* lists[] = {impl_->cmd_list};
+        impl_->queue->ExecuteCommandLists(1, lists);
+        OffscreenProbeReport fill_report;
+        hr = WaitFence(impl_->queue, impl_->fence, impl_->fence_event, impl_->fence_value, impl_->device,
+                       fill_report, &failed_api);
+    } else {
+        failed_api = "ID3D12GraphicsCommandList::Close";
     }
-    report.fence_completed = impl_->fence->GetCompletedValue();
-    if (report.fence_completed < target) {
-        const HRESULT removed = impl_->device->GetDeviceRemovedReason();
-        return fail("ID3D12Fence::GetCompletedValue (fence not reached)", FAILED(removed) ? removed : E_FAIL);
-    }
+    SafeRelease(upload);
+    if (FAILED(hr)) return fail(failed_api ? failed_api : "buffer fill", hr);
 
-    mapped = nullptr;
-    D3D12_RANGE read_range{0, static_cast<SIZE_T>(bytes)};
-    hr = readback->Map(0, &read_range, &mapped);
-    if (FAILED(hr) || !mapped) return fail("ID3D12Resource::Map(Readback)", FAILED(hr) ? hr : E_POINTER);
-    out_dwords.resize(desc.uav_dwords);
-    std::memcpy(out_dwords.data(), mapped, static_cast<size_t>(bytes));
-    D3D12_RANGE empty_range{0, 0};
-    readback->Unmap(0, &empty_range);
-    cleanup();
+    MakeTimestampQueries(impl_->device, &session.timestamps, &session.timestamp_readback);
+    if (timing) timing->resources_ms = MsSince(start);
+
+    out_session = impl_->next_session++;
+    impl_->sessions.emplace(out_session, session);
     return Status::Ok();
 }
 
-Status D3D12Backend::RunDrawProbe(const DrawProbeDesc& desc, FrameBufferRgba8& out_frame,
-                                  OffscreenProbeReport& report) {
+Status D3D12Backend::PrepareDrawProbe(const DrawProbeDesc& desc, uint32_t& out_session,
+                                      OffscreenProbeReport& report, ProbePrepareTiming* timing) {
     report = OffscreenProbeReport{};
+    out_session = 0;
     if (!IsInitialized()) {
         return Status::Error(StatusCode::DeviceError, "D3D12Backend is not initialized");
     }
     if (!desc.vs || !desc.vs_size || !desc.ps || !desc.ps_size || !desc.width || !desc.height) {
         return Status::Error(StatusCode::InvalidArgument, "Draw probe needs two shaders and a target size");
     }
-
-    ID3DBlob* sig_blob = nullptr;
-    ID3DBlob* err_blob = nullptr;
-    ID3D12RootSignature* root_sig = nullptr;
-    ID3D12PipelineState* pso = nullptr;
-    ID3D12DescriptorHeap* rtv_heap = nullptr;
-    ID3D12Resource* render_target = nullptr;
-    ID3D12Resource* readback = nullptr;
-    auto cleanup = [&]() {
-        SafeRelease(readback);
-        SafeRelease(render_target);
-        SafeRelease(rtv_heap);
-        SafeRelease(pso);
-        SafeRelease(root_sig);
-        SafeRelease(err_blob);
-        SafeRelease(sig_blob);
-    };
-    auto fail = [&](const char* api, HRESULT hr) -> Status {
-        report.failed_api = api;
-        report.failed_hr = static_cast<int32_t>(hr);
-        cleanup();
-        std::ostringstream msg;
-        msg << api << " failed, hr=0x" << std::hex << static_cast<uint32_t>(hr);
-        return Status::Error(StatusCode::DeviceError, msg.str());
+    ProbeSession session;
+    session.width = desc.width;
+    session.height = desc.height;
+    session.viewport_width = desc.viewport_width;
+    session.vs_constants = desc.vs_constants;
+    session.constant_count = static_cast<uint32_t>(desc.ps_constants.empty() ? 1 : desc.ps_constants.size());
+    for (int i = 0; i < 4; ++i) session.clear_color[i] = static_cast<float>(desc.clear_rgba[i]) / 255.0f;
+    auto fail = [&](const char* api, HRESULT hr) {
+        session.Release();
+        return ProbeFailure(report, api, hr);
     };
 
     // User data of the vertex stage is root parameter 0, of the pixel stage root parameter 1.
+    LARGE_INTEGER start = Now();
     D3D12_ROOT_PARAMETER params[2]{};
     const UINT counts[2] = {static_cast<UINT>(desc.vs_constants.empty() ? 1 : desc.vs_constants.size()),
-                            static_cast<UINT>(desc.ps_constants.empty() ? 1 : desc.ps_constants.size())};
+                            session.constant_count};
     const D3D12_SHADER_VISIBILITY stages[2] = {D3D12_SHADER_VISIBILITY_VERTEX, D3D12_SHADER_VISIBILITY_PIXEL};
     for (int i = 0; i < 2; ++i) {
         params[i].ParameterType = D3D12_ROOT_PARAMETER_TYPE_32BIT_CONSTANTS;
@@ -1081,14 +1158,20 @@ Status D3D12Backend::RunDrawProbe(const DrawProbeDesc& desc, FrameBufferRgba8& o
         D3D12_ROOT_SIGNATURE_FLAG_ALLOW_INPUT_ASSEMBLER_INPUT_LAYOUT |
         D3D12_ROOT_SIGNATURE_FLAG_CBV_SRV_UAV_HEAP_DIRECTLY_INDEXED |
         D3D12_ROOT_SIGNATURE_FLAG_SAMPLER_HEAP_DIRECTLY_INDEXED);
+    ID3DBlob* sig_blob = nullptr;
+    ID3DBlob* err_blob = nullptr;
     HRESULT hr = D3D12SerializeRootSignature(&rs_desc, D3D_ROOT_SIGNATURE_VERSION_1, &sig_blob, &err_blob);
+    SafeRelease(err_blob);
     if (FAILED(hr)) return fail("D3D12SerializeRootSignature(draw)", hr);
     hr = impl_->device->CreateRootSignature(0, sig_blob->GetBufferPointer(), sig_blob->GetBufferSize(),
-                                            IID_PPV_ARGS(&root_sig));
+                                            IID_PPV_ARGS(&session.root));
+    SafeRelease(sig_blob);
     if (FAILED(hr)) return fail("ID3D12Device::CreateRootSignature(draw)", hr);
+    if (timing) timing->root_signature_ms = MsSince(start);
 
+    start = Now();
     D3D12_GRAPHICS_PIPELINE_STATE_DESC pso_desc{};
-    pso_desc.pRootSignature = root_sig;
+    pso_desc.pRootSignature = session.root;
     pso_desc.VS = {desc.vs, desc.vs_size};
     pso_desc.PS = {desc.ps, desc.ps_size};
     pso_desc.BlendState.RenderTarget[0].RenderTargetWriteMask = D3D12_COLOR_WRITE_ENABLE_ALL;
@@ -1100,13 +1183,15 @@ Status D3D12Backend::RunDrawProbe(const DrawProbeDesc& desc, FrameBufferRgba8& o
     pso_desc.NumRenderTargets = 1;
     pso_desc.RTVFormats[0] = DXGI_FORMAT_R8G8B8A8_UNORM;
     pso_desc.SampleDesc.Count = 1;
-    hr = impl_->device->CreateGraphicsPipelineState(&pso_desc, IID_PPV_ARGS(&pso));
+    hr = impl_->device->CreateGraphicsPipelineState(&pso_desc, IID_PPV_ARGS(&session.pso));
     if (FAILED(hr)) return fail("ID3D12Device::CreateGraphicsPipelineState(draw)", hr);
+    if (timing) timing->pipeline_ms = MsSince(start);
 
+    start = Now();
     D3D12_DESCRIPTOR_HEAP_DESC rtv_heap_desc{};
     rtv_heap_desc.NumDescriptors = 1;
     rtv_heap_desc.Type = D3D12_DESCRIPTOR_HEAP_TYPE_RTV;
-    hr = impl_->device->CreateDescriptorHeap(&rtv_heap_desc, IID_PPV_ARGS(&rtv_heap));
+    hr = impl_->device->CreateDescriptorHeap(&rtv_heap_desc, IID_PPV_ARGS(&session.view_heap));
     if (FAILED(hr)) return fail("ID3D12Device::CreateDescriptorHeap(RTV)", hr);
 
     D3D12_HEAP_PROPERTIES default_heap{};
@@ -1120,111 +1205,267 @@ Status D3D12Backend::RunDrawProbe(const DrawProbeDesc& desc, FrameBufferRgba8& o
     rt_desc.Format = DXGI_FORMAT_R8G8B8A8_UNORM;
     rt_desc.SampleDesc.Count = 1;
     rt_desc.Flags = D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET;
-    float clear_color[4];
-    for (int i = 0; i < 4; ++i) clear_color[i] = static_cast<float>(desc.clear_rgba[i]) / 255.0f;
     D3D12_CLEAR_VALUE clear_val{};
     clear_val.Format = DXGI_FORMAT_R8G8B8A8_UNORM;
-    std::memcpy(clear_val.Color, clear_color, sizeof(clear_color));
+    std::memcpy(clear_val.Color, session.clear_color, sizeof(session.clear_color));
     hr = impl_->device->CreateCommittedResource(&default_heap, D3D12_HEAP_FLAG_NONE, &rt_desc,
                                                 D3D12_RESOURCE_STATE_RENDER_TARGET, &clear_val,
-                                                IID_PPV_ARGS(&render_target));
+                                                IID_PPV_ARGS(&session.target));
     if (FAILED(hr)) return fail("ID3D12Device::CreateCommittedResource(RT)", hr);
-    const D3D12_CPU_DESCRIPTOR_HANDLE rtv = rtv_heap->GetCPUDescriptorHandleForHeapStart();
-    impl_->device->CreateRenderTargetView(render_target, nullptr, rtv);
+    impl_->device->CreateRenderTargetView(session.target, nullptr,
+                                          session.view_heap->GetCPUDescriptorHandleForHeapStart());
 
-    const UINT row_pitch = (desc.width * 4 + D3D12_TEXTURE_DATA_PITCH_ALIGNMENT - 1) &
-                           ~(D3D12_TEXTURE_DATA_PITCH_ALIGNMENT - 1);
-    const UINT64 readback_size = static_cast<UINT64>(row_pitch) * desc.height;
-    D3D12_HEAP_PROPERTIES readback_heap{};
-    readback_heap.Type = D3D12_HEAP_TYPE_READBACK;
-    D3D12_RESOURCE_DESC rb_desc{};
-    rb_desc.Dimension = D3D12_RESOURCE_DIMENSION_BUFFER;
-    rb_desc.Width = readback_size;
-    rb_desc.Height = 1;
-    rb_desc.DepthOrArraySize = 1;
-    rb_desc.MipLevels = 1;
-    rb_desc.SampleDesc.Count = 1;
-    rb_desc.Layout = D3D12_TEXTURE_LAYOUT_ROW_MAJOR;
-    hr = impl_->device->CreateCommittedResource(&readback_heap, D3D12_HEAP_FLAG_NONE, &rb_desc,
-                                                D3D12_RESOURCE_STATE_COPY_DEST, nullptr, IID_PPV_ARGS(&readback));
+    session.row_pitch = (desc.width * 4 + D3D12_TEXTURE_DATA_PITCH_ALIGNMENT - 1) &
+                        ~(D3D12_TEXTURE_DATA_PITCH_ALIGNMENT - 1);
+    hr = MakeProbeBuffer(impl_->device, D3D12_HEAP_TYPE_READBACK, static_cast<UINT64>(session.row_pitch) * desc.height,
+                         D3D12_RESOURCE_FLAG_NONE, D3D12_RESOURCE_STATE_COPY_DEST, &session.readback);
     if (FAILED(hr)) return fail("ID3D12Device::CreateCommittedResource(Readback)", hr);
+    MakeTimestampQueries(impl_->device, &session.timestamps, &session.timestamp_readback);
+    if (timing) timing->resources_ms = MsSince(start);
 
-    hr = impl_->allocator->Reset();
-    if (FAILED(hr)) return fail("ID3D12CommandAllocator::Reset", hr);
-    hr = impl_->cmd_list->Reset(impl_->allocator, pso);
-    if (FAILED(hr)) return fail("ID3D12GraphicsCommandList::Reset", hr);
+    out_session = impl_->next_session++;
+    impl_->sessions.emplace(out_session, session);
+    return Status::Ok();
+}
 
-    impl_->cmd_list->OMSetRenderTargets(1, &rtv, FALSE, nullptr);
-    impl_->cmd_list->ClearRenderTargetView(rtv, clear_color, 0, nullptr);
-    D3D12_VIEWPORT vp{0.0f, 0.0f, static_cast<float>(desc.viewport_width), static_cast<float>(desc.height), 0.0f, 1.0f};
-    D3D12_RECT scissor{0, 0, static_cast<LONG>(desc.width), static_cast<LONG>(desc.height)};
-    impl_->cmd_list->SetGraphicsRootSignature(root_sig);
-    const uint32_t unused = 0;
-    impl_->cmd_list->SetGraphicsRoot32BitConstants(
-        0, counts[0], desc.vs_constants.empty() ? &unused : desc.vs_constants.data(), 0);
-    impl_->cmd_list->SetGraphicsRoot32BitConstants(
-        1, counts[1], desc.ps_constants.empty() ? &unused : desc.ps_constants.data(), 0);
-    impl_->cmd_list->RSSetViewports(1, &vp);
-    impl_->cmd_list->RSSetScissorRects(1, &scissor);
-    impl_->cmd_list->IASetPrimitiveTopology(D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
-    impl_->cmd_list->DrawInstanced(3, 1, 0, 0);
-    report.index_count = 3;
+Status D3D12Backend::SubmitProbeWork(uint32_t session_id, const std::vector<uint32_t>& constants,
+                                     OffscreenProbeReport& report, ProbeSubmitTiming* timing) {
+    report = OffscreenProbeReport{};
+    const auto it = impl_ ? impl_->sessions.find(session_id) : decltype(impl_->sessions.end()){};
+    if (!impl_ || it == impl_->sessions.end()) {
+        return Status::Error(StatusCode::InvalidArgument, "Unknown probe session");
+    }
+    ProbeSession& session = it->second;
+    if (constants.size() != session.constant_count) {
+        return Status::Error(StatusCode::InvalidArgument, "Probe constants do not match the pipeline's user data");
+    }
+    const bool timestamps = timing && session.timestamps;
 
+    LARGE_INTEGER start = Now();
+    HRESULT hr = impl_->allocator->Reset();
+    if (FAILED(hr)) return ProbeFailure(report, "ID3D12CommandAllocator::Reset", hr);
+    hr = impl_->cmd_list->Reset(impl_->allocator, session.pso);
+    if (FAILED(hr)) return ProbeFailure(report, "ID3D12GraphicsCommandList::Reset", hr);
+    if (timestamps) impl_->cmd_list->EndQuery(session.timestamps, D3D12_QUERY_TYPE_TIMESTAMP, 0);
+    if (session.compute) {
+        // The heaps go first: a directly indexed root signature reads whichever are set.
+        ID3D12DescriptorHeap* heaps[] = {session.view_heap, session.sampler_heap};
+        impl_->cmd_list->SetDescriptorHeaps(2, heaps);
+        impl_->cmd_list->SetComputeRootSignature(session.root);
+        impl_->cmd_list->SetComputeRoot32BitConstants(0, session.constant_count, constants.data(), 0);
+        impl_->cmd_list->Dispatch(session.groups[0], session.groups[1], session.groups[2]);
+    } else {
+        const D3D12_CPU_DESCRIPTOR_HANDLE rtv = session.view_heap->GetCPUDescriptorHandleForHeapStart();
+        impl_->cmd_list->OMSetRenderTargets(1, &rtv, FALSE, nullptr);
+        impl_->cmd_list->ClearRenderTargetView(rtv, session.clear_color, 0, nullptr);
+        D3D12_VIEWPORT vp{0.0f, 0.0f, static_cast<float>(session.viewport_width),
+                          static_cast<float>(session.height), 0.0f, 1.0f};
+        D3D12_RECT scissor{0, 0, static_cast<LONG>(session.width), static_cast<LONG>(session.height)};
+        impl_->cmd_list->SetGraphicsRootSignature(session.root);
+        const uint32_t unused = 0;
+        impl_->cmd_list->SetGraphicsRoot32BitConstants(
+            0, static_cast<UINT>(session.vs_constants.empty() ? 1 : session.vs_constants.size()),
+            session.vs_constants.empty() ? &unused : session.vs_constants.data(), 0);
+        impl_->cmd_list->SetGraphicsRoot32BitConstants(1, session.constant_count, constants.data(), 0);
+        impl_->cmd_list->RSSetViewports(1, &vp);
+        impl_->cmd_list->RSSetScissorRects(1, &scissor);
+        impl_->cmd_list->IASetPrimitiveTopology(D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
+        impl_->cmd_list->DrawInstanced(3, 1, 0, 0);
+        report.index_count = 3;
+    }
+    if (timestamps) {
+        impl_->cmd_list->EndQuery(session.timestamps, D3D12_QUERY_TYPE_TIMESTAMP, 1);
+        impl_->cmd_list->ResolveQueryData(session.timestamps, D3D12_QUERY_TYPE_TIMESTAMP, 0, 2,
+                                          session.timestamp_readback, 0);
+    }
+    hr = impl_->cmd_list->Close();
+    if (FAILED(hr)) return ProbeFailure(report, "ID3D12GraphicsCommandList::Close", hr);
+    if (timing) timing->record_ms = MsSince(start);
+
+    start = Now();
+    ID3D12CommandList* lists[] = {impl_->cmd_list};
+    impl_->queue->ExecuteCommandLists(1, lists);
+    const char* failed_api = nullptr;
+    hr = WaitFence(impl_->queue, impl_->fence, impl_->fence_event, impl_->fence_value, impl_->device, report,
+                   &failed_api);
+    if (FAILED(hr)) return ProbeFailure(report, failed_api, hr);
+    if (timing) {
+        timing->submit_to_fence_ms = MsSince(start);
+        timing->gpu_ms = -1.0;
+        if (timestamps) {
+            UINT64 frequency = 0;
+            void* mapped = nullptr;
+            D3D12_RANGE range{0, 16};
+            if (SUCCEEDED(impl_->queue->GetTimestampFrequency(&frequency)) && frequency != 0 &&
+                SUCCEEDED(session.timestamp_readback->Map(0, &range, &mapped)) && mapped) {
+                UINT64 ticks[2];
+                std::memcpy(ticks, mapped, sizeof(ticks));
+                D3D12_RANGE none{0, 0};
+                session.timestamp_readback->Unmap(0, &none);
+                // A host that resolves zeros, or runs the clock backwards, has no usable timestamps.
+                if (ticks[0] != 0 && ticks[1] >= ticks[0]) {
+                    timing->gpu_ms = static_cast<double>(ticks[1] - ticks[0]) * 1000.0 / static_cast<double>(frequency);
+                }
+            }
+        }
+    }
+    return Status::Ok();
+}
+
+Status D3D12Backend::ReadComputeProbe(uint32_t session_id, std::vector<uint32_t>& out_dwords,
+                                      OffscreenProbeReport& report) {
+    report = OffscreenProbeReport{};
+    out_dwords.clear();
+    const auto it = impl_ ? impl_->sessions.find(session_id) : decltype(impl_->sessions.end()){};
+    if (!impl_ || it == impl_->sessions.end() || !it->second.compute) {
+        return Status::Error(StatusCode::InvalidArgument, "Not a compute probe session");
+    }
+    ProbeSession& session = it->second;
+    const UINT64 bytes = static_cast<UINT64>(session.dwords) * 4;
+    HRESULT hr = impl_->allocator->Reset();
+    if (FAILED(hr)) return ProbeFailure(report, "ID3D12CommandAllocator::Reset", hr);
+    hr = impl_->cmd_list->Reset(impl_->allocator, nullptr);
+    if (FAILED(hr)) return ProbeFailure(report, "ID3D12GraphicsCommandList::Reset", hr);
     D3D12_RESOURCE_BARRIER barrier{};
     barrier.Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
-    barrier.Transition.pResource = render_target;
+    barrier.Transition.pResource = session.target;
+    barrier.Transition.StateBefore = D3D12_RESOURCE_STATE_UNORDERED_ACCESS;
+    barrier.Transition.StateAfter = D3D12_RESOURCE_STATE_COPY_SOURCE;
+    barrier.Transition.Subresource = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
+    impl_->cmd_list->ResourceBarrier(1, &barrier);
+    impl_->cmd_list->CopyBufferRegion(session.readback, 0, session.target, 0, bytes);
+    std::swap(barrier.Transition.StateBefore, barrier.Transition.StateAfter);
+    impl_->cmd_list->ResourceBarrier(1, &barrier);
+    hr = impl_->cmd_list->Close();
+    if (FAILED(hr)) return ProbeFailure(report, "ID3D12GraphicsCommandList::Close", hr);
+    ID3D12CommandList* lists[] = {impl_->cmd_list};
+    impl_->queue->ExecuteCommandLists(1, lists);
+    const char* failed_api = nullptr;
+    hr = WaitFence(impl_->queue, impl_->fence, impl_->fence_event, impl_->fence_value, impl_->device, report,
+                   &failed_api);
+    if (FAILED(hr)) return ProbeFailure(report, failed_api, hr);
+
+    void* mapped = nullptr;
+    D3D12_RANGE read_range{0, static_cast<SIZE_T>(bytes)};
+    hr = session.readback->Map(0, &read_range, &mapped);
+    if (FAILED(hr) || !mapped) return ProbeFailure(report, "ID3D12Resource::Map(Readback)", FAILED(hr) ? hr : E_POINTER);
+    out_dwords.resize(session.dwords);
+    std::memcpy(out_dwords.data(), mapped, static_cast<size_t>(bytes));
+    D3D12_RANGE empty_range{0, 0};
+    session.readback->Unmap(0, &empty_range);
+    return Status::Ok();
+}
+
+Status D3D12Backend::ReadDrawProbe(uint32_t session_id, FrameBufferRgba8& out_frame, OffscreenProbeReport& report) {
+    report = OffscreenProbeReport{};
+    const auto it = impl_ ? impl_->sessions.find(session_id) : decltype(impl_->sessions.end()){};
+    if (!impl_ || it == impl_->sessions.end() || it->second.compute) {
+        return Status::Error(StatusCode::InvalidArgument, "Not a draw probe session");
+    }
+    ProbeSession& session = it->second;
+    HRESULT hr = impl_->allocator->Reset();
+    if (FAILED(hr)) return ProbeFailure(report, "ID3D12CommandAllocator::Reset", hr);
+    hr = impl_->cmd_list->Reset(impl_->allocator, nullptr);
+    if (FAILED(hr)) return ProbeFailure(report, "ID3D12GraphicsCommandList::Reset", hr);
+    D3D12_RESOURCE_BARRIER barrier{};
+    barrier.Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
+    barrier.Transition.pResource = session.target;
     barrier.Transition.StateBefore = D3D12_RESOURCE_STATE_RENDER_TARGET;
     barrier.Transition.StateAfter = D3D12_RESOURCE_STATE_COPY_SOURCE;
     barrier.Transition.Subresource = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
     impl_->cmd_list->ResourceBarrier(1, &barrier);
     D3D12_TEXTURE_COPY_LOCATION src_loc{};
-    src_loc.pResource = render_target;
+    src_loc.pResource = session.target;
     src_loc.Type = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX;
     D3D12_TEXTURE_COPY_LOCATION dst_loc{};
-    dst_loc.pResource = readback;
+    dst_loc.pResource = session.readback;
     dst_loc.Type = D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT;
     dst_loc.PlacedFootprint.Footprint.Format = DXGI_FORMAT_R8G8B8A8_UNORM;
-    dst_loc.PlacedFootprint.Footprint.Width = desc.width;
-    dst_loc.PlacedFootprint.Footprint.Height = desc.height;
+    dst_loc.PlacedFootprint.Footprint.Width = session.width;
+    dst_loc.PlacedFootprint.Footprint.Height = session.height;
     dst_loc.PlacedFootprint.Footprint.Depth = 1;
-    dst_loc.PlacedFootprint.Footprint.RowPitch = row_pitch;
+    dst_loc.PlacedFootprint.Footprint.RowPitch = session.row_pitch;
     impl_->cmd_list->CopyTextureRegion(&dst_loc, 0, 0, 0, &src_loc, nullptr);
+    std::swap(barrier.Transition.StateBefore, barrier.Transition.StateAfter);
+    impl_->cmd_list->ResourceBarrier(1, &barrier);
     hr = impl_->cmd_list->Close();
-    if (FAILED(hr)) return fail("ID3D12GraphicsCommandList::Close", hr);
-
+    if (FAILED(hr)) return ProbeFailure(report, "ID3D12GraphicsCommandList::Close", hr);
     ID3D12CommandList* lists[] = {impl_->cmd_list};
     impl_->queue->ExecuteCommandLists(1, lists);
-    const uint64_t target = ++impl_->fence_value;
-    report.fence_signaled = target;
-    hr = impl_->queue->Signal(impl_->fence, target);
-    if (FAILED(hr)) return fail("ID3D12CommandQueue::Signal", hr);
-    if (impl_->fence->GetCompletedValue() < target) {
-        hr = impl_->fence->SetEventOnCompletion(target, impl_->fence_event);
-        if (FAILED(hr)) return fail("ID3D12Fence::SetEventOnCompletion", hr);
-        report.wait_result = WaitForSingleObject(impl_->fence_event, 10000);
-    }
-    report.fence_completed = impl_->fence->GetCompletedValue();
-    if (report.fence_completed < target) {
-        const HRESULT removed = impl_->device->GetDeviceRemovedReason();
-        return fail("ID3D12Fence::GetCompletedValue (fence not reached)", FAILED(removed) ? removed : E_FAIL);
-    }
+    const char* failed_api = nullptr;
+    hr = WaitFence(impl_->queue, impl_->fence, impl_->fence_event, impl_->fence_value, impl_->device, report,
+                   &failed_api);
+    if (FAILED(hr)) return ProbeFailure(report, failed_api, hr);
 
+    const UINT64 readback_size = static_cast<UINT64>(session.row_pitch) * session.height;
     void* mapped = nullptr;
     D3D12_RANGE read_range{0, static_cast<SIZE_T>(readback_size)};
-    hr = readback->Map(0, &read_range, &mapped);
-    if (FAILED(hr) || !mapped) return fail("ID3D12Resource::Map(Readback)", FAILED(hr) ? hr : E_POINTER);
-    out_frame.width = desc.width;
-    out_frame.height = desc.height;
-    out_frame.pixels.resize(static_cast<size_t>(desc.width) * desc.height * 4);
+    hr = session.readback->Map(0, &read_range, &mapped);
+    if (FAILED(hr) || !mapped) return ProbeFailure(report, "ID3D12Resource::Map(Readback)", FAILED(hr) ? hr : E_POINTER);
+    out_frame.width = session.width;
+    out_frame.height = session.height;
+    out_frame.pixels.resize(static_cast<size_t>(session.width) * session.height * 4);
     const auto* src_bytes = static_cast<const uint8_t*>(mapped);
-    for (uint32_t y = 0; y < desc.height; ++y) {
-        std::memcpy(out_frame.pixels.data() + static_cast<size_t>(y) * desc.width * 4,
-                    src_bytes + static_cast<size_t>(y) * row_pitch, static_cast<size_t>(desc.width) * 4);
+    for (uint32_t y = 0; y < session.height; ++y) {
+        std::memcpy(out_frame.pixels.data() + static_cast<size_t>(y) * session.width * 4,
+                    src_bytes + static_cast<size_t>(y) * session.row_pitch, static_cast<size_t>(session.width) * 4);
     }
     D3D12_RANGE empty_range{0, 0};
-    readback->Unmap(0, &empty_range);
-    cleanup();
+    session.readback->Unmap(0, &empty_range);
     return Status::Ok();
+}
+
+void D3D12Backend::ReleaseProbe(uint32_t session_id) {
+    if (!impl_) return;
+    const auto it = impl_->sessions.find(session_id);
+    if (it == impl_->sessions.end()) return;
+    it->second.Release();
+    impl_->sessions.erase(it);
+}
+
+bool D3D12Backend::ProbeHasGpuTimestamps(uint32_t session_id) const {
+    if (!impl_) return false;
+    const auto it = impl_->sessions.find(session_id);
+    return it != impl_->sessions.end() && it->second.timestamps != nullptr;
+}
+
+Status D3D12Backend::RunComputeProbe(const ComputeProbeDesc& desc, std::vector<uint32_t>& out_dwords,
+                                     OffscreenProbeReport& report) {
+    out_dwords.clear();
+    uint32_t session = 0;
+    Status st = PrepareComputeProbe(desc, session, report);
+    if (!st.ok()) return st;
+    OffscreenProbeReport work;
+    st = SubmitProbeWork(session, desc.root_constants, work);
+    if (st.ok()) {
+        OffscreenProbeReport read;
+        st = ReadComputeProbe(session, out_dwords, read);
+        report = st.ok() ? work : read;
+    } else {
+        report = work;
+    }
+    ReleaseProbe(session);
+    return st;
+}
+
+Status D3D12Backend::RunDrawProbe(const DrawProbeDesc& desc, FrameBufferRgba8& out_frame,
+                                  OffscreenProbeReport& report) {
+    uint32_t session = 0;
+    Status st = PrepareDrawProbe(desc, session, report);
+    if (!st.ok()) return st;
+    std::vector<uint32_t> ps_constants = desc.ps_constants;
+    if (ps_constants.empty()) ps_constants.push_back(0);
+    OffscreenProbeReport work;
+    st = SubmitProbeWork(session, ps_constants, work);
+    if (st.ok()) {
+        OffscreenProbeReport read;
+        st = ReadDrawProbe(session, out_frame, read);
+        report = st.ok() ? work : read;
+    } else {
+        report = work;
+    }
+    ReleaseProbe(session);
+    return st;
 }
 
 #else
@@ -1256,6 +1497,34 @@ Status D3D12Backend::RunDrawProbe(const DrawProbeDesc&, FrameBufferRgba8&, Offsc
     report = OffscreenProbeReport{};
     return Status::Error(StatusCode::NotImplemented, "D3D12Backend requires Windows");
 }
+Status D3D12Backend::PrepareComputeProbe(const ComputeProbeDesc&, uint32_t& out_session, OffscreenProbeReport& report,
+                                         ProbePrepareTiming*) {
+    report = OffscreenProbeReport{};
+    out_session = 0;
+    return Status::Error(StatusCode::NotImplemented, "D3D12Backend requires Windows");
+}
+Status D3D12Backend::PrepareDrawProbe(const DrawProbeDesc&, uint32_t& out_session, OffscreenProbeReport& report,
+                                      ProbePrepareTiming*) {
+    report = OffscreenProbeReport{};
+    out_session = 0;
+    return Status::Error(StatusCode::NotImplemented, "D3D12Backend requires Windows");
+}
+Status D3D12Backend::SubmitProbeWork(uint32_t, const std::vector<uint32_t>&, OffscreenProbeReport& report,
+                                     ProbeSubmitTiming*) {
+    report = OffscreenProbeReport{};
+    return Status::Error(StatusCode::NotImplemented, "D3D12Backend requires Windows");
+}
+Status D3D12Backend::ReadComputeProbe(uint32_t, std::vector<uint32_t>& out_dwords, OffscreenProbeReport& report) {
+    report = OffscreenProbeReport{};
+    out_dwords.clear();
+    return Status::Error(StatusCode::NotImplemented, "D3D12Backend requires Windows");
+}
+Status D3D12Backend::ReadDrawProbe(uint32_t, FrameBufferRgba8&, OffscreenProbeReport& report) {
+    report = OffscreenProbeReport{};
+    return Status::Error(StatusCode::NotImplemented, "D3D12Backend requires Windows");
+}
+void D3D12Backend::ReleaseProbe(uint32_t) {}
+bool D3D12Backend::ProbeHasGpuTimestamps(uint32_t) const { return false; }
 
 #endif
 

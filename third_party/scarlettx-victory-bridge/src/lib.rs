@@ -276,6 +276,23 @@ const V_ADD_NC_U32: u8 = 0x25;
 /// One thread: `out[0] = ((c0 + c1) ^ c2) + c3` (32-bit, wrapping), the four
 /// root constants in s0..s3, `out` the raw UAV at heap index 0.
 fn synthetic_compute_program() -> NativeProgram {
+    synthetic_compute_program_salted(0)
+}
+
+/// `v_xor_b32 v<reg>, <literal>, v<reg>` twice: the value is unchanged, the
+/// code (and so the translated shader's bytes) differs with `salt`. A shader
+/// with a salt no run has used is one no driver cache has seen.
+fn push_salt(words: &mut Vec<u32>, reg: u8, salt: u32) {
+    if salt != 0 {
+        for _ in 0..2 {
+            words.push(vop2(V_XOR_B32, reg, 255, reg));
+            words.push(salt);
+        }
+    }
+}
+
+/// The compute fixture with [`push_salt`] before its store.
+fn synthetic_compute_program_salted(salt: u32) -> NativeProgram {
     let mut words = Vec::new();
     // s[4:5] = the descriptor table's address (the high half is zero).
     words.push(s_mov_b32(5, 0x80));
@@ -286,6 +303,7 @@ fn synthetic_compute_program() -> NativeProgram {
     words.push(vop2(V_ADD_NC_U32, 0, vgpr(1), 2)); // v0 = v1 + v2
     words.push(vop2(V_XOR_B32, 0, vgpr(0), 3)); // v0 = v0 ^ v3
     words.push(vop2(V_ADD_NC_U32, 0, vgpr(0), 4)); // v0 = v0 + v4
+    push_salt(&mut words, 0, salt);
     words.extend_from_slice(&buffer_store_dword(0, 8, 0));
     words.push(S_ENDPGM);
 
@@ -353,7 +371,11 @@ fn root_code(root: RootType) -> u32 {
 }
 
 fn translate_synthetic_compute() -> Result<(victory_shader::emit::HostShader, [u32; 3]), String> {
-    let native = synthetic_compute_program();
+    translate_synthetic_compute_salted(0)
+}
+
+fn translate_synthetic_compute_salted(salt: u32) -> Result<(victory_shader::emit::HostShader, [u32; 3]), String> {
+    let native = synthetic_compute_program_salted(salt);
     let envelope = empty_envelope();
     let container = Container::parse(&envelope).map_err(|e| e.to_string())?;
     let (program, structured) =
@@ -380,6 +402,19 @@ pub unsafe extern "C" fn sx_victory_synthetic_compute(
     binding: *mut SxVictoryComputeBinding,
     info: *mut SxVictoryShaderInfo,
 ) -> i32 {
+    // SAFETY: the same contract as the salted form.
+    unsafe { sx_victory_synthetic_compute_salted(0, out, binding, info) }
+}
+
+/// [`sx_victory_synthetic_compute`] with a salt: the same results from a
+/// shader whose bytes differ with `salt` (0 is the plain fixture).
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn sx_victory_synthetic_compute_salted(
+    salt: u32,
+    out: *mut SxVictoryByteBuffer,
+    binding: *mut SxVictoryComputeBinding,
+    info: *mut SxVictoryShaderInfo,
+) -> i32 {
     if out.is_null() || binding.is_null() || info.is_null() {
         return -1;
     }
@@ -388,7 +423,7 @@ pub unsafe extern "C" fn sx_victory_synthetic_compute(
     output.data = std::ptr::null_mut();
     output.size = 0;
     clear(report);
-    let (shader, threads) = match translate_synthetic_compute() {
+    let (shader, threads) = match translate_synthetic_compute_salted(salt) {
         Ok(done) => done,
         Err(text) => {
             message(report, text);
@@ -879,11 +914,12 @@ fn synthetic_vertex_program() -> NativeProgram {
 
 /// A pixel program that writes its four root constants (s0..s3, float bits)
 /// to render target 0.
-fn synthetic_pixel_program() -> NativeProgram {
+fn synthetic_pixel_program(salt: u32) -> NativeProgram {
     let mut w = Vec::new();
     for i in 0..4u8 {
         w.push(vop1(V_MOV_B32, i, u16::from(i))); // v<i> = s<i>
     }
+    push_salt(&mut w, 3, salt);
     w.extend_from_slice(&exp(EXP_MRT0, [0, 1, 2, 3], true));
     w.push(S_ENDPGM);
     NativeProgram {
@@ -976,6 +1012,12 @@ fn translate_graphics(native: &NativeProgram, signatures: Vec<u8>) -> Result<vic
 }
 
 fn translate_synthetic_draw() -> Result<(victory_shader::emit::HostShader, victory_shader::emit::HostShader), String> {
+    translate_synthetic_draw_salted(0)
+}
+
+fn translate_synthetic_draw_salted(
+    salt: u32,
+) -> Result<(victory_shader::emit::HostShader, victory_shader::emit::HostShader), String> {
     let vs = translate_graphics(
         &synthetic_vertex_program(),
         envelope(&[
@@ -985,7 +1027,7 @@ fn translate_synthetic_draw() -> Result<(victory_shader::emit::HostShader, victo
     )
     .map_err(|e| format!("vertex program: {e}"))?;
     let ps = translate_graphics(
-        &synthetic_pixel_program(),
+        &synthetic_pixel_program(salt),
         envelope(&[
             (b"ISG1", signature_part(&[("SV_Position", NAME_POSITION, COMPONENT_FLOAT, 0, 0xF)])),
             (b"OSG1", signature_part(&[("SV_Target", NAME_TARGET, COMPONENT_FLOAT, 0, 0xF)])),
@@ -1008,6 +1050,21 @@ pub unsafe extern "C" fn sx_victory_synthetic_draw(
     ps_binding: *mut SxVictoryComputeBinding,
     info: *mut SxVictoryShaderInfo,
 ) -> i32 {
+    // SAFETY: the same contract as the salted form.
+    unsafe { sx_victory_synthetic_draw_salted(0, vs_out, vs_binding, ps_out, ps_binding, info) }
+}
+
+/// [`sx_victory_synthetic_draw`] with a salt in the pixel program: the same
+/// pixels from a pixel shader whose bytes differ with `salt`.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn sx_victory_synthetic_draw_salted(
+    salt: u32,
+    vs_out: *mut SxVictoryByteBuffer,
+    vs_binding: *mut SxVictoryComputeBinding,
+    ps_out: *mut SxVictoryByteBuffer,
+    ps_binding: *mut SxVictoryComputeBinding,
+    info: *mut SxVictoryShaderInfo,
+) -> i32 {
     if vs_out.is_null() || vs_binding.is_null() || ps_out.is_null() || ps_binding.is_null() || info.is_null() {
         return -1;
     }
@@ -1019,7 +1076,7 @@ pub unsafe extern "C" fn sx_victory_synthetic_draw(
         buffer.size = 0;
     }
     clear(report);
-    let (vs, ps) = match translate_synthetic_draw() {
+    let (vs, ps) = match translate_synthetic_draw_salted(salt) {
         Ok(done) => done,
         Err(text) => {
             message(report, text);
@@ -1250,6 +1307,23 @@ mod tests {
             assert!(shader.root_cbvs.is_empty() && shader.samplers.is_empty() && !shader.memory && !shader.heap);
         }
         eprintln!("vs {} bytes, ps {} bytes", vs.dxil.len(), ps.dxil.len());
+    }
+
+    #[test]
+    fn a_salt_changes_the_shader_bytes_and_nothing_else() {
+        let (plain, _) = translate_synthetic_compute_salted(0).unwrap();
+        let (a, _) = translate_synthetic_compute_salted(0x1234_5678).unwrap();
+        let (b, _) = translate_synthetic_compute_salted(0x1234_5679).unwrap();
+        assert_ne!(plain.dxil, a.dxil);
+        assert_ne!(a.dxil, b.dxil);
+        assert_eq!(plain.user_data, a.user_data);
+        let (_, ps0) = translate_synthetic_draw_salted(0).unwrap();
+        let (vs1, ps1) = translate_synthetic_draw_salted(77).unwrap();
+        let (vs2, ps2) = translate_synthetic_draw_salted(78).unwrap();
+        assert_ne!(ps0.dxil, ps1.dxil);
+        assert_ne!(ps1.dxil, ps2.dxil);
+        assert_eq!(vs1.dxil, vs2.dxil, "the salt is in the pixel program only");
+        assert_eq!(ps0.user_data, ps1.user_data);
     }
 
     #[test]

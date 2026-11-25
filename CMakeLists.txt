@@ -437,6 +437,14 @@ target_link_libraries(test_gameinput PRIVATE GameInput)
 scarlettx_add_test(test_shader_pipeline tests/test_shader_pipeline.cpp)
 target_link_libraries(test_shader_pipeline PRIVATE d3d12_xs)
 
+# Opt-in benchmark of shader and pipeline prewarming (docs/prewarm-benchmark.md). Not a test.
+option(SCARLETTX_BENCHMARKS "Build the opt-in benchmark executables" OFF)
+if(SCARLETTX_BENCHMARKS AND SCARLETTX_VICTORY_SHADER_BRIDGE)
+    add_executable(bench_victory_prewarm bench/bench_victory_prewarm.cpp)
+    target_link_libraries(bench_victory_prewarm PRIVATE scarlettx_core)
+    target_include_directories(bench_victory_prewarm PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/include)
+endif()
+
 if(SCARLETTX_VICTORY_SHADER_BRIDGE)
     scarlettx_add_test(test_victory_shader_bridge tests/test_victory_shader_bridge.cpp)
     # Synthetic GFX10 compute -> DXIL -> D3D12 dispatch -> exact readback.

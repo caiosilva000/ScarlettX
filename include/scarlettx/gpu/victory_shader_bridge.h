@@ -55,8 +55,10 @@ struct VictoryComputeBinding {
 
 // Translates the bridge's built-in synthetic GFX10 compute fixture (hand-assembled, no title
 // data): one thread writes ((c0 + c1) ^ c2) + c3 to dword 0 of the raw UAV at heap index 0.
+// A non-zero `salt` gives the same results from a shader whose bytes differ with the salt
+// (benchmarks use it for a shader no driver cache has seen).
 Status TranslateVictorySyntheticCompute(VictoryShaderInfo& out_info, VictoryComputeBinding& out_binding,
-                                        std::vector<uint8_t>& out_dxil);
+                                        std::vector<uint8_t>& out_dxil, uint32_t salt = 0);
 
 // Translates the bridge's synthetic vertex and pixel programs (hand-assembled, no title data).
 // The vertex program makes a triangle covering the viewport from the vertex id; the pixel
@@ -64,7 +66,7 @@ Status TranslateVictorySyntheticCompute(VictoryShaderInfo& out_info, VictoryComp
 // per stage, in the same form as a compute shader's.
 Status TranslateVictorySyntheticDraw(VictoryShaderInfo& out_info, VictoryComputeBinding& out_vs_binding,
                                      std::vector<uint8_t>& out_vs_dxil, VictoryComputeBinding& out_ps_binding,
-                                     std::vector<uint8_t>& out_ps_dxil);
+                                     std::vector<uint8_t>& out_ps_dxil, uint32_t salt = 0);
 
 // What a shader container is, for a compute pipeline.
 enum class VictoryComputeOutcome {

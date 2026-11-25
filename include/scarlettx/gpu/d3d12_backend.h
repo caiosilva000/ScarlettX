@@ -66,6 +66,18 @@ struct DrawProbeDesc {
     uint8_t clear_rgba[4] = {0, 0, 0, 0};
 };
 
+struct ProbePrepareTiming {
+    double root_signature_ms = 0;
+    double pipeline_ms = 0;   // CreateComputePipelineState / CreateGraphicsPipelineState
+    double resources_ms = 0;  // heaps, buffers or render target, views, the initial fill
+};
+
+struct ProbeSubmitTiming {
+    double record_ms = 0;           // resetting and recording the command list
+    double submit_to_fence_ms = 0;  // ExecuteCommandLists until the fence completes
+    double gpu_ms = -1;             // timestamp queries around the work; -1 when unavailable
+};
+
 class D3D12Backend {
 public:
     D3D12Backend();
@@ -99,8 +111,25 @@ public:
     // every pixel back.
     Status RunDrawProbe(const DrawProbeDesc& desc, FrameBufferRgba8& out_frame, OffscreenProbeReport& report);
 
+    // The same probes in steps, so each can be timed apart: Prepare* builds the pipeline and its
+    // resources once (the compute buffer is filled with uav_fill), SubmitProbeWork records and
+    // submits one dispatch or one clear-and-draw and waits on the fence, Read* copies the result
+    // back. `constants` is b0 of the compute shader, or of the pixel stage. Timings are wall-clock
+    // milliseconds; gpu_ms is a timestamp-query duration around the work, -1 when the host has none.
+    Status PrepareComputeProbe(const ComputeProbeDesc& desc, uint32_t& out_session, OffscreenProbeReport& report,
+                               ProbePrepareTiming* timing = nullptr);
+    Status PrepareDrawProbe(const DrawProbeDesc& desc, uint32_t& out_session, OffscreenProbeReport& report,
+                            ProbePrepareTiming* timing = nullptr);
+    Status SubmitProbeWork(uint32_t session, const std::vector<uint32_t>& constants, OffscreenProbeReport& report,
+                           ProbeSubmitTiming* timing = nullptr);
+    Status ReadComputeProbe(uint32_t session, std::vector<uint32_t>& out_dwords, OffscreenProbeReport& report);
+    Status ReadDrawProbe(uint32_t session, FrameBufferRgba8& out_frame, OffscreenProbeReport& report);
+    void ReleaseProbe(uint32_t session);
+    bool ProbeHasGpuTimestamps(uint32_t session) const;
+
 private:
     struct Impl;
+    struct ProbeSession;
     std::unique_ptr<Impl> impl_;
     D3D12AdapterInfo adapter_info_{};
 };

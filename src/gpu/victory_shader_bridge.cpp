@@ -47,10 +47,11 @@ struct SxVictoryComputeBinding {
     uint32_t flags;
     uint32_t threads[3];
 };
-int32_t sx_victory_synthetic_compute(SxVictoryByteBuffer*, SxVictoryComputeBinding*, SxVictoryShaderInfo*);
+int32_t sx_victory_synthetic_compute_salted(uint32_t, SxVictoryByteBuffer*, SxVictoryComputeBinding*,
+                                            SxVictoryShaderInfo*);
 int32_t sx_victory_synthetic_container(uint32_t, SxVictoryByteBuffer*);
-int32_t sx_victory_synthetic_draw(SxVictoryByteBuffer*, SxVictoryComputeBinding*, SxVictoryByteBuffer*,
-                                  SxVictoryComputeBinding*, SxVictoryShaderInfo*);
+int32_t sx_victory_synthetic_draw_salted(uint32_t, SxVictoryByteBuffer*, SxVictoryComputeBinding*,
+                                         SxVictoryByteBuffer*, SxVictoryComputeBinding*, SxVictoryShaderInfo*);
 int32_t sx_victory_shader_translate_compute(const uint8_t*, size_t, SxVictoryByteBuffer*, SxVictoryComputeBinding*,
                                             SxVictoryShaderInfo*);
 }
@@ -139,18 +140,19 @@ Status TranslateVictoryShader(const std::vector<uint8_t>& bytes, VictoryShaderIn
 }
 
 Status TranslateVictorySyntheticCompute(VictoryShaderInfo& out_info, VictoryComputeBinding& out_binding,
-                                        std::vector<uint8_t>& out_dxil) {
+                                        std::vector<uint8_t>& out_dxil, uint32_t salt) {
     out_info = VictoryShaderInfo{};
     out_binding = VictoryComputeBinding{};
     out_dxil.clear();
 #if !defined(SCARLETTX_VICTORY_SHADER_BRIDGE)
+    (void)salt;
     return Status::Error(StatusCode::NotImplemented,
                          "victory-shader bridge was not enabled at configure time");
 #else
     SxVictoryShaderInfo raw{};
     SxVictoryByteBuffer buffer{};
     SxVictoryComputeBinding binding{};
-    const int32_t result = sx_victory_synthetic_compute(&buffer, &binding, &raw);
+    const int32_t result = sx_victory_synthetic_compute_salted(salt, &buffer, &binding, &raw);
     out_info = Convert(raw);
     if (result != 0) {
         return Status::Error(StatusCode::UnsupportedFormat,
@@ -165,13 +167,14 @@ Status TranslateVictorySyntheticCompute(VictoryShaderInfo& out_info, VictoryComp
 
 Status TranslateVictorySyntheticDraw(VictoryShaderInfo& out_info, VictoryComputeBinding& out_vs_binding,
                                      std::vector<uint8_t>& out_vs_dxil, VictoryComputeBinding& out_ps_binding,
-                                     std::vector<uint8_t>& out_ps_dxil) {
+                                     std::vector<uint8_t>& out_ps_dxil, uint32_t salt) {
     out_info = VictoryShaderInfo{};
     out_vs_binding = VictoryComputeBinding{};
     out_ps_binding = VictoryComputeBinding{};
     out_vs_dxil.clear();
     out_ps_dxil.clear();
 #if !defined(SCARLETTX_VICTORY_SHADER_BRIDGE)
+    (void)salt;
     return Status::Error(StatusCode::NotImplemented,
                          "victory-shader bridge was not enabled at configure time");
 #else
@@ -180,7 +183,7 @@ Status TranslateVictorySyntheticDraw(VictoryShaderInfo& out_info, VictoryCompute
     SxVictoryByteBuffer ps{};
     SxVictoryComputeBinding vs_binding{};
     SxVictoryComputeBinding ps_binding{};
-    const int32_t result = sx_victory_synthetic_draw(&vs, &vs_binding, &ps, &ps_binding, &raw);
+    const int32_t result = sx_victory_synthetic_draw_salted(salt, &vs, &vs_binding, &ps, &ps_binding, &raw);
     out_info = Convert(raw);
     if (result != 0) {
         return Status::Error(StatusCode::UnsupportedFormat,
