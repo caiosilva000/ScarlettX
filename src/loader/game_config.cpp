@@ -156,6 +156,31 @@ const GameExecutableEntry* GameConfig::PrimaryExecutable() const noexcept {
     return nullptr;
 }
 
+ConsoleTarget InferConsoleTargetFromImports(const std::vector<std::string>& import_dll_names) {
+    bool scarlett = false;
+    bool xbox_one = false;
+    bool desktop = false;
+    const auto ends_with = [](const std::string& s, std::string_view suffix) {
+        return s.size() >= suffix.size() && s.compare(s.size() - suffix.size(), suffix.size(), suffix) == 0;
+    };
+    for (const auto& raw : import_dll_names) {
+        const std::string name = ToLower(raw);
+        if (ends_with(name, "_xs.dll")) {
+            scarlett = true;
+        } else if (ends_with(name, "_x.dll")) {
+            xbox_one = true;
+        } else if (name == "d3d12.dll" || name == "d3d11.dll" || name == "dxgi.dll") {
+            desktop = true;
+        }
+    }
+    // A console library decides it: console titles never link the desktop ones,
+    // while a tool DLL beside a desktop title might be named like a console one.
+    if (scarlett) return ConsoleTarget::XboxGen9Scarlett;
+    if (xbox_one) return ConsoleTarget::XboxOne;
+    if (desktop) return ConsoleTarget::PcDesktop;
+    return ConsoleTarget::Unknown;
+}
+
 Status ParseGameConfigXml(const std::string& xml_content, GameConfig& out_config) {
     out_config = GameConfig{};
     if (xml_content.find("<Game") == std::string::npos) {

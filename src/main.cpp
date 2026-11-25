@@ -51,7 +51,9 @@ int main(int argc, char** argv) {
         std::cout << "Title: " << rep.config.display_name << " (" << rep.config.title_id << ")\n"
                   << "Identity: " << rep.config.identity_name << " v" << rep.config.version << "\n"
                   << "Scarlett Native: " << (rep.config.IsNativeScarlett() ? "YES (XboxGen9)"
-                                         : rep.config.IsPcDesktop() ? "NO (PC desktop GDK target)" : "NO") << "\n"
+                                         : rep.config.IsPcDesktop() ? "NO (PC desktop GDK target)" : "NO")
+                  << (rep.config.target_inferred ? " [from the executable's imports; the config names no TargetDeviceFamily]" : "")
+                  << "\n"
                   << "Executable: " << rep.executable_path << " (PE64=" << (rep.main_pe.is_pe64 ? "yes" : "no") << ")\n"
                   << "Imports (" << rep.main_pe.imports.size() << " modules):\n";
         for (const auto& mod : rep.main_pe.imports) {

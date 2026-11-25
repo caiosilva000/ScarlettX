@@ -78,6 +78,33 @@ int main() {
     SX_REQUIRE(pc_cfg.PrimaryExecutable() != nullptr);
     SX_REQUIRE(pc_cfg.PrimaryExecutable()->name == "DesktopGame.exe");
 
+    // A config with no TargetDeviceFamily parses with an unknown target ...
+    const std::string untargeted_xml = R"(
+<Game configVersion="1">
+  <Identity Name="TestStudio.Untargeted" Publisher="CN=Test" Version="1.0.0.0" />
+  <ExecutableList>
+    <Executable Name="Untargeted.exe" Id="Game" />
+  </ExecutableList>
+</Game>
+)";
+    scarlettx::GameConfig untargeted_cfg;
+    st = scarlettx::ParseGameConfigXml(untargeted_xml, untargeted_cfg);
+    SX_REQUIRE(st.ok());
+    SX_REQUIRE(untargeted_cfg.console_target == scarlettx::ConsoleTarget::Unknown);
+    SX_REQUIRE(!untargeted_cfg.target_inferred);
+    SX_REQUIRE(untargeted_cfg.PrimaryExecutable() != nullptr);
+
+    // ... and the executable's imports say which platform it was built for.
+    using scarlettx::ConsoleTarget;
+    using scarlettx::InferConsoleTargetFromImports;
+    SX_REQUIRE(InferConsoleTargetFromImports({"KERNEL32.dll", "d3d12_xs.dll", "xg_xs.dll"}) ==
+               ConsoleTarget::XboxGen9Scarlett);
+    SX_REQUIRE(InferConsoleTargetFromImports({"d3d12_x.dll", "KERNEL32.dll"}) == ConsoleTarget::XboxOne);
+    SX_REQUIRE(InferConsoleTargetFromImports({"D3D12.dll", "dxgi.dll", "USER32.dll"}) == ConsoleTarget::PcDesktop);
+    SX_REQUIRE(InferConsoleTargetFromImports({"d3d12.dll", "D3D12_XS.DLL"}) == ConsoleTarget::XboxGen9Scarlett);
+    SX_REQUIRE(InferConsoleTargetFromImports({"KERNEL32.dll", "xgameruntime.dll"}) == ConsoleTarget::Unknown);
+    SX_REQUIRE(InferConsoleTargetFromImports({}) == ConsoleTarget::Unknown);
+
     scarlettx::GameConfig bad_cfg;
     st = scarlettx::ParseGameConfigXml("<NotAGame/>", bad_cfg);
     SX_REQUIRE(!st.ok());

@@ -55,7 +55,16 @@ Status Emulator::InspectPackage(const std::string& package_dir,
     }
     out_report.executable_path = exe_path.string();
 
-    return InspectPeFile(out_report.executable_path, redirects_, out_report.main_pe);
+    st = InspectPeFile(out_report.executable_path, redirects_, out_report.main_pe);
+    if (st.ok() && out_report.config.console_target == ConsoleTarget::Unknown) {
+        std::vector<std::string> import_names;
+        for (const auto& mod : out_report.main_pe.imports) {
+            import_names.push_back(mod.dll_name);
+        }
+        out_report.config.console_target = InferConsoleTargetFromImports(import_names);
+        out_report.config.target_inferred = out_report.config.console_target != ConsoleTarget::Unknown;
+    }
+    return st;
 }
 
 Status Emulator::BootPackage(const std::string& package_dir) {
@@ -65,6 +74,12 @@ Status Emulator::BootPackage(const std::string& package_dir) {
         return st;
     }
 
+    if (report.config.target_inferred) {
+        std::cout << "[ScarlettX][boot] MicrosoftGame.Config names no TargetDeviceFamily; the executable's imports "
+                     "show a "
+                  << (report.config.IsNativeScarlett() ? "Scarlett" : report.config.IsPcDesktop() ? "PC" : "Xbox One")
+                  << " build\n";
+    }
     if (report.config.IsPcDesktop()) {
         if (!config_.allow_pc_target) {
             return Status::Error(StatusCode::UnsupportedFormat,
@@ -73,6 +88,10 @@ Status Emulator::BootPackage(const std::string& package_dir) {
         }
         std::cout << "[ScarlettX][boot] PC-target package accepted (--allow-pc-target): it uses the "
                      "desktop d3d12.dll, so the d3d12_xs shim, --frames and frame dumps do not apply\n";
+    } else if (report.config.console_target == ConsoleTarget::Unknown) {
+        return Status::Error(StatusCode::UnsupportedFormat,
+                             "MicrosoftGame.Config names no TargetDeviceFamily and the executable's imports do not "
+                             "show which platform it was built for");
     } else if (!report.config.IsNativeScarlett()) {
         return Status::Error(StatusCode::UnsupportedFormat,
                              "Package is not a native XboxGen9/Scarlett Game Core target");
