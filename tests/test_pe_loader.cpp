@@ -18,6 +18,19 @@ std::string ToLower(std::string s) {
 }  // namespace
 
 int main() {
+    {
+        // Console targets get the DirectStorage shim; a PC target keeps its package's runtime.
+        scarlettx::DllRedirectionTable table;
+        std::string host;
+        bool hle = false;
+        SX_REQUIRE(table.Resolve("DSTORAGE.dll", host, hle) && hle && host == "dstorage_xs.dll");
+        SX_REQUIRE(table.Resolve("dstoragecore.dll", host, hle) && hle && host == "dstorage_xs.dll");
+        table.UsePackageDirectStorage();
+        SX_REQUIRE(!table.Resolve("DSTORAGE.dll", host, hle));
+        SX_REQUIRE(!table.Resolve("dstoragecore.dll", host, hle));
+        SX_REQUIRE(table.Resolve("dstorage_xs.dll", host, hle) && hle && host == "dstorage_xs.dll");
+        SX_REQUIRE(table.Resolve("xgameruntime.dll", host, hle) && hle);
+    }
     scarlettx::DllRedirectionTable redirects;
     const std::filesystem::path rt_exe =
         std::filesystem::path(SCARLETTX_BINARY_DIR) / "packages" / "rt_showcase" / "rt_showcase.exe";

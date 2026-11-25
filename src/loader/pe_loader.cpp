@@ -120,6 +120,11 @@ void DllRedirectionTable::RegisterRedirect(const std::string& guest_dll,
     entries_[ToLowerAscii(guest_dll)] = Entry{host_dll, is_hle};
 }
 
+void DllRedirectionTable::UsePackageDirectStorage() {
+    entries_.erase("dstorage.dll");
+    entries_.erase("dstoragecore.dll");
+}
+
 bool DllRedirectionTable::Resolve(const std::string& guest_dll,
                                   std::string& out_host_dll,
                                   bool& out_is_hle) const {

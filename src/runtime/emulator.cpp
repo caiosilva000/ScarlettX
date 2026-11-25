@@ -88,6 +88,8 @@ Status Emulator::BootPackage(const std::string& package_dir) {
         }
         std::cout << "[ScarlettX][boot] PC-target package accepted (--allow-pc-target): it uses the "
                      "desktop d3d12.dll, so the d3d12_xs shim, --frames and frame dumps do not apply\n";
+        // Its DirectStorage imports are the desktop interfaces: bind the package's own runtime.
+        redirects_.UsePackageDirectStorage();
     } else if (report.config.console_target == ConsoleTarget::Unknown) {
         return Status::Error(StatusCode::UnsupportedFormat,
                              "MicrosoftGame.Config names no TargetDeviceFamily and the executable's imports do not "

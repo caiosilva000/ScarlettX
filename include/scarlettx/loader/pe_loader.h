@@ -50,6 +50,12 @@ public:
     void RegisterRedirect(const std::string& guest_dll, const std::string& host_dll, bool is_hle);
     bool Resolve(const std::string& guest_dll, std::string& out_host_dll, bool& out_is_hle) const;
 
+    // A PC (desktop GDK) title is built against the desktop DirectStorage interfaces and
+    // ships that runtime (dstorage.dll, dstoragecore.dll) in its package. The dstorage_xs
+    // shim implements the console interface, so for a PC target these two names are left
+    // to the package's own DLLs. dstorage_xs.dll itself stays redirected.
+    void UsePackageDirectStorage();
+
 private:
     struct Entry {
         std::string host_dll;
