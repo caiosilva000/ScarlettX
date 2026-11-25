@@ -80,6 +80,16 @@ float4 VSMain(uint vid : SV_VertexID) : SV_POSITION {
     return float4(float((vid << 1) & 2) * 2.0f - 1.0f, float(vid & 2) * 2.0f - 1.0f, 0.0f, 1.0f);
 }
 float4 PSMain() : SV_TARGET { return colour; }
+// Slow on purpose: a few of these keep the queue busy while the next list waits behind them.
+float4 PSBusy(float4 pos : SV_POSITION) : SV_TARGET {
+    uint v = uint(pos.x) * 0x9E3779B1u ^ uint(pos.y) * 0x85EBCA77u;
+    for (uint i = 0u; i < 8192u; ++i) {
+        v ^= v << 13;
+        v ^= v >> 17;
+        v ^= v << 5;
+    }
+    return float4(float(v & 255u) / 255.0f, 0.0f, 0.0f, 1.0f);
+}
 )";
 
 struct Region {
@@ -620,10 +630,14 @@ int main() {
     }
     // 8. A desktop pipeline between two translated draws in one list.
     void* desktop_pso = nullptr;
+    void* busy_pso = nullptr;
     {
         ID3DBlob* dvs = nullptr;
         ID3DBlob* dps = nullptr;
+        ID3DBlob* dbusy = nullptr;
         ID3DBlob* errors = nullptr;
+        hr = D3DCompile(kDesktopHlsl, std::strlen(kDesktopHlsl), "desktop.hlsl", nullptr, nullptr, "PSBusy", "ps_5_0", 0, 0, &dbusy, &errors);
+        if (FAILED(hr)) return r.Fail("D3DCompile(PSBusy)", hr);
         hr = D3DCompile(kDesktopHlsl, std::strlen(kDesktopHlsl), "desktop.hlsl", nullptr, nullptr, "VSMain", "vs_5_0", 0, 0, &dvs, &errors);
         if (FAILED(hr)) return r.Fail("D3DCompile(VSMain)", hr);
         hr = D3DCompile(kDesktopHlsl, std::strlen(kDesktopHlsl), "desktop.hlsl", nullptr, nullptr, "PSMain", "ps_5_0", 0, 0, &dps, &errors);
@@ -633,6 +647,10 @@ int main() {
         hr = r.CreatePipeline(root, std::vector<uint8_t>(v, v + dvs->GetBufferSize()), std::vector<uint8_t>(p, p + dps->GetBufferSize()),
                               &desktop_pso);
         if (FAILED(hr) || !desktop_pso) return r.Fail("shim CreateGraphicsPipelineState (slot 10), desktop shaders", hr);
+        const auto* b = static_cast<const uint8_t*>(dbusy->GetBufferPointer());
+        hr = r.CreatePipeline(root, std::vector<uint8_t>(v, v + dvs->GetBufferSize()), std::vector<uint8_t>(b, b + dbusy->GetBufferSize()),
+                              &busy_pso);
+        if (FAILED(hr) || !busy_pso) return r.Fail("shim CreateGraphicsPipelineState (slot 10), busy shader", hr);
     }
     {
         const uint8_t colour[4] = {200, 100, 50, 25};
@@ -680,6 +698,14 @@ int main() {
         Rig::Heap own_heap = r.ViewHeap(4);
         void* own_tex = r.Texture(which & 1);
         r.TextureView(own_heap, 1, own_tex);
+        // Slow draws first, not waited for: the list under test is queued behind them.
+        {
+            void* busy = r.NewList();
+            r.Begin(busy, nullptr, root);
+            r.Pipeline(busy, busy_pso);
+            for (int i = 0; i < 24; ++i) r.DrawIn(busy, kWhole);
+            r.Submit(busy);
+        }
         void* list = r.NewList();
         r.Begin(list, &own_heap, own_root);
         r.Pipeline(list, own_pso);
@@ -687,10 +713,13 @@ int main() {
         r.Table(list, own_heap, 1);
         r.DrawIn(list, kWhole);
         const uint64_t value = r.End(list);
-        // The title's last reference, before the list has been waited for.
+        // The title's last reference, while the list has not run yet.
         void* released = which == 0 ? own_pso : which == 1 ? own_heap.proxy : which == 2 ? own_root : own_tex;
         const intptr_t left = Call(released, 2);
-        std::printf("%s %s: Release returned %lld\n", kTag, kNames[which], static_cast<long long>(left));
+        const bool in_flight = static_cast<uint64_t>(Call(r.fence, 8)) < value;
+        std::printf("%s %s: Release returned %lld, list still in flight afterwards: %s\n", kTag, kNames[which],
+                    static_cast<long long>(left), in_flight ? "yes" : "no");
+        r.Check(in_flight, "10 the release came while the list was in flight");
         if (!r.Wait(value)) {
             r.Check(false, kNames[which]);
             std::printf("%s %s: the submission did not complete; the remaining cases are not run\n", kTag, kNames[which]);

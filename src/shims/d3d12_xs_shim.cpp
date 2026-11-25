@@ -267,6 +267,7 @@ struct TranslatedGraphicsPipeline {
     ID3D12RootSignature* host_root = nullptr;  // owned
     scarlettx::VictoryComputeBinding vs;
     scarlettx::VictoryComputeBinding ps;
+    bool reads_views = false;  // a stage takes a view from a descriptor table
     ~TranslatedGraphicsPipeline() {
         if (host_root) host_root->Release();
     }
@@ -483,6 +484,54 @@ std::array<ComVtableFn, 24> BuildAdapterProxyVtable() {
 
 const auto kXboxDXGIAdapterProxyVtbl = BuildAdapterProxyVtable();
 
+#if defined(_WIN32)
+// What the title has put in each descriptor of its CBV/SRV/UAV heaps. A translated shader takes
+// its views from the heap by index, so nothing on the host checks that the descriptor a table
+// names is of the kind the shader reads; a draw through the wrong kind is dropped instead.
+struct GuestViewRecord {
+    uint8_t kind = 0;        // 0 nothing written, 1 constant buffer, 2 shader resource, 3 unordered access
+    uint8_t dimension = 0;   // D3D12_SRV_DIMENSION or D3D12_UAV_DIMENSION of the view
+};
+struct GuestViewHeap {
+    SIZE_T cpu_start = 0;
+    UINT count = 0;
+    UINT increment = 0;
+    std::vector<GuestViewRecord> views;
+};
+std::mutex g_view_heaps_mutex;
+std::map<SIZE_T, std::shared_ptr<GuestViewHeap>> g_view_heaps_by_cpu;                     // by cpu_start
+std::unordered_map<ID3D12DescriptorHeap*, std::shared_ptr<GuestViewHeap>> g_view_heaps;   // by host heap
+std::atomic<uint64_t> g_view_generation{1};  // bumped whenever a record changes
+
+// The record of the descriptor at `cpu`, or null when it is in no heap this shim made. Caller
+// holds g_view_heaps_mutex.
+GuestViewRecord* FindViewRecordLocked(SIZE_T cpu) {
+    auto it = g_view_heaps_by_cpu.upper_bound(cpu);
+    if (it == g_view_heaps_by_cpu.begin()) return nullptr;
+    --it;
+    GuestViewHeap& heap = *it->second;
+    if (heap.increment == 0) return nullptr;
+    const SIZE_T index = (cpu - heap.cpu_start) / heap.increment;
+    return index < heap.views.size() ? &heap.views[index] : nullptr;
+}
+void RecordGuestView(SIZE_T cpu, uint8_t kind, uint8_t dimension) {
+    std::lock_guard<std::mutex> lock(g_view_heaps_mutex);
+    if (GuestViewRecord* record = FindViewRecordLocked(cpu)) {
+        *record = GuestViewRecord{kind, dimension};
+        g_view_generation.fetch_add(1, std::memory_order_relaxed);
+    }
+}
+void CopyGuestViews(SIZE_T dst, SIZE_T src, UINT count, UINT increment) {
+    std::lock_guard<std::mutex> lock(g_view_heaps_mutex);
+    for (UINT i = 0; i < count; ++i) {
+        GuestViewRecord* to = FindViewRecordLocked(dst + static_cast<SIZE_T>(i) * increment);
+        const GuestViewRecord* from = FindViewRecordLocked(src + static_cast<SIZE_T>(i) * increment);
+        if (to) *to = from ? *from : GuestViewRecord{};
+    }
+    g_view_generation.fetch_add(1, std::memory_order_relaxed);
+}
+#endif
+
 struct XboxD3D12DescriptorHeapProxy {
     const ComVtableFn* lpVtbl;
     std::atomic<uint32_t> ref_count{1};
@@ -511,7 +560,17 @@ intptr_t SCARLETTX_GDK_CALLBACK DescHeapProxyRelease(void* self, uintptr_t, uint
     const uint32_t rem = obj->ref_count.fetch_sub(1, std::memory_order_acq_rel) - 1;
     if (rem == 0) {
 #if defined(_WIN32)
-        if (obj->pc_heap) obj->pc_heap->Release();
+        if (obj->pc_heap) {
+            {
+                std::lock_guard<std::mutex> lock(g_view_heaps_mutex);
+                const auto it = g_view_heaps.find(obj->pc_heap);
+                if (it != g_view_heaps.end()) {
+                    g_view_heaps_by_cpu.erase(it->second->cpu_start);
+                    g_view_heaps.erase(it);
+                }
+            }
+            obj->pc_heap->Release();
+        }
 #endif
         delete obj;
     }
@@ -1776,7 +1835,9 @@ struct XboxD3D12GraphicsCommandListProxy {
     std::shared_ptr<TranslatedGraphicsPipeline> host_bound;
     std::vector<uint32_t> bound_user_data[2];
     std::vector<uint32_t> scratch_user_data[2];
-    bool graphics_constants_changed = true;  // since bound_user_data was built
+    bool graphics_constants_changed = true;  // constants, tables or the view heap, since bound_user_data was built
+    std::shared_ptr<GuestViewHeap> view_heap_records;  // what the title put in `view_heap`
+    uint64_t views_checked_at = 0;           // g_view_generation when the bound views were last checked
 #endif
 };
 #if defined(_WIN32)
@@ -1794,6 +1855,7 @@ void ResetComputeShadow(XboxD3D12GraphicsCommandListProxy* obj) {
     obj->graphics_tables.clear();
     obj->host_bound.reset();
     obj->graphics_constants_changed = true;
+    obj->view_heap_records.reset();
 }
 
 // Puts the host root signature and both stages' user data on the list for a draw with a
@@ -1802,16 +1864,55 @@ void ResetComputeShadow(XboxD3D12GraphicsCommandListProxy* obj) {
 bool BindTranslatedGraphics(XboxD3D12GraphicsCommandListProxy* obj) {
     const TranslatedGraphicsPipeline& pipeline = *obj->graphics_translated;
     const bool same_root = obj->host_bound == obj->graphics_translated;
-    if (same_root && !obj->graphics_constants_changed) {
+    // A descriptor written since the views were last checked may be one this pipeline reads.
+    const uint64_t view_generation = pipeline.reads_views ? g_view_generation.load(std::memory_order_relaxed) : 0;
+    if (same_root && !obj->graphics_constants_changed && view_generation == obj->views_checked_at) {
         // The previous translated draw's bindings still stand: nothing to put on the list.
         g_draws_translated.fetch_add(1, std::memory_order_relaxed);
         return true;
     }
     const scarlettx::VictoryComputeBinding* stages[2] = {&pipeline.vs, &pipeline.ps};
     std::vector<uint32_t>* user_data = obj->scratch_user_data;
+    auto drop = [](const std::string& why, int stage) {
+        g_draws_skipped.fetch_add(1, std::memory_order_relaxed);
+        std::cerr << "[ScarlettX][d3d12_xs] translated draw dropped: " << why << " (" << (stage == 0 ? "vertex" : "pixel")
+                  << " stage)\n";
+        return false;
+    };
     for (int stage = 0; stage < 2; ++stage) {
         user_data[stage].assign(std::max<uint32_t>(stages[stage]->user_data_dwords, 1), 0);
         for (const auto& entry : stages[stage]->user_data) {
+            if (entry.root == 1) {
+                // A descriptor table: the shader takes the view from the heap by index, and its
+                // user data holds the byte offset of the table's first descriptor (32 a view).
+                const std::string table = "the descriptor table of root parameter " + std::to_string(entry.slot);
+                const auto table_it = obj->graphics_tables.find(entry.slot);
+                if (table_it == obj->graphics_tables.end()) return drop(table + " was not set", stage);
+                const UINT64 start = obj->view_heap_start;
+                const UINT increment = obj->view_heap_increment;
+                if (!obj->view_heap || table_it->second < start || increment == 0 ||
+                    (table_it->second - start) % increment != 0 ||
+                    (table_it->second - start) / increment >= obj->view_heap_count) {
+                    return drop(table + " does not point into the bound heap", stage);
+                }
+                const uint32_t index = static_cast<uint32_t>((table_it->second - start) / increment);
+                // The one view this route maps is a 2D texture read as a shader resource.
+                GuestViewRecord record;
+                if (obj->view_heap_records) {
+                    std::lock_guard<std::mutex> lock(g_view_heaps_mutex);
+                    if (index < obj->view_heap_records->views.size()) record = obj->view_heap_records->views[index];
+                }
+                if (record.kind != 2 || record.dimension != D3D12_SRV_DIMENSION_TEXTURE2D) {
+                    static const char* const kHolds[] = {"was never written", "holds a constant buffer view",
+                                                         "holds a shader resource view that is not of a 2D texture",
+                                                         "holds an unordered access view"};
+                    return drop(table + " names descriptor " + std::to_string(index) + " of the bound heap, which " +
+                                    kHolds[record.kind < 4 ? record.kind : 0] + "; the shader samples a 2D texture there",
+                                stage);
+                }
+                user_data[stage][entry.index] = index * 32u;
+                continue;
+            }
             const auto it = obj->graphics_constants.find(entry.slot);
             if (it == obj->graphics_constants.end() || entry.dword >= it->second.size()) {
                 g_draws_skipped.fetch_add(1, std::memory_order_relaxed);
@@ -1837,6 +1938,7 @@ bool BindTranslatedGraphics(XboxD3D12GraphicsCommandListProxy* obj) {
         g_user_data_sets.fetch_add(1, std::memory_order_relaxed);
     }
     obj->graphics_constants_changed = false;
+    obj->views_checked_at = view_generation;
     g_draws_translated.fetch_add(1, std::memory_order_relaxed);
     return true;
 }
@@ -2032,7 +2134,9 @@ intptr_t SCARLETTX_GDK_CALLBACK CmdListSetDescriptorHeaps(void* self, uintptr_t 
     std::vector<ID3D12DescriptorHeap*> pc_heaps;
     pc_heaps.reserve(num);
     obj->view_heap = nullptr;
+    obj->view_heap_records.reset();
     obj->compute_arguments_changed = true;  // a table's index is relative to the heap
+    obj->graphics_constants_changed = true;
     for (uintptr_t i = 0; i < num; ++i) {
         if (guest_heaps[i] && guest_heaps[i]->pc_heap) {
             pc_heaps.push_back(guest_heaps[i]->pc_heap);
@@ -2043,6 +2147,9 @@ intptr_t SCARLETTX_GDK_CALLBACK CmdListSetDescriptorHeaps(void* self, uintptr_t 
                 obj->view_heap_count = heap_desc.NumDescriptors;
                 obj->view_heap_increment = obj->pc_device
                     ? obj->pc_device->GetDescriptorHandleIncrementSize(D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV) : 0;
+                std::lock_guard<std::mutex> lock(g_view_heaps_mutex);
+                const auto found = g_view_heaps.find(obj->view_heap);
+                if (found != g_view_heaps.end()) obj->view_heap_records = found->second;
             }
         }
     }
@@ -2576,6 +2683,7 @@ intptr_t SCARLETTX_GDK_CALLBACK CmdListSetGraphicsRootDescriptorTable(
     if (obj->pc_list) {
         D3D12_GPU_DESCRIPTOR_HANDLE h{static_cast<UINT64>(baseDesc)};
         obj->graphics_tables[static_cast<uint32_t>(rootParamIdx)] = h.ptr;
+        obj->graphics_constants_changed = true;  // a translated shader's user data holds the table's index
         // With a translated draw's root signature on the host list the table waits in the
         // shadow; EnsureTitleGraphics sets it.
         if (!obj->host_bound) obj->pc_list->SetGraphicsRootDescriptorTable(static_cast<UINT>(rootParamIdx), h);
@@ -3998,6 +4106,16 @@ intptr_t SCARLETTX_GDK_CALLBACK ProxyCreateDescriptorHeap(
     proxy->lpVtbl = kXboxD3D12DescriptorHeapProxyVtbl.data();
     proxy->pc_heap = pc_heap;
     proxy->orig_desc = *guest_desc;
+    if (pc_desc.Type == D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV) {
+        auto record = std::make_shared<GuestViewHeap>();
+        record->cpu_start = pc_heap->GetCPUDescriptorHandleForHeapStart().ptr;
+        record->count = pc_desc.NumDescriptors;
+        record->increment = obj->pc_device->GetDescriptorHandleIncrementSize(D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV);
+        record->views.resize(pc_desc.NumDescriptors);
+        std::lock_guard<std::mutex> lock(g_view_heaps_mutex);
+        g_view_heaps_by_cpu[record->cpu_start] = record;
+        g_view_heaps[pc_heap] = record;
+    }
     *out = proxy;
     return 0;  // S_OK
 #else
@@ -4170,9 +4288,34 @@ intptr_t SCARLETTX_GDK_CALLBACK ProxyCreateGraphicsPipelineState(
             params[i].Constants.Num32BitValues = counts[i];
             params[i].ShaderVisibility = visibility[i];
         }
+        // Immediate samplers become static samplers: s<n>, space 0, for the stage that has them.
+        std::vector<D3D12_STATIC_SAMPLER_DESC> static_samplers;
+        const scarlettx::VictoryComputeBinding* stage_bindings[2] = {&vs_binding, &ps_binding};
+        for (int i = 0; i < 2; ++i) {
+            for (size_t n = 0; n < stage_bindings[i]->static_samplers.size(); ++n) {
+                const scarlettx::VictoryStaticSampler& from = stage_bindings[i]->static_samplers[n];
+                D3D12_STATIC_SAMPLER_DESC to{};
+                to.Filter = static_cast<D3D12_FILTER>(from.filter);
+                to.AddressU = static_cast<D3D12_TEXTURE_ADDRESS_MODE>(from.address[0]);
+                to.AddressV = static_cast<D3D12_TEXTURE_ADDRESS_MODE>(from.address[1]);
+                to.AddressW = static_cast<D3D12_TEXTURE_ADDRESS_MODE>(from.address[2]);
+                to.MipLODBias = from.mip_lod_bias;
+                to.MaxAnisotropy = from.max_anisotropy;
+                to.ComparisonFunc = static_cast<D3D12_COMPARISON_FUNC>(from.comparison);
+                to.BorderColor = static_cast<D3D12_STATIC_BORDER_COLOR>(from.border);
+                to.MinLOD = from.min_lod;
+                to.MaxLOD = from.max_lod;
+                to.ShaderRegister = static_cast<UINT>(n);
+                to.RegisterSpace = 0;
+                to.ShaderVisibility = visibility[i];
+                static_samplers.push_back(to);
+            }
+        }
         D3D12_ROOT_SIGNATURE_DESC rs_desc{};
         rs_desc.NumParameters = 2;
         rs_desc.pParameters = params;
+        rs_desc.NumStaticSamplers = static_cast<UINT>(static_samplers.size());
+        rs_desc.pStaticSamplers = static_samplers.empty() ? nullptr : static_samplers.data();
         rs_desc.Flags = static_cast<D3D12_ROOT_SIGNATURE_FLAGS>(
             D3D12_ROOT_SIGNATURE_FLAG_ALLOW_INPUT_ASSEMBLER_INPUT_LAYOUT |
             D3D12_ROOT_SIGNATURE_FLAG_CBV_SRV_UAV_HEAP_DIRECTLY_INDEXED |
@@ -4191,6 +4334,7 @@ intptr_t SCARLETTX_GDK_CALLBACK ProxyCreateGraphicsPipelineState(
         if (FAILED(rs_hr)) return reject(rs_hr, "the host root signature for the translated shaders failed");
         translated_pipeline->vs = vs_binding;
         translated_pipeline->ps = ps_binding;
+        translated_pipeline->reads_views = !vs_binding.views.empty() || !ps_binding.views.empty();
         desc.pRootSignature = translated_pipeline->host_root;
         desc.VS = {vs_dxil.data(), vs_dxil.size()};
         desc.PS = {ps_dxil.data(), ps_dxil.size()};
@@ -4235,7 +4379,9 @@ intptr_t SCARLETTX_GDK_CALLBACK ProxyCreateGraphicsPipelineState(
         g_graphics_translated.fetch_add(1, std::memory_order_relaxed);
         std::cerr << "[ScarlettX][d3d12_xs] CreateGraphicsPipelineState: native shaders translated, vertex "
                   << vs_dxil.size() << " bytes with " << vs_binding.user_data_dwords << " user-data dwords, pixel "
-                  << ps_dxil.size() << " bytes with " << ps_binding.user_data_dwords << " user-data dwords\n";
+                  << ps_dxil.size() << " bytes with " << ps_binding.user_data_dwords << " user-data dwords, "
+                  << ps_binding.views.size() + vs_binding.views.size() << " table views, "
+                  << ps_binding.static_samplers.size() + vs_binding.static_samplers.size() << " static samplers\n";
     } else {
         g_graphics_passed_through.fetch_add(1, std::memory_order_relaxed);
     }
@@ -4465,6 +4611,7 @@ intptr_t SCARLETTX_GDK_CALLBACK ProxyCreateConstantBufferView(
         }
         D3D12_CPU_DESCRIPTOR_HANDLE h{destDesc};
         obj->pc_device->CreateConstantBufferView(d, h);
+        RecordGuestView(h.ptr, 1, 0);
     }
 #endif
     return 0;
@@ -4497,6 +4644,16 @@ intptr_t SCARLETTX_GDK_CALLBACK ProxyCreateShaderResourceView(
         }
         D3D12_CPU_DESCRIPTOR_HANDLE h{destDesc};
         obj->pc_device->CreateShaderResourceView(pc_res, d, h);
+        // Without a description the view is the resource's own shape.
+        uint8_t dimension = d ? static_cast<uint8_t>(d->ViewDimension) : 0;
+        if (!d && pc_res) {
+            const D3D12_RESOURCE_DESC rd = pc_res->GetDesc();
+            dimension = rd.Dimension == D3D12_RESOURCE_DIMENSION_BUFFER ? D3D12_SRV_DIMENSION_BUFFER
+                        : rd.Dimension == D3D12_RESOURCE_DIMENSION_TEXTURE1D ? D3D12_SRV_DIMENSION_TEXTURE1D
+                        : rd.Dimension == D3D12_RESOURCE_DIMENSION_TEXTURE3D ? D3D12_SRV_DIMENSION_TEXTURE3D
+                        : rd.DepthOrArraySize > 1 ? D3D12_SRV_DIMENSION_TEXTURE2DARRAY : D3D12_SRV_DIMENSION_TEXTURE2D;
+        }
+        RecordGuestView(h.ptr, 2, dimension);
     }
 #endif
     return 0;
@@ -4512,6 +4669,8 @@ intptr_t SCARLETTX_GDK_CALLBACK ProxyCreateUnorderedAccessView(
         D3D12_CPU_DESCRIPTOR_HANDLE h{destDesc};
         obj->pc_device->CreateUnorderedAccessView(
             pc_res, pc_cnt, reinterpret_cast<const D3D12_UNORDERED_ACCESS_VIEW_DESC*>(pDesc), h);
+        const auto* uav = reinterpret_cast<const D3D12_UNORDERED_ACCESS_VIEW_DESC*>(pDesc);
+        RecordGuestView(h.ptr, 3, uav ? static_cast<uint8_t>(uav->ViewDimension) : 0);
     }
 #endif
     return 0;
@@ -4596,6 +4755,26 @@ intptr_t SCARLETTX_GDK_CALLBACK ProxyCopyDescriptors(
             reinterpret_cast<const D3D12_CPU_DESCRIPTOR_HANDLE*>(pSrcStarts),
             reinterpret_cast<const UINT*>(pSrcSizes),
             pc_type);
+        if (pc_type == D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV) {
+            // The records follow the descriptors, range by range (a null size list means ones).
+            const auto* dst_starts = reinterpret_cast<const D3D12_CPU_DESCRIPTOR_HANDLE*>(pDstStarts);
+            const auto* dst_sizes = reinterpret_cast<const UINT*>(pDstSizes);
+            const auto* src_starts = reinterpret_cast<const D3D12_CPU_DESCRIPTOR_HANDLE*>(pSrcStarts);
+            const auto* src_sizes = reinterpret_cast<const UINT*>(pSrcSizes);
+            const UINT increment = obj->pc_device->GetDescriptorHandleIncrementSize(pc_type);
+            UINT src_range = 0, src_at = 0;
+            for (UINT d = 0; d < numDstRanges && dst_starts && src_starts; ++d) {
+                const UINT dst_count = dst_sizes ? dst_sizes[d] : 1;
+                for (UINT i = 0; i < dst_count && src_range < numSrcRanges; ++i) {
+                    CopyGuestViews(dst_starts[d].ptr + static_cast<SIZE_T>(i) * increment,
+                                   src_starts[src_range].ptr + static_cast<SIZE_T>(src_at) * increment, 1, increment);
+                    if (++src_at >= (src_sizes ? src_sizes[src_range] : 1)) {
+                        ++src_range;
+                        src_at = 0;
+                    }
+                }
+            }
+        }
     }
 #endif
     return 0;
@@ -4619,6 +4798,9 @@ intptr_t SCARLETTX_GDK_CALLBACK ProxyCopyDescriptorsSimple(
                       << ", type=" << static_cast<uint32_t>(pc_type) << ")\n";
         }
         obj->pc_device->CopyDescriptorsSimple(static_cast<UINT>(numDescs), dst, src, pc_type);
+        if (pc_type == D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV) {
+            CopyGuestViews(dst.ptr, src.ptr, static_cast<UINT>(numDescs), obj->pc_device->GetDescriptorHandleIncrementSize(pc_type));
+        }
     }
 #endif
     return 0;

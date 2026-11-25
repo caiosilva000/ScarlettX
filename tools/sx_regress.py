@@ -537,6 +537,34 @@ def check_victory_wave(stdout: str) -> dict:
     return info
 
 
+def check_victory_draw_table(stdout: str) -> dict:
+    """The descriptor-table draw test: frames exact, dropped draws, objects released in flight."""
+    total = re.search(r"\[victory-draw-table\] pixels exact (\d+)/(\d+) over (\d+) frames", stdout)
+    fences = [(int(s_), int(c), int(w)) for s_, c, w in
+              re.findall(r"\[victory-draw-table\] fence signaled=(\d+) completed=(\d+) wait_result=(\d+)", stdout)]
+    in_flight = re.findall(r"\[victory-draw-table\] (10\w) .*?: Release returned \d+, list still in flight afterwards: (\w+)",
+                           stdout)
+    info = {
+        "shader_path": ("synthetic console-shaped vertex and pixel containers -> d3d12_xs CreateGraphicsPipelineState "
+                        "(device object) -> victory-shader bridge -> DXIL -> shim command list draws on the shim's queue"),
+        "pixels_exact": int(total.group(1)) if total else 0,
+        "pixels_total": int(total.group(2)) if total else 0,
+        "frames": int(total.group(3)) if total else 0,
+        "checks_ok": len(re.findall(r"\[victory-draw-table\] ok: ", stdout)),
+        "checks_failed": len(re.findall(r"\[victory-draw-table\] CHECK FAILED", stdout)),
+        "released_in_flight": {name: answer == "yes" for name, answer in in_flight},
+        "fences": len(fences),
+        "fences_completed": sum(1 for s_, c, w in fences if c >= s_ >= 1 and w == 0),
+        "final_line": (re.search(r"\[victory-draw-table\] (PASS|FAIL) \(\d+ failed\)", stdout) or [None])[0],
+    }
+    info["requirements_met"] = bool(
+        total and info["frames"] == 11 and info["pixels_exact"] == info["pixels_total"] == 11 * 4096
+        and info["checks_failed"] == 0 and len(in_flight) == 4 and all(info["released_in_flight"].values())
+        and info["fences"] >= 11 and info["fences_completed"] == info["fences"]
+        and info["final_line"] == "[victory-draw-table] PASS (0 failed)")
+    return info
+
+
 def check_victory_quad(stdout: str) -> dict:
     """The quad-read test at triangle edges: coverage, and where translated and desktop differ."""
     cov = re.search(r"\[victory-quad\] coverage: cpu=(\d+) desktop=(\d+) \(differs at (\d+)\) translated=(\d+) "
@@ -809,6 +837,15 @@ def cmd_regress(args) -> int:
                 verdicts = ", ".join(f"{n} {c.get('verdict')}" for n, c in probe["cases"].items())
                 note = (f"{verdicts}; adapter waves {probe['wave_lanes_min']}..{probe['wave_lanes_max']}"
                         + (f"; SKIPPED: {', '.join(probe['skipped'])}" if probe["skipped"] else ""))
+        if name == "test_victory_draw_table":
+            probe = check_victory_draw_table(r["stdout"])
+            details["victory_draw_table"] = probe
+            if status == PASS and not probe["requirements_met"]:
+                status, note = FAIL, "exit 0 but a descriptor-table draw requirement was not met"
+            elif status == PASS:
+                note = (f"{probe['pixels_exact']}/{probe['pixels_total']} pixels exact over {probe['frames']} frames, fences "
+                        f"{probe['fences_completed']}/{probe['fences']}, {probe['checks_ok']} checks, "
+                        f"{sum(probe['released_in_flight'].values())} objects released in flight")
         if name == "test_victory_quad_edge":
             probe = check_victory_quad(r["stdout"])
             details["victory_quad"] = probe
