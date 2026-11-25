@@ -61,6 +61,9 @@ constexpr TestGuid kGuidE349BD1A = {
 // Interface ids a later GDK asks the XGameSave and XSystem APIs for.
 constexpr TestGuid kGuid704C3F58Later = {
     0x704C3F58u, 0xE629u, 0x4CC2u, {0xB1, 0x97, 0x30, 0x51, 0x1B, 0x99, 0x6E, 0xE2}};
+// The XGameSave interface id a title built against the October 2026 GDK asks for.
+constexpr TestGuid kGuid1BFFF3AF = {
+    0x1BFFF3AFu, 0xF14Au, 0x40A3u, {0x8E, 0x35, 0x9A, 0xDA, 0x90, 0x65, 0x93, 0xF9}};
 constexpr TestGuid kGuid67CE4BFC = {
     0x67CE4BFCu, 0xB1D1u, 0x4AC7u, {0xBC, 0x3A, 0xCB, 0x92, 0x19, 0xA9, 0x7A, 0x85}};
 // XGameRuntimeIsFeatureAvailable.
@@ -405,6 +408,22 @@ int main() {
         CHECK(LoadVtableSlot<FnInit>(save, 0x18)(save, user, "00000000-0000-0000-0000-000072a634a4", false,
                                                  &provider) == XGR_S_OK);
         CHECK(provider != nullptr);
+
+        // The 2610 interface id is answered, and its InitializeProvider slot is the same one.
+        {
+            void* save_2610 = nullptr;
+            CHECK(QueryApiImpl(&kGuid704C3F58, &kGuid1BFFF3AF, &save_2610) == XGR_S_OK);
+            CHECK(save_2610 != nullptr);
+            void* provider_2610 = nullptr;
+            CHECK(LoadVtableSlot<FnInit>(save_2610, 0x18)(save_2610, user, "00000000-0000-0000-0000-000072a634a4",
+                                                          false, &provider_2610) == XGR_S_OK);
+            CHECK(provider_2610 != nullptr);
+            XGameSaveCloseProvider(static_cast<XGameSaveProviderHandle>(provider_2610));
+            LoadVtableSlot<FnRelease>(save_2610, 0x10)(save_2610);
+            void* refused = reinterpret_cast<void*>(uintptr_t{1});
+            CHECK(QueryApiImpl(&kGuid704C3F58, &kGuidUnsupported, &refused) == kENoInterface);
+            CHECK(refused == nullptr);
+        }
         void* container = nullptr;
         CHECK(LoadVtableSlot<FnCreate>(save, 0x80)(save, provider, "slot_a", &container) == XGR_S_OK);
         void* update = nullptr;

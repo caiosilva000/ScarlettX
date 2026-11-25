@@ -45,6 +45,12 @@ constexpr Guid kIidGameLater = {0x2549F142u, 0x6419u, 0x4A06u, {0x97, 0xB5, 0x93
 constexpr Guid kIidUserLater = {0x079415E3u, 0x6727u, 0x437Fu, {0x8E, 0x9D, 0x8F, 0x8F, 0x9B, 0x24, 0x39, 0xF7}};
 // For these the console object answers both ids with one table.
 constexpr Guid kIidGameSaveLater = {0x704C3F58u, 0xE629u, 0x4CC2u, {0xB1, 0x97, 0x30, 0x51, 0x1B, 0x99, 0x6E, 0xE2}};
+// Asked for by a title built against the October 2026 GDK (2610). Its first
+// calls land on the same slots with the same arguments as the main table
+// (4 InitializeProviderAsync, 5 InitializeProviderResult, 15
+// EnumerateContainerInfoByName), so it is answered with that table. Slots the
+// sample used to check this are the only ones verified.
+constexpr Guid kIidGameSave2610 = {0x1BFFF3AFu, 0xF14Au, 0x40A3u, {0x8E, 0x35, 0x9A, 0xDA, 0x90, 0x65, 0x93, 0xF9}};
 constexpr Guid kIidSystemLater = {0x67CE4BFCu, 0xB1D1u, 0x4AC7u, {0xBC, 0x3A, 0xCB, 0x92, 0x19, 0xA9, 0x7A, 0x85}};
 // XGameRuntimeIsFeatureAvailable.
 constexpr Guid kApiFeature = {0x8836FE87u, 0xEDB9u, 0x4FE3u, {0x8D, 0xAD, 0x05, 0xF0, 0xD2, 0xCD, 0x5B, 0x40}};
@@ -731,7 +737,9 @@ const Slot* FindVtbl(const void* api_id, const void* riid, Guid* iid) {
     std::memcpy(iid, main ? api_id : riid, sizeof(Guid));
     if (Equal(api_id, kApiGame)) return main || Equal(riid, kIidGameLater) ? kGameVtbl : nullptr;
     if (Equal(api_id, kApiSystem)) return main || Equal(riid, kIidSystemLater) ? kSystemVtbl : nullptr;
-    if (Equal(api_id, kApiGameSave)) return main || Equal(riid, kIidGameSaveLater) ? kGameSaveVtbl.data() : nullptr;
+    if (Equal(api_id, kApiGameSave)) {
+        return main || Equal(riid, kIidGameSaveLater) || Equal(riid, kIidGameSave2610) ? kGameSaveVtbl.data() : nullptr;
+    }
     if (Equal(api_id, kApiUser)) {
         if (main || Equal(riid, kIidUserLater)) return kUserVtbl.data();
         return Equal(riid, kIidUserGamertag) ? kUserGamertagVtbl : nullptr;
