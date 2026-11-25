@@ -18,6 +18,13 @@ __declspec(dllimport) uint64_t XTelemetryRecord(uint64_t a, uint64_t b, uint64_t
 __declspec(dllimport) uint64_t PkgLocalCombine(uint64_t a, uint64_t b);
 }
 
+// kernel32, declared here to keep this probe free of <windows.h>.
+extern "C" {
+__declspec(dllimport) void* __stdcall CreateFileA(const char* name, unsigned long access, unsigned long share, void* security,
+                                                  unsigned long disposition, unsigned long flags, void* template_file);
+__declspec(dllimport) int __stdcall CloseHandle(void* handle);
+}
+
 namespace {
 
 // Static pointer to static data forces a DIR64 base relocation in .reloc.
@@ -89,6 +96,17 @@ __declspec(dllexport) int ScarlettGuestMain() {
     if (ProbeRelocatedGlobal() != kRelocMagicValue) {
         XGameRuntimeUninitialize();
         return 12;
+    }
+    // A title's relative paths start at its package root, as on the console: the manifest that
+    // every package has at its root must open by its bare name.
+    {
+        void* const manifest = CreateFileA("MicrosoftGame.Config", 0x80000000ul /* GENERIC_READ */, 1 /* FILE_SHARE_READ */,
+                                           nullptr, 3 /* OPEN_EXISTING */, 0, nullptr);
+        if (manifest == reinterpret_cast<void*>(static_cast<intptr_t>(-1))) {
+            XGameRuntimeUninitialize();
+            return 14;
+        }
+        CloseHandle(manifest);
     }
     const uint64_t stub1 = ProbeMissingNamedStub();
     const uint64_t stub2 = ProbeMissingOrdinalStub();
