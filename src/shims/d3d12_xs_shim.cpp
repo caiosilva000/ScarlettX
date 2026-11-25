@@ -237,6 +237,11 @@ std::atomic<uint64_t> g_host_root_binds{0};
 std::atomic<uint64_t> g_user_data_sets{0};
 std::atomic<uint64_t> g_title_root_restores{0};
 std::atomic<uint64_t> g_title_arguments_replayed{0};
+// The same four for translated compute dispatches.
+std::atomic<uint64_t> g_compute_host_root_binds{0};
+std::atomic<uint64_t> g_compute_user_data_sets{0};
+std::atomic<uint64_t> g_compute_title_root_restores{0};
+std::atomic<uint64_t> g_compute_title_arguments_replayed{0};
 
 #if defined(_WIN32)
 // A compute pipeline made from translated native code. The translated shader does not use the
@@ -1607,6 +1612,15 @@ void FlushGuestTextureWrites(ID3D12CommandQueue* queue) {
     }
 }
 #endif
+#if defined(_WIN32)
+// A title may release a resource while command lists that use it are still in flight; the
+// console keeps going, and this host stops completing the queue's fences. So the host resource
+// is not released with the title's last reference: every live queue is signalled, and the
+// resource goes when those signals have completed, which is when everything submitted before
+// the release has run. (Defined after the queue object, further down.)
+void RetireHostResource(ID3D12Resource* resource);
+void DrainRetiredHostResources();
+#endif
 intptr_t SCARLETTX_GDK_CALLBACK ResProxyQueryInterface(void* self, uintptr_t, uintptr_t ppv, uintptr_t) {
     auto* obj = static_cast<XboxD3D12ResourceProxy*>(self);
     auto** out = reinterpret_cast<void**>(ppv);
@@ -1625,7 +1639,7 @@ intptr_t SCARLETTX_GDK_CALLBACK ResProxyRelease(void* self, uintptr_t, uintptr_t
     if (rem == 0) {
 #if defined(_WIN32)
         ReleaseGuestTextureMemory(obj);
-        if (obj->pc_res) obj->pc_res->Release();
+        if (obj->pc_res) RetireHostResource(obj->pc_res);
 #endif
         if (obj->device) (*static_cast<const ComVtableFn* const*>(obj->device))[2](obj->device, 0, 0, 0);
         delete obj;
@@ -1877,18 +1891,25 @@ void DispatchTranslatedCompute(XboxD3D12GraphicsCommandListProxy* obj, UINT x, U
     obj->pc_list->SetComputeRoot32BitConstants(0, static_cast<UINT>(user_data.size()), user_data.data(), 0);
     obj->pc_list->Dispatch(x, y, z);
     g_dispatches_translated.fetch_add(1, std::memory_order_relaxed);
+    g_compute_host_root_binds.fetch_add(1, std::memory_order_relaxed);
+    g_compute_user_data_sets.fetch_add(1, std::memory_order_relaxed);
 
     // The title's root signature and arguments, for whatever it runs next with another pipeline.
     if (obj->title_compute_root) {
         obj->pc_list->SetComputeRootSignature(obj->title_compute_root);
+        uint64_t replayed = 0;
         for (const auto& [slot, values] : obj->compute_constants) {
             if (!values.empty()) {
                 obj->pc_list->SetComputeRoot32BitConstants(slot, static_cast<UINT>(values.size()), values.data(), 0);
+                ++replayed;
             }
         }
         for (const auto& [slot, handle] : obj->compute_tables) {
             obj->pc_list->SetComputeRootDescriptorTable(slot, D3D12_GPU_DESCRIPTOR_HANDLE{handle});
+            ++replayed;
         }
+        g_compute_title_root_restores.fetch_add(1, std::memory_order_relaxed);
+        g_compute_title_arguments_replayed.fetch_add(replayed, std::memory_order_relaxed);
     }
 }
 #endif
@@ -2878,11 +2899,65 @@ struct XboxD3D12CommandQueueProxy {
     UINT swap_h = 0;
     DXGI_FORMAT swap_fmt = DXGI_FORMAT_R8G8B8A8_UNORM;
     bool present_init_attempted = false;
+    ID3D12Fence* retire_fence = nullptr;  // see RetireHostResource
+    uint64_t retire_value = 0;
 #endif
 };
 
 #if defined(_WIN32)
 void StopPresentWindow(XboxD3D12CommandQueueProxy* obj);
+#endif
+
+#if defined(_WIN32)
+struct RetiredHostResource {
+    ID3D12Resource* resource = nullptr;
+    std::vector<std::pair<ID3D12Fence*, uint64_t>> waits;  // one per queue alive at the release; fences referenced
+};
+std::mutex g_retire_mutex;
+std::vector<XboxD3D12CommandQueueProxy*> g_live_queues;  // under g_retire_mutex
+std::vector<RetiredHostResource> g_retired;              // under g_retire_mutex
+std::atomic<size_t> g_retired_count{0};
+
+void DrainRetiredLocked() {
+    for (size_t i = 0; i < g_retired.size();) {
+        RetiredHostResource& r = g_retired[i];
+        bool done = true;
+        for (const auto& [fence, value] : r.waits) done = done && fence->GetCompletedValue() >= value;
+        if (!done) {
+            ++i;
+            continue;
+        }
+        r.resource->Release();
+        for (const auto& [fence, value] : r.waits) fence->Release();
+        g_retired[i] = std::move(g_retired.back());
+        g_retired.pop_back();
+    }
+    g_retired_count.store(g_retired.size(), std::memory_order_relaxed);
+}
+
+void DrainRetiredHostResources() {
+    if (g_retired_count.load(std::memory_order_relaxed) == 0) return;
+    std::lock_guard<std::mutex> lock(g_retire_mutex);
+    DrainRetiredLocked();
+}
+
+void RetireHostResource(ID3D12Resource* resource) {
+    std::lock_guard<std::mutex> lock(g_retire_mutex);
+    RetiredHostResource retired;
+    retired.resource = resource;
+    for (XboxD3D12CommandQueueProxy* q : g_live_queues) {
+        if (!q->retire_fence &&
+            FAILED(q->pc_device->CreateFence(0, D3D12_FENCE_FLAG_NONE, IID_PPV_ARGS(&q->retire_fence)))) {
+            continue;
+        }
+        if (FAILED(q->pc_queue->Signal(q->retire_fence, q->retire_value + 1))) continue;
+        ++q->retire_value;
+        q->retire_fence->AddRef();
+        retired.waits.emplace_back(q->retire_fence, q->retire_value);
+    }
+    g_retired.push_back(std::move(retired));
+    DrainRetiredLocked();  // with no queue, or an idle one, it goes at once
+}
 #endif
 
 intptr_t SCARLETTX_GDK_CALLBACK QueueProxyQueryInterface(void* self, uintptr_t riid, uintptr_t ppv, uintptr_t) {
@@ -2916,6 +2991,18 @@ intptr_t SCARLETTX_GDK_CALLBACK QueueProxyRelease(void* self, uintptr_t, uintptr
         if (obj->swapchain) obj->swapchain->Release();
         StopPresentWindow(obj);
         if (obj->pc_queue) ReleaseGuestUploadPool(obj->pc_queue);
+        {
+            // Let what this queue still has in flight finish, then drop what was waiting on it.
+            std::lock_guard<std::mutex> lock(g_retire_mutex);
+            g_live_queues.erase(std::remove(g_live_queues.begin(), g_live_queues.end(), obj), g_live_queues.end());
+            if (obj->retire_fence) {
+                if (obj->retire_fence->GetCompletedValue() < obj->retire_value) {
+                    obj->retire_fence->SetEventOnCompletion(obj->retire_value, nullptr);
+                }
+                DrainRetiredLocked();
+                obj->retire_fence->Release();
+            }
+        }
         if (obj->pc_device) obj->pc_device->Release();
         if (obj->pc_queue) obj->pc_queue->Release();
 #endif
@@ -2990,6 +3077,7 @@ intptr_t SCARLETTX_GDK_CALLBACK QueueProxyExecuteCommandLists(
             g_flushed_epoch.store(epoch, std::memory_order_relaxed);
         }
         WaitForGuestUploadsOnOtherQueues(obj->pc_queue);
+        DrainRetiredHostResources();
         obj->pc_queue->ExecuteCommandLists(static_cast<UINT>(pc_lists.size()), pc_lists.data());
     }
 #endif
@@ -3762,6 +3850,10 @@ intptr_t SCARLETTX_GDK_CALLBACK ProxyCreateCommandQueue(void* self, uintptr_t pD
     q_proxy->pc_queue = pc_q;
     q_proxy->pc_device = obj->pc_device;
     if (q_proxy->pc_device) q_proxy->pc_device->AddRef();
+    {
+        std::lock_guard<std::mutex> lock(g_retire_mutex);
+        g_live_queues.push_back(q_proxy);
+    }
     *out = q_proxy;
     return 0;
 #else
@@ -5363,6 +5455,15 @@ int32_t D3D12XboxGetTranslatedDrawBindStats(D3D12XBOX_TRANSLATED_DRAW_BIND_STATS
     out_stats->user_data_sets = g_user_data_sets.load(std::memory_order_relaxed);
     out_stats->title_root_restores = g_title_root_restores.load(std::memory_order_relaxed);
     out_stats->title_arguments_replayed = g_title_arguments_replayed.load(std::memory_order_relaxed);
+    return 0;
+}
+
+int32_t D3D12XboxGetTranslatedDispatchBindStats(D3D12XBOX_TRANSLATED_DRAW_BIND_STATS* out_stats) {
+    if (!out_stats) return -1;
+    out_stats->host_root_binds = g_compute_host_root_binds.load(std::memory_order_relaxed);
+    out_stats->user_data_sets = g_compute_user_data_sets.load(std::memory_order_relaxed);
+    out_stats->title_root_restores = g_compute_title_root_restores.load(std::memory_order_relaxed);
+    out_stats->title_arguments_replayed = g_compute_title_arguments_replayed.load(std::memory_order_relaxed);
     return 0;
 }
 

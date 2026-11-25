@@ -54,7 +54,7 @@ KEY_METRICS = ["completed_fps", "serialized_frames_per_second", "serialized_subm
                "upload_bytes_per_frame", "present_call_interval_ms_median", "present_call_interval_ms_p95",
                "present_call_interval_ms_p99", "present_call_ms_median", "presented_fps",
                "constant_sets_per_frame", "translated_draws_per_frame", "host_root_binds_per_frame",
-               "user_data_sets_per_frame", "title_root_restores_per_frame", "title_arguments_replayed_per_frame",
+               "user_data_sets_per_frame", "title_root_restores_per_frame", "title_arguments_replayed_per_frame", "dispatches_per_frame",
                "frame_interval_ms_p95", "fence_wait_ms_p95", "cpu_prep_ms_p99", "submit_ms_p99"]
 
 
@@ -508,6 +508,9 @@ def main() -> int:
         run.launch(build, "discard", cell("pixel", "heavy", frames=60))
         run.launch(build, "discard", cell("upload", "batched-reuse", frames=60))
         run.launch(build, "discard", cell("draws", "pertable", draws=1000, frames=60))
+        if any(c.startswith("tdispatch") for c in args.ab_cells):
+            for v in ("same", "changing-table", "changing-constants"):
+                run.launch(build, "discard", cell("tdispatch", v, draws=1000, frames=60))
         if "tdraws" in args.modes or any(c.startswith("tdraws") for c in args.ab_cells):
             for v in args.tdraw_variants:
                 run.launch(build, "discard", cell("tdraws", v, draws=1000, frames=60))
@@ -573,10 +576,12 @@ def main() -> int:
         cells = []
         for spec in args.ab_cells:
             mode, variant, *rest = spec.split(":")
-            kw = {"draws": 4000} if mode in ("draws", "tdraws") else (size(args.resolutions[-1]) if mode == "pixel" else {})
+            kw = {"draws": 4000} if mode in ("draws", "tdraws", "tdispatch") else (size(args.resolutions[-1]) if mode == "pixel" else {})
             for extra in rest:
                 if extra.startswith("draws="):
                     kw["draws"] = int(extra.split("=")[1])
+                if extra.startswith("descriptors="):
+                    kw["descriptors"] = int(extra.split("=")[1])
                 if extra.startswith("idle="):  # guest-memory textures that are never written again
                     kw["idle-guest-textures"] = int(extra.split("=")[1])
             if "windowed" in rest:

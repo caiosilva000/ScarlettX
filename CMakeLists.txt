@@ -480,6 +480,11 @@ if(SCARLETTX_VICTORY_SHADER_BRIDGE)
     target_link_libraries(test_victory_draw_guest PRIVATE d3d12_xs)
     # A translated pipeline's bindings from one draw to the next: reused, changed, and given
     # back to the title's root signature when a desktop pipeline draws.
+    # Directly indexed descriptors: a slot given another buffer's view, a buffer released while a
+    # dispatch into it is in flight, and table and constant changes inside one list.
+    scarlettx_add_test(test_victory_compute_remap tests/test_victory_compute_remap.cpp)
+    target_link_libraries(test_victory_compute_remap PRIVATE d3d12_xs)
+    set_tests_properties(test_victory_compute_remap PROPERTIES ENVIRONMENT "SCARLETTX_REAL_TITLE=1")
     scarlettx_add_test(test_victory_draw_reuse tests/test_victory_draw_reuse.cpp)
     target_link_libraries(test_victory_draw_reuse PRIVATE d3d12_xs)
     set_tests_properties(test_victory_draw_reuse PROPERTIES ENVIRONMENT "SCARLETTX_REAL_TITLE=1")

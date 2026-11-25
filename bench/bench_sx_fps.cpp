@@ -24,6 +24,15 @@
 //                     --variant translated-changing  root constants set before every draw
 //                     --variant desktop-same, desktop-changing   the HLSL pipeline, same draws
 //                   Reports the host root-signature binds and argument replays the shim made.
+//   --mode tdispatch  directly indexed descriptors: --draws dispatches per frame of a translated
+//                   native compute program that writes 64 dwords through the raw UAV its
+//                   descriptor table names; the translated shader takes the view from the
+//                   descriptor heap by index, which the shim works out from the table at every
+//                   dispatch. --descriptors UAVs sit in the heap.
+//                     --variant same                table and constants set once per frame
+//                     --variant changing-table      a different descriptor before every dispatch
+//                     --variant changing-constants  the root constants before every dispatch
+//                   Every buffer is read back after the last frame and compared with the CPU.
 //   --mode pixel    pixel shading: a fixed scene (floor + 24 beacons) at --width x --height.
 //                     --variant light      one integer hash per pixel
 //                     --variant heavy      the same hash followed by --rounds xorshift rounds
@@ -98,7 +107,9 @@ constexpr int kDevCreateCommandList = 12;
 constexpr int kDevCreateDescriptorHeap = 14;
 constexpr int kDevGetDescriptorHandleIncrementSize = 15;
 constexpr int kDevCreateRootSignature = 16;
+constexpr int kDevCreateComputePipelineState = 11;
 constexpr int kDevCreateShaderResourceView = 18;
+constexpr int kDevCreateUnorderedAccessView = 19;
 constexpr int kDevCreateRenderTargetView = 20;
 constexpr int kDevCreateCommittedResource = 27;
 constexpr int kDevCreateFence = 36;
@@ -117,6 +128,8 @@ constexpr int kListClose = 9;
 constexpr int kListReset = 10;
 constexpr int kListDrawInstanced = 12;
 constexpr int kListDrawIndexedInstanced = 13;
+constexpr int kListDispatch = 14;
+constexpr int kListCopyBufferRegion = 15;
 constexpr int kListCopyTextureRegion = 16;
 constexpr int kListIASetPrimitiveTopology = 20;
 constexpr int kListRSSetViewports = 21;
@@ -124,7 +137,10 @@ constexpr int kListRSSetScissorRects = 22;
 constexpr int kListSetPipelineState = 25;
 constexpr int kListResourceBarrier = 26;
 constexpr int kListSetDescriptorHeaps = 32;
+constexpr int kListSetComputeRootSignature = 33;
 constexpr int kListSetGraphicsRootSignature = 34;
+constexpr int kListSetComputeRootDescriptorTable = 35;
+constexpr int kListSetComputeRoot32BitConstants = 39;
 constexpr int kListSetGraphicsRootDescriptorTable = 36;
 constexpr int kListSetGraphicsRoot32BitConstants = 40;
 constexpr int kListIASetIndexBuffer = 47;
@@ -175,6 +191,8 @@ constexpr uint32_t kBeacons = 24;              // pixel mode: quads on top of th
 constexpr uint32_t kPayloads = 8;              // upload mode: texel payloads in rotation
 constexpr uint32_t kStamps = 16;               // upload mode: texels per texture unique to a frame
 constexpr uint32_t kMarkerBits = 16;
+constexpr uint32_t kDispatchDwords = 64;       // tdispatch: dwords a dispatch writes (two groups of 32)
+constexpr uint32_t kDispatchLiteral = 0x5A17C0DEu;  // tdispatch: the kernel's literal k
 
 uint32_t Hash3(uint32_t a, uint32_t b, uint32_t c) {
     uint32_t h = (a * 0x9E3779B1u) ^ (b * 0x85EBCA77u) ^ (c * 0xC2B2AE3Du);
@@ -231,6 +249,16 @@ uint32_t MarkerColor(uint32_t frame, uint32_t k) {
     if (k == kMarkerBits) return (frame & 1u) ? 0xFFFF00FFu : 0xFFFFFF00u;
     return k == kMarkerBits + 1 ? 0xFF0000FFu : 0xFF00FF00u;
 }
+
+// tdispatch: the kernel's arithmetic for the CPU, and the constants a dispatch runs with.
+uint32_t DispatchKernel(uint32_t i, uint32_t c0, uint32_t c1) {
+    uint32_t x = i + c0;
+    x ^= x << 13;
+    x ^= x >> 17;
+    x ^= x << 5;
+    return (x + c1) ^ kDispatchLiteral;
+}
+uint32_t DispatchC0(bool per_dispatch, uint32_t j, uint32_t frame) { return 0x1000u + frame * 7919u + (per_dispatch ? j * 31u : 0u); }
 
 // The pixel shaders' arithmetic, written again for the CPU.
 uint32_t MixPixel(uint32_t x, uint32_t y, uint32_t frame, uint32_t draw_id, uint32_t seed) {
@@ -339,6 +367,7 @@ struct Args {
     uint32_t height = 720;
     uint32_t draws = 4000;
     uint32_t textures = 16;
+    uint32_t descriptors = 64;
     uint32_t rounds = 1024;
     uint32_t upload_count = 16;
     uint32_t upload_size = 256;
@@ -402,6 +431,12 @@ struct Bench {
     void* troot = nullptr;           // tdraws: the title's root signature (four root constants)
     void* pso_t_desktop = nullptr;   // tdraws: HLSL pipeline
     void* pso_t_translated = nullptr;  // tdraws: translated native pipeline (null without the bridge)
+    void* croot = nullptr;             // tdispatch: the title's compute root (four constants, a table of one UAV)
+    void* pso_compute = nullptr;       // tdispatch: translated native compute pipeline
+    std::vector<void*> ubuf;           // tdispatch: one buffer per descriptor
+    std::vector<uint32_t> ubuf_c0;     // the c0 of the last dispatch recorded into each
+    std::vector<uint8_t> ubuf_written;
+    uint32_t c1 = 0;
     void* vb = nullptr;
     void* ib = nullptr;
     D3D12_VERTEX_BUFFER_VIEW vbv{};
@@ -428,6 +463,8 @@ struct Bench {
 
     bool Upload() const { return a.mode == "upload"; }
     bool TDraws() const { return a.mode == "tdraws"; }
+    bool TDispatch() const { return a.mode == "tdispatch"; }
+    uint32_t MarkerSrvSlot() const { return TDispatch() ? a.descriptors : 0; }
     bool TChanging() const { return a.variant.find("changing") != std::string::npos; }
     bool PerCopy() const { return a.variant == "percopy" || a.variant == "reuse"; }
     bool Reuse() const { return a.variant == "reuse" || a.variant == "batched-reuse"; }
@@ -703,6 +740,41 @@ struct Bench {
             }
             Call(list, kListRSSetScissorRects, uintptr_t{1}, P(&scissor), uintptr_t{0});
         }
+        if (TDispatch()) {
+            // The title's compute root and the translated pipeline, then per dispatch: the table
+            // (once per frame, or a different descriptor every time), the constants (once, or
+            // every time), two groups of 32.
+            const bool per_table = a.variant == "changing-table";
+            const bool per_constants = a.variant == "changing-constants";
+            Call(list, kListSetComputeRootSignature, P(croot), uintptr_t{0}, uintptr_t{0});
+            Call(list, kListSetPipelineState, P(pso_compute), uintptr_t{0}, uintptr_t{0});
+            auto set_constants = [&](uint32_t j) {
+                const uint32_t constants[4] = {DispatchC0(per_constants, j, frame), c1, 0, 0};
+                Call(list, kListSetComputeRoot32BitConstants, uintptr_t{0}, uintptr_t{4}, P(constants), uintptr_t{0});
+                ++s.constant_sets;
+                return constants[0];
+            };
+            uint32_t c0 = set_constants(0);
+            uint32_t slot_index = 0;
+            Call(list, kListSetComputeRootDescriptorTable, uintptr_t{1}, SrvGpu(0), uintptr_t{0});
+            ++s.table_binds;
+            for (uint32_t j = 0; j < a.draws; ++j) {
+                if (per_table) {
+                    slot_index = j % a.descriptors;
+                    Call(list, kListSetComputeRootDescriptorTable, uintptr_t{1}, SrvGpu(slot_index), uintptr_t{0});
+                    ++s.table_binds;
+                }
+                if (per_constants && j) c0 = set_constants(j);
+                Call(list, kListDispatch, static_cast<uintptr_t>(kDispatchDwords / 32), uintptr_t{1}, uintptr_t{1});
+                // A UAV barrier: the next dispatch that writes the same buffer comes after this one.
+                D3D12_RESOURCE_BARRIER uav{};
+                uav.Type = D3D12_RESOURCE_BARRIER_TYPE_UAV;
+                Call(list, kListResourceBarrier, uintptr_t{1}, P(&uav), uintptr_t{0});
+                ubuf_c0[slot_index] = c0;
+                ubuf_written[slot_index] = 1;
+                ++s.draws;
+            }
+        }
         Call(list, kListSetGraphicsRootSignature, P(root), uintptr_t{0}, uintptr_t{0});
         Call(list, kListIASetVertexBuffers, uintptr_t{0}, uintptr_t{1}, P(&vbv));
         Call(list, kListIASetIndexBuffer, P(&ibv), uintptr_t{0}, uintptr_t{0});
@@ -738,8 +810,8 @@ struct Bench {
                 DrawQuad(list);
                 ++s.draws;
             }
-        } else if (TDraws()) {
-            // drawn above, with the title's own root signature
+        } else if (TDraws() || TDispatch()) {
+            // done above: tdraws with the title's own root signature, tdispatch on the compute side
         } else if (a.mode == "pixel") {
             static std::vector<Rect> scene;
             PixelScene(rt_w, rt_h, a.seed, frame, scene);
@@ -773,7 +845,9 @@ struct Bench {
             }
         }
         if (a.markers) {
-            if (TDraws()) Call(list, kListSetGraphicsRootDescriptorTable, uintptr_t{1}, SrvGpu(0), uintptr_t{0});
+            if (TDraws() || TDispatch()) {
+                Call(list, kListSetGraphicsRootDescriptorTable, uintptr_t{1}, SrvGpu(MarkerSrvSlot()), uintptr_t{0});
+            }
             Call(list, kListSetPipelineState, P(pso_solid), uintptr_t{0}, uintptr_t{0});
             for (uint32_t k = 0; k < MarkerCount(); ++k) {
                 const Rect r = MarkerRect(rt_w, rt_h, k);
@@ -829,7 +903,9 @@ struct Bench {
     // ---- the CPU's picture of a frame --------------------------------------------------------
     void Expected(uint32_t frame, bool probe, std::vector<uint32_t>& img) const {
         img.assign(static_cast<size_t>(rt_w) * rt_h, kClearDword);
-        if (a.mode == "draws") {
+        if (TDispatch()) {
+            // nothing is drawn: the target keeps its clear colour, the buffers are checked apart
+        } else if (a.mode == "draws") {
             const uint32_t cols = rt_w / kCell;
             const uint32_t cells = cols * (rt_h / kCell);
             const uint32_t shift = ((frame % cells) * 37u) % cells;
@@ -974,6 +1050,7 @@ bool ParseArgs(int argc, char** argv, Args& a) {
         else if (k == "--height") a.height = u();
         else if (k == "--draws") a.draws = u();
         else if (k == "--textures") a.textures = u();
+        else if (k == "--descriptors") a.descriptors = u();
         else if (k == "--rounds") a.rounds = u();
         else if (k == "--upload-count") a.upload_count = u();
         else if (k == "--upload-size") a.upload_size = u();
@@ -985,6 +1062,7 @@ bool ParseArgs(int argc, char** argv, Args& a) {
     const bool mode_ok =
         (a.mode == "draws" && (a.variant == "fixed" || a.variant == "pertable")) ||
         (a.mode == "pixel" && (a.variant == "light" || a.variant == "heavy")) ||
+        (a.mode == "tdispatch" && (a.variant == "same" || a.variant == "changing-table" || a.variant == "changing-constants")) ||
         (a.mode == "tdraws" && (a.variant == "translated-same" || a.variant == "translated-changing" ||
                                 a.variant == "desktop-same" || a.variant == "desktop-changing")) ||
         (a.mode == "upload" && (a.variant == "percopy" || a.variant == "batched" || a.variant == "reuse" ||
@@ -993,7 +1071,7 @@ bool ParseArgs(int argc, char** argv, Args& a) {
     const bool source_ok = a.shader_source == "desktop" || a.shader_source == "translated";
     return mode_ok && path_ok && source_ok && a.frames > 0 && a.inflight > 0 && a.inflight <= 16 && a.width >= 64 &&
            a.height >= 64 && a.width % 32 == 0 && a.textures > 0 && a.textures <= 64 && a.upload_count > 0 &&
-           a.upload_count <= 64 && a.upload_size >= 32 && a.rounds <= 4096;
+           a.upload_count <= 64 && a.upload_size >= 32 && a.rounds <= 4096 && a.descriptors > 0 && a.descriptors <= 65536;
 }
 
 }  // namespace
@@ -1003,7 +1081,7 @@ int main(int argc, char** argv) {
     Args& a = b.a;
     if (!ParseArgs(argc, argv, a)) {
         std::fprintf(stderr,
-                     "usage: bench_sx_fps --mode draws|tdraws|pixel|upload --variant <see the top of bench_sx_fps.cpp>\n"
+                     "usage: bench_sx_fps --mode draws|tdraws|tdispatch|pixel|upload --variant <see the top of bench_sx_fps.cpp>\n"
                      "  [--path offscreen|serialized|windowed] [--shader-source desktop|translated]\n"
                      "  [--frames N] [--warmup N] [--inflight N] [--check-frames N] [--seed N]\n"
                      "  [--width N --height N] [--draws N] [--textures N] [--rounds N]\n"
@@ -1097,7 +1175,9 @@ int main(int argc, char** argv) {
         return 64;
     }
 
-    const uint32_t srv_count = a.mode == "draws" ? a.textures * 2 : (a.mode == "upload" ? a.upload_count : 1);
+    const uint32_t srv_count = a.mode == "draws" ? a.textures * 2
+                               : a.mode == "upload" ? a.upload_count
+                               : a.mode == "tdispatch" ? a.descriptors + 1 : 1;
     D3D12_DESCRIPTOR_HEAP_DESC heap_desc{};
     heap_desc.Type = D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV;
     heap_desc.NumDescriptors = srv_count;
@@ -1247,6 +1327,66 @@ int main(int argc, char** argv) {
         }
     }
 
+    // ---- tdispatch: the compute root, the translated pipeline, a buffer and a UAV per descriptor
+    double compute_pso_ms = 0;
+    if (a.mode == "tdispatch") {
+        D3D12_DESCRIPTOR_RANGE urange{};
+        urange.RangeType = D3D12_DESCRIPTOR_RANGE_TYPE_UAV;
+        urange.NumDescriptors = 1;
+        D3D12_ROOT_PARAMETER cparams[2]{};
+        cparams[0].ParameterType = D3D12_ROOT_PARAMETER_TYPE_32BIT_CONSTANTS;
+        cparams[0].Constants.Num32BitValues = 4;
+        cparams[1].ParameterType = D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE;
+        cparams[1].DescriptorTable.NumDescriptorRanges = 1;
+        cparams[1].DescriptorTable.pDescriptorRanges = &urange;
+        D3D12_ROOT_SIGNATURE_DESC crs{};
+        crs.NumParameters = 2;
+        crs.pParameters = cparams;
+        ID3DBlob* crs_blob = nullptr;
+        if (FAILED(D3D12SerializeRootSignature(&crs, D3D_ROOT_SIGNATURE_VERSION_1, &crs_blob, &rs_err))) {
+            return Fail("D3D12SerializeRootSignature(tdispatch)", E_FAIL);
+        }
+        hr = Call(b.dev, kDevCreateRootSignature, uintptr_t{0}, P(crs_blob->GetBufferPointer()),
+                  static_cast<uintptr_t>(crs_blob->GetBufferSize()), uintptr_t{0}, P(&b.croot));
+        if (hr != 0 || !b.croot) return Fail("shim CreateRootSignature, tdispatch (slot 16)", hr);
+        std::vector<uint8_t> kernel;
+        if (!scarlettx::BuildVictoryVectorKernelContainer(kDispatchLiteral, kernel).ok()) {
+            std::printf("[fps] tdispatch NOT AVAILABLE: this build has no victory-shader bridge\n");
+            return 5;
+        }
+        D3D12_COMPUTE_PIPELINE_STATE_DESC cd{};
+        cd.pRootSignature = static_cast<ID3D12RootSignature*>(b.croot);
+        cd.CS = {kernel.data(), kernel.size()};
+        const int64_t t0 = Ticks();
+        hr = Call(b.dev, kDevCreateComputePipelineState, P(&cd), uintptr_t{0}, P(&b.pso_compute));
+        compute_pso_ms = Us(t0, Ticks()) / 1000.0;
+        if (hr != 0 || !b.pso_compute) return Fail("shim CreateComputePipelineState, translated (slot 11)", hr);
+        D3D12XBOX_SHADER_TRANSLATION_STATS cs{};
+        D3D12XboxGetShaderTranslationStats(&cs);
+        if (cs.compute_translated != 1) return Fail("the shim did not translate the native compute program", E_FAIL);
+        b.c1 = 0xABCD0000u ^ a.seed;
+        b.ubuf_c0.assign(a.descriptors, 0);
+        b.ubuf_written.assign(a.descriptors, 0);
+        D3D12_RESOURCE_DESC ud{};
+        ud.Dimension = D3D12_RESOURCE_DIMENSION_BUFFER;
+        ud.Width = kDispatchDwords * 4;
+        ud.Height = 1;
+        ud.DepthOrArraySize = 1;
+        ud.MipLevels = 1;
+        ud.SampleDesc.Count = 1;
+        ud.Layout = D3D12_TEXTURE_LAYOUT_ROW_MAJOR;
+        ud.Flags = D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS;
+        D3D12_UNORDERED_ACCESS_VIEW_DESC view{};
+        view.Format = DXGI_FORMAT_R32_TYPELESS;
+        view.ViewDimension = D3D12_UAV_DIMENSION_BUFFER;
+        view.Buffer.NumElements = kDispatchDwords;
+        view.Buffer.Flags = D3D12_BUFFER_UAV_FLAG_RAW;
+        for (uint32_t i = 0; i < a.descriptors; ++i) {
+            b.ubuf.push_back(b.CreateResource(D3D12_HEAP_TYPE_DEFAULT, ud, D3D12_RESOURCE_STATE_UNORDERED_ACCESS));
+            Call(b.dev, kDevCreateUnorderedAccessView, P(b.ubuf.back()), uintptr_t{0}, P(&view), b.SrvCpu(i));
+        }
+    }
+
     // ---- geometry: one unit quad -------------------------------------------------------------
     const float corners[8] = {0, 0, 1, 0, 0, 1, 1, 1};
     const uint16_t indices[6] = {0, 1, 2, 2, 1, 3};
@@ -1295,7 +1435,7 @@ int main(int argc, char** argv) {
     srv.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE2D;
     srv.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
     srv.Texture2D.MipLevels = 1;
-    if (a.mode == "draws" || a.mode == "pixel" || a.mode == "tdraws") {
+    if (a.mode == "draws" || a.mode == "pixel" || a.mode == "tdraws" || a.mode == "tdispatch") {
         // 16x16 textures filled once: `textures` with equal contents, then as many with contents
         // of their own for the binding probe. Pixel mode binds one and does not sample it.
         const uint32_t count = a.mode == "draws" ? a.textures * 2 : 1;
@@ -1315,7 +1455,7 @@ int main(int argc, char** argv) {
             }
             void* tex = b.CreateTexture(kTexSize, kTexSize, false);
             (probe ? b.tex_probe : b.tex_equal).push_back(tex);
-            Call(b.dev, kDevCreateShaderResourceView, P(tex), P(&srv), b.SrvCpu(i));
+            Call(b.dev, kDevCreateShaderResourceView, P(tex), P(&srv), b.SrvCpu(b.MarkerSrvSlot() + i));
             b.Barrier(b.plumb_list, tex, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE, D3D12_RESOURCE_STATE_COPY_DEST);
             D3D12_TEXTURE_COPY_LOCATION dst{};
             dst.pResource = static_cast<ID3D12Resource*>(tex);
@@ -1476,6 +1616,10 @@ int main(int argc, char** argv) {
     std::vector<FrameSample> samples(a.frames);
     const uint64_t fence_before = b.fence_value;
     const uint64_t waits_before = b.fence_waits;
+    D3D12XBOX_TRANSLATED_DRAW_BIND_STATS cbind0{}, cbind1{};
+    D3D12XBOX_SHADER_TRANSLATION_STATS cst0{}, cst1{};
+    D3D12XboxGetTranslatedDispatchBindStats(&cbind0);
+    D3D12XboxGetShaderTranslationStats(&cst0);
     D3D12XBOX_TRANSLATED_DRAW_BIND_STATS bind0{}, bind1{};
     D3D12XBOX_GRAPHICS_TRANSLATION_STATS gfx0{}, gfx1{};
     D3D12XboxGetTranslatedDrawBindStats(&bind0);
@@ -1491,6 +1635,8 @@ int main(int argc, char** argv) {
     const int64_t loop_end = Ticks();
     D3D12XboxGetTranslatedDrawBindStats(&bind1);
     D3D12XboxGetGraphicsTranslationStats(&gfx1);
+    D3D12XboxGetTranslatedDispatchBindStats(&cbind1);
+    D3D12XboxGetShaderTranslationStats(&cst1);
     const uint64_t fence_after = b.fence_value;
     const uint64_t completed_after = b.Completed();
     const uint64_t loop_waits = b.fence_waits - waits_before;
@@ -1535,6 +1681,38 @@ int main(int argc, char** argv) {
         exact += b.Compare(b.slots[i].readback, b.slots[i].last_frame, false, "timed-loop tail");
         checked += pixels;
     }
+    // 4. tdispatch: every buffer, after the last frame, against the kernel computed on the CPU.
+    uint64_t dwords_checked = 0, dwords_exact = 0;
+    if (a.mode == "tdispatch") {
+        const uint64_t each = kDispatchDwords * 4;
+        void* all = b.CreateBuffer(D3D12_HEAP_TYPE_READBACK, each * a.descriptors);
+        b.PlumbBegin();
+        for (uint32_t i = 0; i < a.descriptors; ++i) {
+            b.Barrier(b.plumb_list, b.ubuf[i], D3D12_RESOURCE_STATE_UNORDERED_ACCESS, D3D12_RESOURCE_STATE_COPY_SOURCE);
+            Call(b.plumb_list, kListCopyBufferRegion, P(all), static_cast<uintptr_t>(each * i), P(b.ubuf[i]), uintptr_t{0},
+                 static_cast<uintptr_t>(each));
+            b.Barrier(b.plumb_list, b.ubuf[i], D3D12_RESOURCE_STATE_COPY_SOURCE, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
+        }
+        b.PlumbRun();
+        const uint8_t* data = b.Map(all);
+        uint32_t buffers_written = 0;
+        for (uint32_t i = 0; i < a.descriptors; ++i) {
+            buffers_written += b.ubuf_written[i];
+            for (uint32_t d = 0; d < kDispatchDwords; ++d) {
+                uint32_t got;
+                std::memcpy(&got, data + each * i + d * 4, 4);
+                const uint32_t want = b.ubuf_written[i] ? DispatchKernel(d, b.ubuf_c0[i], b.c1) : 0u;
+                ++dwords_checked;
+                dwords_exact += got == want;
+            }
+        }
+        b.Unmap(all);
+        std::printf("[fps] check buffers: dwords exact %llu/%llu over %u buffers (%u written by a dispatch, the rest must be zero)\n",
+                    static_cast<unsigned long long>(dwords_exact), static_cast<unsigned long long>(dwords_checked),
+                    a.descriptors, buffers_written);
+        checked += dwords_checked;
+        exact += dwords_exact;
+    }
     const uint64_t final_signaled = b.fence_value;
     const uint64_t final_completed = b.Completed();
     const uint32_t removed = static_cast<uint32_t>(Call(b.dev, kDevGetDeviceRemovedReason));
@@ -1546,7 +1724,8 @@ int main(int argc, char** argv) {
 
     // ---- results -----------------------------------------------------------------------------
     FILE* csv = a.csv.empty() ? nullptr : std::fopen(a.csv.c_str(), "a");
-    std::string param = a.mode == "draws" || a.mode == "tdraws" ? "draws=" + std::to_string(a.draws)
+    std::string param = a.mode == "tdispatch" ? "dispatches=" + std::to_string(a.draws) + ";descriptors=" + std::to_string(a.descriptors)
+                        : a.mode == "draws" || a.mode == "tdraws" ? "draws=" + std::to_string(a.draws)
                         : a.mode == "pixel" ? std::to_string(b.rt_w) + "x" + std::to_string(b.rt_h)
                                             : std::to_string(a.upload_count) + "x" + std::to_string(a.upload_size);
     if (a.idle_guest_textures) param += ";idle=" + std::to_string(a.idle_guest_textures);
@@ -1611,6 +1790,23 @@ int main(int argc, char** argv) {
     metric("submit_ms_total", submit_total / 1000.0);
     metric("draws_per_frame", static_cast<double>(draws) / n);
     metric("table_binds_per_frame", static_cast<double>(binds) / n);
+    if (a.mode == "tdispatch") {
+        uint64_t csets = 0;
+        for (const FrameSample& fs : samples) csets += fs.constant_sets;
+        metric("dispatches_per_frame", static_cast<double>(draws) / n);
+        metric("constant_sets_per_frame", static_cast<double>(csets) / n);
+        metric("translated_dispatches_per_frame", static_cast<double>(cst1.dispatches_translated - cst0.dispatches_translated) / n);
+        metric("translated_dispatches_skipped", static_cast<double>(cst1.dispatches_skipped - cst0.dispatches_skipped));
+        metric("host_root_binds_per_frame", static_cast<double>(cbind1.host_root_binds - cbind0.host_root_binds) / n);
+        metric("user_data_sets_per_frame", static_cast<double>(cbind1.user_data_sets - cbind0.user_data_sets) / n);
+        metric("title_root_restores_per_frame", static_cast<double>(cbind1.title_root_restores - cbind0.title_root_restores) / n);
+        metric("title_arguments_replayed_per_frame",
+               static_cast<double>(cbind1.title_arguments_replayed - cbind0.title_arguments_replayed) / n);
+        metric("descriptors", a.descriptors);
+        metric("checked_dwords", static_cast<double>(dwords_checked));
+        metric("exact_dwords", static_cast<double>(dwords_exact));
+        metric("translated_pso_create_ms", compute_pso_ms);
+    }
     if (a.mode == "tdraws") {
         uint64_t csets = 0;
         for (const FrameSample& fs : samples) csets += fs.constant_sets;

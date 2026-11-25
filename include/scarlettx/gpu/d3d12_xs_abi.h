@@ -293,6 +293,8 @@ struct D3D12XBOX_TRANSLATED_DRAW_BIND_STATS {
     uint64_t title_arguments_replayed;  // the title's root constants and tables set again after it
 };
 SCARLETTX_D3D12_API int32_t D3D12XboxGetTranslatedDrawBindStats(D3D12XBOX_TRANSLATED_DRAW_BIND_STATS* out_stats);
+// The same counts for translated compute dispatches (the compute root signature and arguments).
+SCARLETTX_D3D12_API int32_t D3D12XboxGetTranslatedDispatchBindStats(D3D12XBOX_TRANSLATED_DRAW_BIND_STATS* out_stats);
 SCARLETTX_D3D12_API int32_t D3D12XboxQueryCapabilities(
     uint64_t device_handle,
     D3D12XBOX_CAPABILITIES* out_caps);
