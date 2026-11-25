@@ -24,11 +24,17 @@ jobs:
           - name: present-frames-msvc
             ref: ""
             cmake_args: ""
+          # The dispatched ref with the GPL victory-shader bridge (needs the submodule and Rust).
+          - name: bridge-msvc
+            ref: ""
+            cmake_args: "-DSCARLETTX_VICTORY_SHADER_BRIDGE=ON"
+            submodules: true
     name: ${{ matrix.name }}
     steps:
       - uses: actions/checkout@v4
         with:
           ref: ${{ matrix.ref }}
+          submodules: ${{ matrix.submodules || false }}
 
       - uses: ilammy/msvc-dev-cmd@v1
         with:
@@ -48,6 +54,8 @@ jobs:
           $lines += "clang-cl=$((cmd /c 'clang-cl --version 2>&1' | Select-Object -First 1))"
           $lines += "lld-link=$((cmd /c 'lld-link --version 2>&1' | Select-Object -First 1))"
           $lines += "cmake=$((cmake --version | Select-Object -First 1)) ninja=$(ninja --version)"
+          $lines += "rustc=$((cmd /c 'rustc --version 2>&1' | Select-Object -First 1)) cargo=$((cmd /c 'cargo --version 2>&1' | Select-Object -First 1))"
+          $lines += "victory=$((cmd /c 'git -C third_party/victory rev-parse HEAD 2>&1' | Select-Object -First 1))"
           foreach ($d in 'ucrtbase.dll','vcruntime140.dll','vcruntime140_1.dll','msvcp140.dll','ntdll.dll','d3d12.dll') {
             $f = Join-Path $env:SystemRoot "System32\$d"
             if (Test-Path $f) { $lines += "crt:$d=$((Get-Item $f).VersionInfo.FileVersion)" } else { $lines += "crt:$d=missing" }
