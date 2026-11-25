@@ -19,7 +19,17 @@
 //
 // A draw samples the texture texel for pixel into a band of eight rows of a 64x64 target.
 //
-// Exit codes: 0 pass, 1 a band showed the wrong texels, 2 a call failed, 3 no device.
+// How busy "busy" is, is measured, not assumed: one slow draw into a small area is timed, and the
+// area and the number of draws are chosen so that a busy block lasts about 100 ms on the adapter
+// at hand. A software rasterizer then gets a small area instead of minutes of work, and each part
+// still reports whether its submission was in flight when it mattered (required).
+//
+// Every submission, signal and wait prints a flushed stage line with both queues' signaled and
+// completed fence values, so a run that stops says where, and whether a fence was still moving.
+// A wait that does not complete in 120 s ends the test with exit code 5 and those values.
+//
+// Exit codes: 0 pass, 1 a band showed the wrong texels or a part was not in flight, 2 a call
+// failed, 3 no device, 5 a wait did not complete.
 #include "scarlettx/gpu/d3d12_xs_abi.h"
 #include "scarlettx/gpu/xg_layout.h"
 #include "sx_check.h"
@@ -29,6 +39,8 @@
 #include <d3d12.h>
 #include <d3dcompiler.h>
 
+#include <algorithm>
+#include <cmath>
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
@@ -136,6 +148,28 @@ struct Rig {
     uint32_t srv_inc = 0;
     XG_RESOURCE_LAYOUT* layout = nullptr;
     int failures = 0;
+    uint32_t busy_size = 256;    // side of the area a busy draw shades (calibrated)
+    uint32_t busy_draws = 6;     // draws in a busy block (calibrated)
+    ULONGLONG start_ms = GetTickCount64();
+
+    uint64_t Completed(int q) { return static_cast<uint64_t>(Call(fence[q], kFenceGetCompletedValue)); }
+    // A flushed line saying where the test is and what both fences say.
+    void Mark(const char* stage) {
+        std::printf("[in-flight] t_ms=%llu stage=%s q0 signaled=%llu completed=%llu q1 signaled=%llu completed=%llu\n",
+                    static_cast<unsigned long long>(GetTickCount64() - start_ms), stage,
+                    static_cast<unsigned long long>(fence_value[0]), static_cast<unsigned long long>(Completed(0)),
+                    static_cast<unsigned long long>(fence_value[1]), static_cast<unsigned long long>(Completed(1)));
+        std::fflush(stdout);
+    }
+    // Whether queue `q` had not yet reached `value` when asked: the work behind it was in flight.
+    void RequireInFlight(const char* part, int q, uint64_t value) {
+        const uint64_t completed = Completed(q);
+        const bool yes = completed < value;
+        std::printf("[in-flight] %s: in flight when it mattered: %s (queue %d completed %llu, needed below %llu)\n", part,
+                    yes ? "yes" : "NO", q, static_cast<unsigned long long>(completed), static_cast<unsigned long long>(value));
+        std::fflush(stdout);
+        if (!yes) ++failures;
+    }
 
     void* CreateResource(D3D12_HEAP_TYPE heap, const D3D12_RESOURCE_DESC& desc, D3D12_RESOURCE_STATES state) {
         D3D12_HEAP_PROPERTIES hp = {};
@@ -185,33 +219,56 @@ struct Rig {
         return list;
     }
     // Submits without waiting; returns the fence value that marks it done.
-    uint64_t Submit(int q, void* list) {
+    uint64_t Submit(int q, void* list, const char* what = "list") {
         SX_REQUIRE(Call(list, kListClose) == 0);
         void* lists[] = {list};
+        char stage[96];
+        std::snprintf(stage, sizeof(stage), "submit:%s:q%d:before-execute", what, q);
+        Mark(stage);
         Call(queue[q], kQueueExecuteCommandLists, uintptr_t{1}, P(lists), uintptr_t{0});
         const uint64_t value = ++fence_value[q];
         SX_REQUIRE(Call(queue[q], kQueueSignal, P(fence[q]), static_cast<uintptr_t>(value), uintptr_t{0}) == 0);
+        std::snprintf(stage, sizeof(stage), "submit:%s:q%d:signaled", what, q);
+        Mark(stage);
         return value;
     }
     void Wait(int q, uint64_t value) {
-        if (static_cast<uint64_t>(Call(fence[q], kFenceGetCompletedValue)) < value) {
+        char stage[96];
+        std::snprintf(stage, sizeof(stage), "wait:q%d:for-%llu:begin", q, static_cast<unsigned long long>(value));
+        Mark(stage);
+        if (Completed(q) < value) {
             SX_REQUIRE(Call(fence[q], kFenceSetEventOnCompletion, static_cast<uintptr_t>(value), P(event), uintptr_t{0}) == 0);
-            SX_REQUIRE(WaitForSingleObject(event, 60000) == WAIT_OBJECT_0);
+            // In steps, so that a slow queue shows its fence moving and a stuck one shows it still.
+            for (int step = 0; step < 12 && Completed(q) < value; ++step) {
+                if (WaitForSingleObject(event, 10000) == WAIT_OBJECT_0) break;
+                std::snprintf(stage, sizeof(stage), "wait:q%d:for-%llu:still-waiting-%ds", q,
+                              static_cast<unsigned long long>(value), (step + 1) * 10);
+                Mark(stage);
+            }
+            if (Completed(q) < value) {
+                std::snprintf(stage, sizeof(stage), "wait:q%d:for-%llu:GAVE-UP", q, static_cast<unsigned long long>(value));
+                Mark(stage);
+                std::printf("test_d3d12_guest_texture_inflight: FAIL (a wait did not complete in 120 s)\n");
+                std::fflush(stdout);
+                TerminateProcess(GetCurrentProcess(), 5);
+            }
         }
+        std::snprintf(stage, sizeof(stage), "wait:q%d:for-%llu:done", q, static_cast<unsigned long long>(value));
+        Mark(stage);
     }
     // Keeps queue `q` busy: `draws` slow full-target draws, not waited for.
     uint64_t Busy(int q, uint32_t draws) {
         void* list = NewList();
         Call(list, kListSetPipelineState, P(pso_busy), uintptr_t{0}, uintptr_t{0});
         const D3D12_VIEWPORT vp{0.0f, 0.0f, static_cast<float>(kBusySize), static_cast<float>(kBusySize), 0.0f, 1.0f};
-        const D3D12_RECT scissor{0, 0, static_cast<LONG>(kBusySize), static_cast<LONG>(kBusySize)};
+        const D3D12_RECT scissor{0, 0, static_cast<LONG>(busy_size), static_cast<LONG>(busy_size)};
         Call(list, kListRSSetViewports, uintptr_t{1}, P(&vp), uintptr_t{0});
         Call(list, kListRSSetScissorRects, uintptr_t{1}, P(&scissor), uintptr_t{0});
         const D3D12_CPU_DESCRIPTOR_HANDLE handle{busy_rtv};
         Call(list, kListOMSetRenderTargets, uintptr_t{1}, P(&handle), uintptr_t{0}, uintptr_t{0});
         Call(list, kListSetGraphicsRootDescriptorTable, uintptr_t{0}, srv_gpu, uintptr_t{0});
         for (uint32_t i = 0; i < draws; ++i) Call(list, kListDrawInstanced, uintptr_t{3}, uintptr_t{1}, uintptr_t{0}, uintptr_t{0});
-        return Submit(q, list);
+        return Submit(q, list, "busy");
     }
     // Draws texture `slot` into band `band` of the target, on queue `q`, not waited for.
     uint64_t DrawBand(int q, uint32_t slot, uint32_t band) {
@@ -225,7 +282,7 @@ struct Rig {
         Call(list, kListOMSetRenderTargets, uintptr_t{1}, P(&handle), uintptr_t{0}, uintptr_t{0});
         Call(list, kListSetGraphicsRootDescriptorTable, uintptr_t{0}, srv_gpu + static_cast<uintptr_t>(slot) * srv_inc, uintptr_t{0});
         Call(list, kListDrawInstanced, uintptr_t{3}, uintptr_t{1}, uintptr_t{0}, uintptr_t{0});
-        return Submit(q, list);
+        return Submit(q, list, "band");
     }
     // Reads the target back (queue 0, waited for) and compares band by band.
     void ExpectBands(const char* part, const std::vector<std::vector<uint32_t>>& want) {
@@ -251,7 +308,7 @@ struct Rig {
         Call(list, kListCopyTextureRegion, P(&dst), uintptr_t{0}, uintptr_t{0}, uintptr_t{0}, P(&src), uintptr_t{0});
         std::swap(b.Transition.StateBefore, b.Transition.StateAfter);
         Call(list, kListResourceBarrier, uintptr_t{1}, P(&b), uintptr_t{0});
-        Wait(0, Submit(0, list));
+        Wait(0, Submit(0, list, "readback"));
         uint8_t* data = nullptr;
         SX_REQUIRE(Call(readback, kResMap, uintptr_t{0}, uintptr_t{0}, P(&data)) == 0 && data);
         for (uint32_t band = 0; band < want.size(); ++band) {
@@ -391,21 +448,38 @@ int main() {
     void* texture = r.GuestTexture(0, &memory);
     (void)texture;
     // Both pipelines drawn with once, and the texture written twice, before anything depends on timing.
+    r.Mark("setup:done");
     r.Write(memory, Pattern(1));
     r.Wait(0, r.Busy(0, 1));
     r.Write(memory, Pattern(2));
     r.Wait(0, r.DrawBand(0, 0, 0));
+    // How long a busy draw takes here: timed on a 256x256 area, then the area is scaled so that one
+    // draw is about 20 ms (64 to 2048 a side) and a block is as many draws as make about 100 ms.
+    {
+        const ULONGLONG t0 = GetTickCount64();
+        r.Wait(0, r.Busy(0, 2));
+        const double per_draw_ms = std::max(0.05, static_cast<double>(GetTickCount64() - t0) / 2.0);
+        const double scale = std::sqrt(20.0 / per_draw_ms);
+        r.busy_size = static_cast<uint32_t>(std::min(2048.0, std::max(64.0, 256.0 * scale)));
+        const double expected_ms = per_draw_ms * (static_cast<double>(r.busy_size) * r.busy_size) / (256.0 * 256.0);
+        r.busy_draws = static_cast<uint32_t>(std::min(6.0, std::max(1.0, std::ceil(100.0 / std::max(1.0, expected_ms)))));
+        std::printf("[in-flight] calibration: a busy draw over 256x256 took %.1f ms; busy area %ux%u (about %.0f ms a draw), "
+                    "%u draws a block\n", per_draw_ms, r.busy_size, r.busy_size, expected_ms, r.busy_draws);
+        std::fflush(stdout);
+    }
 
     // 1. Queue 0 is busy; a write, a submission to queue 0 (which takes the upload), then a draw
     //    on queue 1 at once. Three rounds, each into its own band.
     {
         std::vector<std::vector<uint32_t>> want;
         uint64_t last0 = 0, last1 = 0;
+        r.Mark("part1:begin");
         for (uint32_t round = 0; round < 3; ++round) {
-            r.Busy(0, 6);
+            const uint64_t block = r.Busy(0, r.busy_draws);
             want.push_back(Pattern(10 + round));
             r.Write(memory, want.back());
             last0 = r.Busy(0, 1);                 // the first submission after the write: the upload goes with it
+            r.RequireInFlight("1 second queue", 0, block);  // the upload is queued behind the busy block
             last1 = r.DrawBand(1, 0, round);      // another queue, straight away
             r.Wait(1, last1);                     // the next round's write must not race this draw
         }
@@ -416,12 +490,17 @@ int main() {
     // 2. Queue 0 busy, then six writes, each followed at once by a draw of it on queue 0.
     {
         std::vector<std::vector<uint32_t>> want;
-        r.Busy(0, 6);
+        r.Mark("part2:begin");
+        const uint64_t block = r.Busy(0, r.busy_draws);
         uint64_t last = 0;
         for (uint32_t i = 0; i < 6; ++i) {
             want.push_back(Pattern(20 + i));
             r.Write(memory, want.back());
             last = r.DrawBand(0, 0, i);
+            // After the fourth, every staging slot holds an upload queued behind the busy block.
+            // The fifth submission then has to wait for the oldest slot, which lets the block
+            // finish, so this can only be asked here.
+            if (i == 3) r.RequireInFlight("2 six in flight (four slots taken)", 0, block);
         }
         r.Wait(0, last);
         r.ExpectBands("2 six in flight", want);
@@ -432,16 +511,19 @@ int main() {
         uint8_t* memory2 = nullptr;
         void* second = r.GuestTexture(1, &memory2);
         const std::vector<uint32_t> p = Pattern(30);
-        r.Busy(0, 6);
+        r.Mark("part3:begin");
+        const uint64_t block = r.Busy(0, r.busy_draws);
         r.Write(memory2, p);
         const uint64_t last = r.DrawBand(0, 1, 0);
         SX_REQUIRE(Call(second, 2) == 0);  // Release: the title's last reference
+        r.RequireInFlight("3 released early", 0, block);  // released before its upload could run
         r.Wait(0, last);
         r.ExpectBands("3 released early", {p});
     }
 
     // 4. Forty textures. Every step is waited for; this part is about which textures get uploaded.
     {
+        r.Mark("part4:begin");
         constexpr uint32_t kCount = 40, kFirstSlot = 8;
         std::vector<void*> tex(kCount);
         std::vector<uint8_t*> mem(kCount);
@@ -489,7 +571,7 @@ int main() {
     }
 
     if (r.failures) {
-        std::printf("test_d3d12_guest_texture_inflight: FAIL (%d band(s) wrong)\n", r.failures);
+        std::printf("test_d3d12_guest_texture_inflight: FAIL (%d check(s) failed)\n", r.failures);
         return 1;
     }
     std::printf("test_d3d12_guest_texture_inflight: OK\n");
