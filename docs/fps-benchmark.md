@@ -33,6 +33,12 @@ create such a pipeline; the place for it is marked in `bench/bench_sx_fps.cpp`. 
 Each process logs the draws, descriptor-table changes, submissions, uploads and upload bytes it actually issued
 per frame.
 
+`guestmem` is the variant that exercises ScarlettX's own code most: the shim write-watches the texture's memory,
+converts it from the console layout and uploads it at submission. It is where this benchmark found its first
+optimization: a texture written in two submissions running is no longer re-armed page by page (see
+`FlushGuestTextureWrites` in `src/shims/d3d12_xs_shim.cpp`). The other four variants go through the command
+list's `CopyTextureRegion` and measure the host route with a thin shim on top.
+
 ## Paths
 
 - `offscreen`: uncapped throughput with `--inflight` (3) frames in flight. The loop waits only to recycle a slot
