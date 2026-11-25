@@ -192,12 +192,27 @@ Status Emulator::BootPackage(const std::string& package_dir) {
 
         int exit_code = 0;
         Status call_st = Status::Ok();
+        // A title's relative paths start at its package root, as on the console, whichever way
+        // it is entered. (A child process gets this from CreateProcess; in process the working
+        // directory is the emulator's until it is moved here.) Put back when the guest returns.
+        char previous_dir[MAX_PATH + 1] = {};
+        const DWORD previous_len = GetCurrentDirectoryA(sizeof(previous_dir), previous_dir);
+        const char* const title_dir = drive_mapped ? "G:\\" : abs_pkg_dir.c_str();
+        if (!SetCurrentDirectoryA(title_dir)) {
+            std::cerr << "[ScarlettX][loader] The working directory could not be moved to the package root " << title_dir
+                      << " (error " << GetLastError() << "); the title's relative paths will not resolve\n";
+        }
+        struct RestoreDirectory {
+            const char* dir;
+            bool valid;
+            ~RestoreDirectory() {
+                if (valid) SetCurrentDirectoryA(dir);
+            }
+        } restore_directory{previous_dir, previous_len > 0 && previous_len < sizeof(previous_dir)};
         if (image.GetExportAddress(config_.in_process_entry) != nullptr) {
             call_st = image.CallExportedEntry(config_.in_process_entry, exit_code);
         } else {
             set_env("SCARLETTX_REAL_TITLE", "1");
-            // A title's relative paths start at its package root, as on the console.
-            SetCurrentDirectoryA(drive_mapped ? "G:\\" : abs_pkg_dir.c_str());
             std::cout << "[ScarlettX][loader] Entering native PE entry point at "
                       << image.EntryPointAddress() << std::endl;
             call_st = image.CallEntryPoint(exit_code);
