@@ -46,7 +46,7 @@ GPU_TESTS = {
     "test_d3d12_list_layout", "test_d3d12_frame_pacing", "test_d3d12_present_window", "test_d3d12_present_frames",
     "test_d3d12_offscreen_probe", "test_d3d12_offscreen_clear", "test_d3d12_offscreen_indexed",
     "test_victory_compute_e2e", "test_victory_compute_guest", "test_d3d12_blend_mrt",
-    "test_victory_compute_conformance", "test_victory_draw_e2e",
+    "test_victory_compute_conformance", "test_victory_draw_e2e", "test_victory_draw_guest",
 }
 # Translated compute (tests/test_victory_compute_e2e.cpp): five dispatches of four dwords each.
 VICTORY_COMPUTE_TEST = "test_victory_compute_e2e"
@@ -512,6 +512,44 @@ def check_victory_draw(stdout: str) -> dict:
     return info
 
 
+def check_victory_draw_guest(stdout: str) -> dict:
+    """The requirements of the guest-route draw test: the native pipeline created and counted as
+    translated, four translated draws with every pixel exact, six completed fences (four draws,
+    the dropped control draw and the desktop control), and no failed check."""
+    fences = [(int(s_), int(c), int(w)) for s_, c, w in
+              re.findall(r"\[victory-draw-guest\] fence signaled=(\d+) completed=(\d+) wait_result=(\d+)", stdout)]
+    pixels = re.search(r"\[victory-draw-guest\] pixels exact (\d+)/(\d+), translated draws=\+(\d+)", stdout)
+    created = re.search(r"\[victory-draw-guest\] shim CreateGraphicsPipelineState\(native containers\) hr=(0x[0-9a-f]+) "
+                        r"translated=\+(\d+)", stdout)
+    desktop = re.search(r"\[victory-draw-guest\] desktop control: drawn half exact (\d+)/(\d+), untouched half exact "
+                        r"(\d+)/(\d+)", stdout)
+    failed = re.search(r"\[victory-draw-guest\] FAILED api=(.*?) hr=(0x[0-9a-f]+)", stdout)
+    info = {
+        "shader_path": ("synthetic console-shaped vertex and pixel containers -> d3d12_xs CreateGraphicsPipelineState "
+                        "(device object) -> victory-shader bridge -> DXIL -> shim command list draw"),
+        "native_pipeline_hresult": created.group(1) if created else None,
+        "pipelines_translated": int(created.group(2)) if created else None,
+        "fences": len(fences),
+        "fences_completed": sum(1 for s_, c, w in fences if c >= s_ >= 1 and w == 0),
+        "pixels_exact": int(pixels.group(1)) if pixels else None,
+        "pixels_total": int(pixels.group(2)) if pixels else None,
+        "translated_draws": int(pixels.group(3)) if pixels else None,
+        "desktop_control_exact": (int(desktop.group(1)) + int(desktop.group(3))) if desktop else None,
+        "checks_ok": len(re.findall(r"\[victory-draw-guest\] ok: ", stdout)),
+        "checks_failed": len(re.findall(r"\[victory-draw-guest\] CHECK FAILED: ", stdout)),
+        "final_line": (re.search(r"\[victory-draw-guest\] (PASS|FAIL) \(\d+ failed checks\)", stdout) or [None])[0],
+    }
+    if failed:
+        info["first_failing_api"] = {"api": failed.group(1), "hresult": failed.group(2)}
+    info["requirements_met"] = bool(
+        created and pixels and info["native_pipeline_hresult"] == "0x00000000" and info["pipelines_translated"] == 1
+        and info["fences"] == 6 and info["fences_completed"] == 6
+        and info["pixels_exact"] == info["pixels_total"] == 16384 and info["translated_draws"] == 4
+        and info["desktop_control_exact"] == 4096 and info["checks_failed"] == 0
+        and info["final_line"] == "[victory-draw-guest] PASS (0 failed checks)")
+    return info
+
+
 def read_build_info(build: Path) -> dict:
     """build-info.txt as tools/macos_cross_build.sh writes it: `key=value` lines."""
     info = {}
@@ -689,6 +727,14 @@ def cmd_regress(args) -> int:
             elif status == PASS:
                 note = (f"{probe['pixels_exact']}/{probe['pixels_total']} pixels exact, fences "
                         f"{probe['fences_completed']}/{probe['fences']}, adapter {probe['adapter']}")
+        if name == "test_victory_draw_guest":
+            probe = check_victory_draw_guest(r["stdout"])
+            details["victory_draw_guest"] = probe
+            if status == PASS and not probe["requirements_met"]:
+                status, note = FAIL, "exit 0 but a guest-route draw requirement was not met"
+            elif status == PASS:
+                note = (f"{probe['pixels_exact']}/{probe['pixels_total']} pixels exact through the shim, fences "
+                        f"{probe['fences_completed']}/{probe['fences']}, {probe['checks_ok']} checks")
         # The hash of what ran, so a result can be tied to one artifact.
         details["exe_sha256"] = hashlib.sha256(exe.read_bytes()).hexdigest()
         add(name, category, status, note=note, **details)

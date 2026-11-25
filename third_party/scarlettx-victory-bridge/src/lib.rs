@@ -501,25 +501,59 @@ fn raw_resource_type(kind: ResourceType) -> u8 {
     }
 }
 
-/// The `FSSM` record set of one compute program.
-fn fssm_compute(native: &NativeProgram) -> Vec<u8> {
-    let StageIo::Cs(io) = &native.io else {
-        unreachable!("the writer is only given compute programs");
+const FSSM_SLOT_VS: usize = 0x28;
+const FSSM_SLOT_PS: usize = 0x30;
+/// Stage data of a vertex or pixel program: the semantic tables, then eight
+/// export patches of 404 bytes from 0x14c, each absent (code offset -1).
+const GRAPHICS_STAGE_DATA: usize = 0x14c + 8 * 404;
+
+/// The `FSSM` record set of one program: a compute program, or a vertex or
+/// pixel program without attribute inputs, parameter outputs or export
+/// patches (which is all the synthetic fixtures use).
+fn fssm_program(native: &NativeProgram) -> Vec<u8> {
+    let (slot, mut stage) = match &native.io {
+        StageIo::Cs(io) => {
+            let mut data = vec![0u8; 0x34];
+            data[0x24..0x28].copy_from_slice(&io.rsrc2.to_le_bytes());
+            for (k, t) in io.threads.iter().enumerate() {
+                data[0x28 + 4 * k..0x2c + 4 * k].copy_from_slice(&t.to_le_bytes());
+            }
+            (FSSM_SLOT_CS, data)
+        }
+        StageIo::Vs { inputs, outputs } => {
+            assert!(inputs.is_empty() && outputs.is_empty(), "the writer has no semantic tables");
+            (FSSM_SLOT_VS, vec![0u8; GRAPHICS_STAGE_DATA])
+        }
+        StageIo::Ps { inputs, input_addr, db_shader_control, patches } => {
+            assert!(inputs.is_empty() && patches.is_empty(), "the writer has no semantic tables or patches");
+            let mut data = vec![0u8; GRAPHICS_STAGE_DATA];
+            data[0x134..0x138].copy_from_slice(&input_addr.to_le_bytes());
+            data[0x138..0x13c].copy_from_slice(&db_shader_control.to_le_bytes());
+            (FSSM_SLOT_PS, data)
+        }
+        _ => unreachable!("the writer is given compute, vertex and pixel programs only"),
     };
+    if slot != FSSM_SLOT_CS {
+        for mrt in 0..8 {
+            let at = 0x14c + mrt * 404;
+            stage[at..at + 4].copy_from_slice(&u32::MAX.to_le_bytes());
+        }
+    }
     let mut payload = vec![0u8; FSSM_SLOT_CS + 8];
     payload[..8].copy_from_slice(&6u64.to_le_bytes()); // graphics slot count
     for at in [0x08usize, 0x10, 0x18, 0x20, 0x28, 0x30, 0x48, FSSM_SLOT_CS] {
         payload[at..at + 8].copy_from_slice(&FSSM_ABSENT.to_le_bytes());
     }
     let record = payload.len();
-    payload[FSSM_SLOT_CS..FSSM_SLOT_CS + 8].copy_from_slice(&(record as u64).to_le_bytes());
+    payload[slot..slot + 8].copy_from_slice(&(record as u64).to_le_bytes());
 
-    // Record, then the compute stage data, the two root tables, the code.
+    // Record, then the stage data, the two root tables, the code.
     let stage_data = record + FSSM_RECORD_SIZE;
-    let layout_at = stage_data + 0x34;
+    let layout_at = stage_data + stage.len();
     let used_at = layout_at + 20 * native.layout.len();
     let code_at = used_at + 20 * native.used.len();
     payload.resize(code_at, 0);
+    payload[stage_data..layout_at].copy_from_slice(&stage);
     let put32 = |p: &mut Vec<u8>, at: usize, v: u32| p[at..at + 4].copy_from_slice(&v.to_le_bytes());
     let put64 = |p: &mut Vec<u8>, at: usize, v: u64| p[at..at + 8].copy_from_slice(&v.to_le_bytes());
     put64(&mut payload, record, code_at as u64);
@@ -530,10 +564,6 @@ fn fssm_compute(native: &NativeProgram) -> Vec<u8> {
     put32(&mut payload, record + 0x38, native.layout.len() as u32);
     put32(&mut payload, record + 0x3c, native.used.len() as u32);
     put32(&mut payload, record + 0x50, u32::from(native.vgprs) | 31 << 20);
-    put32(&mut payload, stage_data + 0x24, io.rsrc2);
-    for (k, t) in io.threads.iter().enumerate() {
-        put32(&mut payload, stage_data + 0x28 + 4 * k, *t);
-    }
     for (k, param) in native.layout.iter().enumerate() {
         let at = layout_at + 20 * k;
         put32(&mut payload, at, raw_root_type(param.root));
@@ -563,6 +593,11 @@ fn fssm_compute(native: &NativeProgram) -> Vec<u8> {
     out
 }
 
+/// The `FSSM` record set of one compute program.
+fn fssm_compute(native: &NativeProgram) -> Vec<u8> {
+    fssm_program(native)
+}
+
 fn xbch(unpacked: &[u8]) -> Vec<u8> {
     let stream = zlib_stored(unpacked);
     let mut out = b"XBCH".to_vec();
@@ -573,9 +608,9 @@ fn xbch(unpacked: &[u8]) -> Vec<u8> {
     out
 }
 
-/// A DXBC container with one `DXIL` part: a program header that carries no
+/// The data of a console `DXIL` part: a program header that carries no
 /// bitcode (as a stripped shader's does), the `XDAT` index, then the blobs.
-fn console_container(blobs: &[(u32, Vec<u8>)]) -> Vec<u8> {
+fn console_dxil_part(blobs: &[(u32, Vec<u8>)], stage: HwStage) -> Vec<u8> {
     let mut part = vec![0u8; XDAT_OFFSET];
     part.extend_from_slice(b"XDAT");
     part.extend_from_slice(&(blobs.len() as u32).to_le_bytes());
@@ -593,23 +628,45 @@ fn console_container(blobs: &[(u32, Vec<u8>)]) -> Vec<u8> {
     while part.len() % 4 != 0 {
         part.push(0);
     }
-    // Program header: cs_6_0, the size in dwords, the DXIL magic and version.
-    part[0..4].copy_from_slice(&((5u32 << 16) | (6 << 4)).to_le_bytes());
+    // Program header: the shader kind and model 6.0, the size in dwords, the DXIL magic and version.
+    let kind: u32 = match stage {
+        HwStage::Ps => 0,
+        HwStage::Vs => 1,
+        _ => 5,
+    };
+    part[0..4].copy_from_slice(&((kind << 16) | (6 << 4)).to_le_bytes());
     let dwords = (part.len() / 4) as u32;
     part[4..8].copy_from_slice(&dwords.to_le_bytes());
     part[8..12].copy_from_slice(b"DXIL");
     part[12..16].copy_from_slice(&0x100u32.to_le_bytes());
+    part
+}
 
+/// A DXBC container with one console `DXIL` part (compute programs).
+fn console_container(blobs: &[(u32, Vec<u8>)]) -> Vec<u8> {
+    dxbc_envelope(&[(b"DXIL", console_dxil_part(blobs, HwStage::Cs))])
+}
+
+/// A DXBC envelope of these parts.
+fn dxbc_envelope(parts: &[(&[u8; 4], Vec<u8>)]) -> Vec<u8> {
+    let table = 32 + 4 * parts.len();
+    let total = table + parts.iter().map(|(_, d)| 8 + d.len()).sum::<usize>();
     let mut out = b"DXBC".to_vec();
     out.extend_from_slice(&[0; 16]);
     out.extend_from_slice(&1u16.to_le_bytes());
     out.extend_from_slice(&0u16.to_le_bytes());
-    out.extend_from_slice(&((32 + 4 + 8 + part.len()) as u32).to_le_bytes());
-    out.extend_from_slice(&1u32.to_le_bytes());
-    out.extend_from_slice(&36u32.to_le_bytes());
-    out.extend_from_slice(b"DXIL");
-    out.extend_from_slice(&(part.len() as u32).to_le_bytes());
-    out.extend_from_slice(&part);
+    out.extend_from_slice(&(total as u32).to_le_bytes());
+    out.extend_from_slice(&(parts.len() as u32).to_le_bytes());
+    let mut offset = table;
+    for (_, d) in parts {
+        out.extend_from_slice(&(offset as u32).to_le_bytes());
+        offset += 8 + d.len();
+    }
+    for (fourcc, d) in parts {
+        out.extend_from_slice(*fourcc);
+        out.extend_from_slice(&(d.len() as u32).to_le_bytes());
+        out.extend_from_slice(d);
+    }
     out
 }
 
@@ -933,27 +990,8 @@ fn signature_part(elements: &[(&str, u32, u32, u32, u8)]) -> Vec<u8> {
     out
 }
 
-/// A DXBC envelope of these parts.
 fn envelope(parts: &[(&[u8; 4], Vec<u8>)]) -> Vec<u8> {
-    let table = 32 + 4 * parts.len();
-    let total = table + parts.iter().map(|(_, d)| 8 + d.len()).sum::<usize>();
-    let mut out = b"DXBC".to_vec();
-    out.extend_from_slice(&[0; 16]);
-    out.extend_from_slice(&1u16.to_le_bytes());
-    out.extend_from_slice(&0u16.to_le_bytes());
-    out.extend_from_slice(&(total as u32).to_le_bytes());
-    out.extend_from_slice(&(parts.len() as u32).to_le_bytes());
-    let mut offset = table;
-    for (_, d) in parts {
-        out.extend_from_slice(&(offset as u32).to_le_bytes());
-        offset += 8 + d.len();
-    }
-    for (fourcc, d) in parts {
-        out.extend_from_slice(*fourcc);
-        out.extend_from_slice(&(d.len() as u32).to_le_bytes());
-        out.extend_from_slice(d);
-    }
-    out
+    dxbc_envelope(parts)
 }
 
 /// D3D system values and component types of signature parts.
@@ -1041,6 +1079,63 @@ pub unsafe extern "C" fn sx_victory_synthetic_draw(
     0
 }
 
+fn vertex_signatures() -> [(&'static [u8; 4], Vec<u8>); 2] {
+    [
+        (b"ISG1", signature_part(&[("SV_VertexID", NAME_VERTEX_ID, COMPONENT_UINT, 0, 0x1)])),
+        (b"OSG1", signature_part(&[("SV_Position", NAME_POSITION, COMPONENT_FLOAT, 0, 0xF)])),
+    ]
+}
+
+fn pixel_signatures() -> [(&'static [u8; 4], Vec<u8>); 2] {
+    [
+        (b"ISG1", signature_part(&[("SV_Position", NAME_POSITION, COMPONENT_FLOAT, 0, 0xF)])),
+        (b"OSG1", signature_part(&[("SV_Target", NAME_TARGET, COMPONENT_FLOAT, 0, 0xF)])),
+    ]
+}
+
+/// A vertex or pixel program as a title's pipeline carries it: a DXBC
+/// container with the signature parts and a console `DXIL` part holding the
+/// native code.
+fn graphics_container(native: &NativeProgram, signatures: [(&'static [u8; 4], Vec<u8>); 2], blob: Vec<u8>) -> Vec<u8> {
+    let [isg1, osg1] = signatures;
+    dxbc_envelope(&[isg1, osg1, (b"DXIL", console_dxil_part(&[(KIND_NATIVE, blob)], native.stage))])
+}
+
+/// The pixel fixture, plus a store to the raw UAV of a descriptor table in
+/// s4: a translated pixel shader whose bindings go beyond root constants.
+fn synthetic_pixel_program_with_table() -> NativeProgram {
+    let mut w = vec![s_mov_b32(5, 0x80)];
+    w.extend_from_slice(&s_load_dwordx4(8, 4));
+    for i in 0..4u8 {
+        w.push(vop1(V_MOV_B32, i, u16::from(i)));
+    }
+    w.extend_from_slice(&buffer_store_dword(0, 8, 0));
+    w.extend_from_slice(&exp(EXP_MRT0, [0, 1, 2, 3], true));
+    w.push(S_ENDPGM);
+    let mut native = synthetic_pixel_program();
+    native.code = w.iter().flat_map(|w| w.to_le_bytes()).collect();
+    native.vgprs = 16;
+    native.layout.push(RootParam {
+        root: RootType::Table,
+        table_offset_dwords: 0,
+        sgprs: 1,
+        base_register: 0,
+        user_data: 4,
+        slot: 1,
+    });
+    native.used.push(UsedResource {
+        kind: ResourceType::Uav,
+        root: RootType::Table,
+        table_offset_dwords: 0,
+        lower_bound: 0,
+        stride: 0,
+        dwords: 4,
+        user_data: 4,
+        slot: 1,
+    });
+    native
+}
+
 /// The synthetic containers the tests use. 0: the compute fixture. 1: the same
 /// with its native stream cut short (malformed). 2: a console-shaped container
 /// whose index lists no native code (missing). 3: a compute program that reads
@@ -1061,6 +1156,27 @@ fn synthetic_container(variant: u32) -> Option<Vec<u8>> {
         5 => Some(console_container(&[(KIND_NATIVE, xbch(&fssm_compute(&synthetic_lane_mask_program(false, false))))])),
         6 => Some(console_container(&[(KIND_NATIVE, xbch(&fssm_compute(&synthetic_lane_mask_program(false, true))))])),
         7 => Some(console_container(&[(KIND_NATIVE, xbch(&fssm_compute(&synthetic_lane_mask_program(true, false))))])),
+        // The draw fixture as a title's pipeline carries it: 9 the vertex program, 10 the pixel
+        // program, 11 the vertex program with its native stream cut short, 12 a pixel program
+        // that also stores to a table's UAV (bindings beyond root constants).
+        9 => {
+            let native = synthetic_vertex_program();
+            Some(graphics_container(&native, vertex_signatures(), xbch(&fssm_program(&native))))
+        }
+        10 => {
+            let native = synthetic_pixel_program();
+            Some(graphics_container(&native, pixel_signatures(), xbch(&fssm_program(&native))))
+        }
+        11 => {
+            let native = synthetic_vertex_program();
+            let mut blob = xbch(&fssm_program(&native));
+            blob.truncate(blob.len() - 16);
+            Some(graphics_container(&native, vertex_signatures(), blob))
+        }
+        12 => {
+            let native = synthetic_pixel_program_with_table();
+            Some(graphics_container(&native, pixel_signatures(), xbch(&fssm_program(&native))))
+        }
         _ => None,
     }
 }
@@ -1098,6 +1214,13 @@ enum ComputeInput {
 }
 
 fn translate_compute_container(data: &[u8]) -> ComputeInput {
+    translate_stage_container(data, HwStage::Cs)
+}
+
+/// Classifies a container for a pipeline stage and translates its native
+/// program of that stage. For a compute program the thread-group size comes
+/// along; for the other stages it is zero.
+fn translate_stage_container(data: &[u8], stage: HwStage) -> ComputeInput {
     let Ok(container) = Container::parse(data) else {
         return ComputeInput::Desktop;
     };
@@ -1113,15 +1236,16 @@ fn translate_compute_container(data: &[u8]) -> ComputeInput {
         Ok(programs) => programs,
         Err(err) => return ComputeInput::Malformed(err.to_string()),
     };
-    let Some(threads) = programs.iter().find_map(|p| match (&p.io, p.stage) {
-        (StageIo::Cs(io), HwStage::Cs) => Some(io.threads),
-        _ => None,
+    let Some(threads) = programs.iter().find_map(|p| match &p.io {
+        _ if p.stage != stage => None,
+        StageIo::Cs(io) => Some(io.threads),
+        _ => Some([0, 0, 0]),
     }) else {
         return ComputeInput::NoNativeCompute;
     };
     match victory_shader::emit::translate(data) {
-        Ok(shader) if shader.stage == HwStage::Cs => ComputeInput::Translated(Box::new(shader), threads),
-        Ok(_) => ComputeInput::Refused("the container's first program is not its compute program".into()),
+        Ok(shader) if shader.stage == stage => ComputeInput::Translated(Box::new(shader), threads),
+        Ok(_) => ComputeInput::Refused("the container's first program is of another stage".into()),
         Err(err) => ComputeInput::Refused(err.to_string()),
     }
 }
@@ -1149,11 +1273,50 @@ pub unsafe extern "C" fn sx_victory_shader_translate_compute(
     let (output, binding, report) = unsafe { (&mut *out, &mut *binding, &mut *info) };
     output.data = std::ptr::null_mut();
     output.size = 0;
+    translate_stage_into(input, HwStage::Cs, output, binding, report)
+}
+
+/// [`sx_victory_shader_translate_compute`] for a pipeline stage: `stage` 0
+/// vertex, 1 pixel, 2 compute. The return codes are the same; 2 means the
+/// container carries no native program of that stage, -1 also an unknown stage.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn sx_victory_shader_translate_stage(
+    data: *const u8,
+    size: usize,
+    stage: u32,
+    out: *mut SxVictoryByteBuffer,
+    binding: *mut SxVictoryComputeBinding,
+    info: *mut SxVictoryShaderInfo,
+) -> i32 {
+    let stage = match stage {
+        0 => HwStage::Vs,
+        1 => HwStage::Ps,
+        2 => HwStage::Cs,
+        _ => return -1,
+    };
+    if data.is_null() || out.is_null() || binding.is_null() || info.is_null() {
+        return -1;
+    }
+    // SAFETY: the C++ caller passes a readable range and three live, exclusive objects.
+    let input = unsafe { slice::from_raw_parts(data, size) };
+    let (output, binding, report) = unsafe { (&mut *out, &mut *binding, &mut *info) };
+    output.data = std::ptr::null_mut();
+    output.size = 0;
+    translate_stage_into(input, stage, output, binding, report)
+}
+
+fn translate_stage_into(
+    input: &[u8],
+    stage: HwStage,
+    output: &mut SxVictoryByteBuffer,
+    binding: &mut SxVictoryComputeBinding,
+    report: &mut SxVictoryShaderInfo,
+) -> i32 {
     inspect(input, report);
-    match translate_compute_container(input) {
+    match translate_stage_container(input, stage) {
         ComputeInput::Desktop => 1,
         ComputeInput::NoNativeCompute => {
-            message(report, "a console-shaped container without a native compute program");
+            message(report, "a console-shaped container without a native program of this stage");
             2
         }
         ComputeInput::Malformed(text) => {
@@ -1236,6 +1399,51 @@ mod tests {
                 ComputeInput::Malformed(text) => panic!("variant {variant} malformed: {text}"),
                 _ => panic!("variant {variant} not translated"),
             }
+        }
+    }
+
+    #[test]
+    fn the_graphics_containers_parse_back_and_translate_like_the_programs() {
+        let (direct_vs, direct_ps) = translate_synthetic_draw().unwrap();
+        for (variant, native, direct, stage) in [
+            (9u32, synthetic_vertex_program(), &direct_vs, HwStage::Vs),
+            (10, synthetic_pixel_program(), &direct_ps, HwStage::Ps),
+        ] {
+            let bytes = synthetic_container(variant).unwrap();
+            let container = Container::parse(&bytes).unwrap();
+            assert!(container.part(FourCC::ISG1).is_some() && container.part(FourCC::OSG1).is_some());
+            let parsed = native_programs(container.part(FourCC::DXIL).unwrap().data).unwrap();
+            assert_eq!(parsed, [native], "variant {variant}");
+            match translate_stage_container(&bytes, stage) {
+                ComputeInput::Translated(shader, threads) => {
+                    assert_eq!(&*shader, direct, "variant {variant}");
+                    assert_eq!(threads, [0, 0, 0]);
+                }
+                ComputeInput::Refused(text) => panic!("variant {variant} refused: {text}"),
+                _ => panic!("variant {variant} not translated"),
+            }
+            // Asked for as another stage, it has no native program of that stage.
+            let other = if stage == HwStage::Vs { HwStage::Ps } else { HwStage::Vs };
+            assert!(matches!(translate_stage_container(&bytes, other), ComputeInput::NoNativeCompute));
+        }
+        assert!(matches!(
+            translate_stage_container(&synthetic_container(11).unwrap(), HwStage::Vs),
+            ComputeInput::Malformed(_)
+        ));
+        // A translated shader is a desktop container for every stage.
+        assert!(matches!(translate_stage_container(&direct_ps.dxil, HwStage::Ps), ComputeInput::Desktop));
+    }
+
+    #[test]
+    fn the_pixel_program_with_a_table_translates_with_a_table_binding() {
+        match translate_stage_container(&synthetic_container(12).unwrap(), HwStage::Ps) {
+            ComputeInput::Translated(shader, _) => {
+                let tables = shader.user_data.iter().filter(|u| u.root == RootType::Table).count();
+                assert_eq!(tables, 1, "{:?}", shader.user_data);
+            }
+            ComputeInput::Refused(text) => panic!("refused: {text}"),
+            ComputeInput::Malformed(text) => panic!("malformed: {text}"),
+            _ => panic!("not translated"),
         }
     }
 

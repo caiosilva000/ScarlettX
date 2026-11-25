@@ -53,6 +53,8 @@ int32_t sx_victory_synthetic_draw(SxVictoryByteBuffer*, SxVictoryComputeBinding*
                                   SxVictoryComputeBinding*, SxVictoryShaderInfo*);
 int32_t sx_victory_shader_translate_compute(const uint8_t*, size_t, SxVictoryByteBuffer*, SxVictoryComputeBinding*,
                                             SxVictoryShaderInfo*);
+int32_t sx_victory_shader_translate_stage(const uint8_t*, size_t, uint32_t, SxVictoryByteBuffer*,
+                                          SxVictoryComputeBinding*, SxVictoryShaderInfo*);
 }
 
 void ConvertBinding(const SxVictoryComputeBinding& binding, scarlettx::VictoryComputeBinding& out) {
@@ -237,6 +239,68 @@ VictoryComputeOutcome TranslateVictoryCompute(const uint8_t* data, size_t size, 
         default: return VictoryComputeOutcome::Refused;
     }
 #endif
+}
+
+VictoryComputeOutcome TranslateVictoryStage(const uint8_t* data, size_t size, VictoryStage stage,
+                                            VictoryShaderInfo& out_info, VictoryComputeBinding& out_binding,
+                                            std::vector<uint8_t>& out_dxil) {
+    out_info = VictoryShaderInfo{};
+    out_binding = VictoryComputeBinding{};
+    out_dxil.clear();
+#if !defined(SCARLETTX_VICTORY_SHADER_BRIDGE)
+    (void)data;
+    (void)size;
+    (void)stage;
+    return VictoryComputeOutcome::Unavailable;
+#else
+    if (!data || size == 0) return VictoryComputeOutcome::Desktop;
+    SxVictoryShaderInfo raw{};
+    SxVictoryByteBuffer buffer{};
+    SxVictoryComputeBinding binding{};
+    const int32_t result =
+        sx_victory_shader_translate_stage(data, size, static_cast<uint32_t>(stage), &buffer, &binding, &raw);
+    out_info = Convert(raw);
+    switch (result) {
+        case 0:
+            out_dxil.assign(buffer.data, buffer.data + buffer.size);
+            sx_victory_buffer_free(&buffer);
+            ConvertBinding(binding, out_binding);
+            return VictoryComputeOutcome::Translated;
+        case 1: return VictoryComputeOutcome::Desktop;
+        case 2: return VictoryComputeOutcome::NoNativeCompute;
+        case 3: return VictoryComputeOutcome::Malformed;
+        default: return VictoryComputeOutcome::Refused;
+    }
+#endif
+}
+
+bool VictoryGraphicsBindingSupported(const VictoryComputeBinding& binding, std::string& why) {
+    why.clear();
+    if (binding.user_data_dwords > 32) {
+        // Two stages share a 64-dword root signature.
+        why = "user data of " + std::to_string(binding.user_data_dwords) + " dwords does not fit a stage's root constants";
+    } else if (binding.root_cbv_count) {
+        why = "root constant buffers are not bound yet";
+    } else if (binding.root_srv_count || binding.root_uav_count) {
+        why = "root buffer views are not bound yet";
+    } else if (binding.sampler_count || binding.static_sampler_count) {
+        why = "samplers are not bound yet";
+    } else if (binding.flags) {
+        why = "the shader needs title-memory or heap tables (flags " + std::to_string(binding.flags) + ")";
+    } else {
+        for (const auto& u : binding.user_data) {
+            if (u.index >= binding.user_data_dwords) {
+                why = "a user-data entry lies outside the user data";
+            } else if (u.root == 1) {
+                why = "descriptor tables are not mapped for graphics pipelines yet (root parameter " +
+                      std::to_string(u.slot) + ")";
+            } else if (u.root != 0) {
+                why = "user data from root type " + std::to_string(u.root) + " (only root constants are mapped)";
+            }
+            if (!why.empty()) break;
+        }
+    }
+    return why.empty();
 }
 
 bool VictoryComputeBindingSupported(const VictoryComputeBinding& binding, std::string& why) {
