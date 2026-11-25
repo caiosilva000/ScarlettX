@@ -441,8 +441,10 @@ target_link_libraries(test_shader_pipeline PRIVATE d3d12_xs)
 option(SCARLETTX_BENCHMARKS "Build the opt-in benchmark executables" OFF)
 if(SCARLETTX_BENCHMARKS AND SCARLETTX_VICTORY_SHADER_BRIDGE)
     add_executable(bench_victory_prewarm bench/bench_victory_prewarm.cpp)
-    target_link_libraries(bench_victory_prewarm PRIVATE scarlettx_core)
-    target_include_directories(bench_victory_prewarm PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/include)
+    target_link_libraries(bench_victory_prewarm PRIVATE scarlettx_core d3d12_xs)
+    target_include_directories(bench_victory_prewarm PRIVATE
+        ${CMAKE_CURRENT_SOURCE_DIR}/include
+        ${CMAKE_CURRENT_SOURCE_DIR}/tests)  # the guest-route rig
 endif()
 
 if(SCARLETTX_VICTORY_SHADER_BRIDGE)

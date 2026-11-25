@@ -14,6 +14,8 @@
 //                         first call apart from this shader's translation, pipeline creation the
 //                         first time and again, and pipeline blobs (--corrupt-blob also offers
 //                         the host a damaged one)
+//   --workload guest      guest-facing compute: the vector kernel as a console-shaped container
+//                         through the d3d12_xs shim's device object and command list (salt = k)
 //   --workload control    graphics control without translation: the existing offscreen indexed
 //                         draw (HLSL -> d3dcompiler, pipeline built inside every call)
 //
@@ -44,6 +46,7 @@
 
 #include "scarlettx/gpu/d3d12_backend.h"
 #include "scarlettx/gpu/victory_shader_bridge.h"
+#include "victory_guest_rig.h"
 
 namespace {
 
@@ -263,6 +266,7 @@ int RunTranslated(const Args& args, scarlettx::D3D12Backend& backend, Recorder& 
     }
 
     rec.Metric("backend_init_ms", init_ms);
+    rec.Metric("shader_bytes", static_cast<double>(all.size()));
     rec.Metric("translate_ms", translate_ms);
     rec.Metric("root_signature_ms", prepare.root_signature_ms);
     rec.Metric("pipeline_create_ms", prepare.pipeline_ms);
@@ -458,6 +462,126 @@ int RunVector(const Args& args, scarlettx::D3D12Backend& backend, Recorder& rec,
     rec.Metric("validated_exact", static_cast<double>(exact));
     rec.Metric("validated_total", static_cast<double>(total));
     backend.ReleaseProbe(session);
+    return 0;
+}
+
+// Guest-facing compute: the vector kernel as a console-shaped container, handed to the d3d12_xs
+// shim's device object and dispatched through its command list, as a title's shader is. The
+// shim translates inside CreateComputePipelineState, so translation and pipeline creation are one
+// guest call; the shim reports how that call split.
+int RunGuest(const Args& args, Recorder& rec) {
+    constexpr uint32_t kElements = 1024;                 // 32 groups of 32 threads
+    constexpr uint32_t kBufferDwords = kElements + 32;   // the tail must keep its sentinel
+    const UINT groups[3] = {kElements / 32, 1, 1};
+    const uint32_t k = args.salt;
+    const bool cold = args.condition == "cold";
+    const bool steady = args.condition == "steady";
+
+    sxrig::GuestRig rig;
+    rig.tag = "[bench]";
+    LARGE_INTEGER start = Now();
+    if (const int rc = rig.Init(false, kBufferDwords, 8, 5)) return rc;
+    if (const int rc = rig.PrepareTimed()) return rc;
+    const double init_ms = MsBetween(start, Now());
+    std::vector<uint8_t> container;
+    if (!scarlettx::BuildVictoryVectorKernelContainer(k, container).ok()) {
+        std::printf("[bench] the container could not be built\n");
+        return 4;
+    }
+
+    // Translation and pipeline creation: one guest call.
+    start = Now();
+    void* pso = nullptr;
+    const HRESULT hr = rig.CreatePipeline(rig.title_root, container, &pso);
+    const double create_ms = MsBetween(start, Now());
+    if (FAILED(hr) || !pso) return rig.Fail("shim CreateComputePipelineState (slot 11)", hr);
+    const auto stats = sxrig::Stats();
+    if (stats.compute_translated != 1) {
+        std::printf("[bench] FAILED: the shim did not translate the container\n");
+        return 1;
+    }
+    const double translate_ms = static_cast<double>(stats.last_translate_us) / 1000.0;
+    const double pipeline_ms = static_cast<double>(stats.last_host_pipeline_us) / 1000.0;
+    rec.shader_hash = Fnv(container);
+    std::printf("[bench] native=%llu bytes translated=%llu bytes k=%u\n",
+                static_cast<unsigned long long>(stats.last_native_bytes),
+                static_cast<unsigned long long>(stats.last_translated_bytes), k);
+
+    uint32_t exact = 0;
+    uint32_t total = 0;
+    uint32_t fences = 0;
+    uint32_t submissions = 0;
+    uint32_t c[4] = {0, 0, 0, 0};
+    auto submit = [&](double* record, double* wait) {
+        c[0] = 0x1000u + submissions * 7919u;
+        c[1] = 0xABCD0000u ^ submissions;
+        ++submissions;
+        const int rc = rig.TimedDispatch(rig.title_root, pso, c, 4, 1, groups, record, wait);
+        if (rc == 0) ++fences;
+        return rc;
+    };
+    auto validate = [&](const char* when) -> int {
+        std::vector<uint32_t> out;
+        if (const int rc = rig.ReadBack(out)) return rc;
+        uint32_t ok = 0;
+        for (uint32_t i = 0; i < kElements; ++i) ok += out[i] == VectorKernel(i, c[0], c[1], k);
+        for (uint32_t i = kElements; i < kBufferDwords; ++i) ok += out[i] == sxrig::kSentinel;
+        std::printf("[bench] validate %s: dwords exact %u/%u\n", when, ok, kBufferDwords);
+        exact += ok;
+        total += kBufferDwords;
+        return ok == kBufferDwords ? 0 : 1;
+    };
+
+    double priming_ms = 0.0;
+    if (args.condition == "primed" || steady) {
+        start = Now();
+        for (uint32_t i = 0; i < (steady ? 3u : 1u); ++i) {
+            if (const int rc = submit(nullptr, nullptr)) return rc;
+        }
+        priming_ms = MsBetween(start, Now());
+    }
+    rec.Metric("backend_init_ms", init_ms);
+    rec.Metric("shader_bytes", static_cast<double>(stats.last_translated_bytes));
+    rec.Metric("native_bytes", static_cast<double>(stats.last_native_bytes));
+    rec.Metric("translate_ms", translate_ms);
+    rec.Metric("pipeline_create_ms", pipeline_ms);
+    rec.Metric("guest_create_pipeline_ms", create_ms);
+    if (priming_ms > 0.0) rec.Metric("priming_submissions_ms", priming_ms);
+    if (!steady) {
+        double record = 0;
+        double wait = 0;
+        if (const int rc = submit(&record, &wait)) return rc;
+        const double first_ms = record + wait;
+        rec.Metric("first_record_ms", record);
+        rec.Metric("first_submit_to_fence_ms", wait);
+        rec.Metric("first_submission_ms", first_ms);
+        rec.Metric("first_use_latency_ms", (cold ? create_ms : 0.0) + first_ms);
+        rec.Metric("preparation_ms", cold ? 0.0 : create_ms + priming_ms);
+        rec.Metric("total_to_first_result_ms", create_ms + priming_ms + first_ms);
+        if (const int rc = validate("first use")) return rc;
+    }
+    std::vector<double> samples;
+    for (uint32_t i = 0; i < args.iterations; ++i) {
+        scarlettx::ProbeSubmitTiming t;
+        if (const int rc = submit(&t.record_ms, &t.submit_to_fence_ms)) return rc;
+        samples.push_back(t.record_ms + t.submit_to_fence_ms);
+        rec.Sample(i, t);
+    }
+    if (const int rc = validate("after the steady loop")) return rc;
+    const auto after = sxrig::Stats();
+    if (after.dispatches_translated != submissions || after.dispatches_skipped != 0) {
+        std::printf("[bench] FAILED: %llu of %u dispatches ran the translated pipeline\n",
+                    static_cast<unsigned long long>(after.dispatches_translated), submissions);
+        return 1;
+    }
+    rec.Metric("steady_iterations", static_cast<double>(samples.size()));
+    rec.Metric("steady_submission_median_ms", Percentile(samples, 0.5));
+    rec.Metric("steady_submission_p95_ms", Percentile(samples, 0.95));
+    rec.Metric("steady_submission_min_ms", Percentile(samples, 0.0));
+    rec.Metric("steady_submission_max_ms", Percentile(samples, 1.0));
+    rec.Metric("fences_completed", static_cast<double>(fences));
+    rec.Metric("validated_exact", static_cast<double>(exact));
+    rec.Metric("validated_total", static_cast<double>(total));
     return 0;
 }
 
@@ -686,12 +810,14 @@ int main(int argc, char** argv) {
         return 64;
     }
     const bool cache = args.workload == "cache";
+    const bool guest = args.workload == "guest";
     if (cache && (args.rounds == 0 || args.rounds > 4096)) {
         std::fprintf(stderr, "bench_victory_prewarm: --rounds must be 1 to 4096\n");
         return 64;
     }
-    if ((!translated && !vector && !cache && args.workload != "control") || !known_condition || args.iterations == 0) {
-        std::fprintf(stderr, "usage: bench_victory_prewarm --workload compute|draw|control|vector|cache --condition "
+    if ((!translated && !vector && !cache && !guest && args.workload != "control") || !known_condition ||
+        args.iterations == 0) {
+        std::fprintf(stderr, "usage: bench_victory_prewarm --workload compute|draw|guest|control|vector|cache --condition "
                              "cold|prewarmed|primed|steady [--iterations N] [--salt S] [--launch N] [--series NAME] "
                              "[--csv FILE] [--samples FILE] [--hold-ms MS] [--elements N] [--rounds N] "
                              "[--corrupt-blob]\n");
@@ -700,6 +826,7 @@ int main(int argc, char** argv) {
     const char* shader_path =
         args.workload == "compute" ? "translated compute: GFX10 -> victory-shader bridge -> DXIL -> D3D12Backend (backend path)"
         : args.workload == "draw" ? "translated draw: GFX10 VS+PS -> victory-shader bridge -> DXIL -> D3D12Backend (backend path)"
+        : guest ? "guest-facing compute: GFX10 container -> d3d12_xs CreateComputePipelineState (device object) -> bridge -> DXIL -> shim command list"
         : vector || cache ? "vector kernel: GFX10 container -> victory-shader bridge -> DXIL -> D3D12Backend (backend path)"
                                   : "control: HLSL -> d3dcompiler -> D3D12Backend indexed draw, pipeline built per call";
     Recorder rec{args, shader_path};
@@ -709,6 +836,15 @@ int main(int argc, char** argv) {
     std::printf("[bench] workload=%s condition=%s series=%s launch=%u salt=%u iterations=%u\n", args.workload.c_str(),
                 args.condition.c_str(), args.series.c_str(), args.launch, args.salt, args.iterations);
     std::printf("[bench] shader_path=%s\n", shader_path);
+    if (guest) {
+        // The shim makes its own device; its adapter line goes to stderr.
+        const int guest_rc = RunGuest(args, rec);
+        if (rec.csv) std::fclose(rec.csv);
+        if (rec.samples) std::fclose(rec.samples);
+        std::printf("[bench] %s\n", guest_rc == 0 ? "PASS" : "FAIL");
+        if (args.hold_ms) Sleep(args.hold_ms);
+        return guest_rc;
+    }
     scarlettx::D3D12Backend backend;
     LARGE_INTEGER start = Now();
     const auto init = backend.Initialize(false, false);

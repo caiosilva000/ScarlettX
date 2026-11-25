@@ -121,7 +121,11 @@ def main() -> int:
     ap.add_argument("--iterations", type=int, default=200, help="steady submissions per launch")
     ap.add_argument("--control-iterations", type=int, default=30)
     ap.add_argument("--timeout", type=int, default=120)
+    ap.add_argument("--workloads", nargs="+", default=WORKLOADS, choices=["compute", "draw", "guest"],
+                    help="translated workloads to run; the first is held open for the route record")
+    ap.add_argument("--no-control", action="store_true", help="leave out the untranslated control draw")
     args = ap.parse_args()
+    workloads = args.workloads
 
     out = Path(args.out).resolve()
     out.mkdir(parents=True, exist_ok=True)
@@ -148,6 +152,7 @@ def main() -> int:
         "build": str(build), "build_info": build_info,
         "exe_sha256": hashlib.sha256(exe.read_bytes()).hexdigest(),
         "launches": args.launches, "unseen_launches": args.unseen_launches, "iterations": args.iterations,
+        "workloads": workloads,
         "wineserver": "restarted once before the first launch, then left running",
         "caches_before": cache_state(),
     }
@@ -168,23 +173,26 @@ def main() -> int:
 
     # Discarded launches: bring wine up and let the host's caches see the plain fixtures. The
     # first one is held open so the process's mapped graphics libraries can be recorded.
-    env["route_evidence"] = go("discard", "compute", "cold", 0, 10, hold_ms=6000)
-    go("discard", "draw", "cold", 0, 10)
-    go("discard", "control", "cold", 0, 3)
+    env["route_evidence"] = go("discard", workloads[0], "cold", 0, 10, hold_ms=6000)
+    for workload in workloads[1:]:
+        go("discard", workload, "cold", 0, 10)
+    if not args.no_control:
+        go("discard", "control", "cold", 0, 3)
     env["caches_after_discard"] = cache_state()
 
     # Main matrix, round-robin.
     for _ in range(args.launches):
-        for workload in WORKLOADS:
+        for workload in workloads:
             for condition in CONDITIONS:
                 go("seen", workload, condition, 0, args.iterations)
-        go("seen", "control", "cold", 0, args.control_iterations)
+        if not args.no_control:
+            go("seen", "control", "cold", 0, args.control_iterations)
     env["caches_after_seen"] = cache_state()
 
     # Shaders no cache has seen: a salt from the clock, then counting up.
     salt = (int(time.time()) & 0x3FFFFFFF) | 0x40000000
     for _ in range(args.unseen_launches):
-        for workload in WORKLOADS:
+        for workload in workloads:
             for condition in ("cold", "prewarmed", "primed"):
                 salt += 1
                 go("unseen", workload, condition, salt, args.iterations)
@@ -194,7 +202,7 @@ def main() -> int:
     # of the benchmark under a name never used before starts with none.
     fresh = []
     for i in range(args.fresh_cache_launches):
-        for workload in WORKLOADS:
+        for workload in workloads:
             for condition in ("cold", "primed"):
                 salt += 1
                 name = f"bench_fresh_{salt:x}.exe"
@@ -227,7 +235,7 @@ def main() -> int:
     result = {"launches": len(launches), "failed_launches": failed, "summary": summary}
     (out / "summary.json").write_text(json.dumps(result, indent=1))
 
-    wanted = ["translate_ms", "pipeline_create_ms", "first_submission_ms", "first_use_latency_ms", "preparation_ms",
+    wanted = ["shader_bytes", "translate_ms", "pipeline_create_ms", "guest_create_pipeline_ms", "first_submission_ms", "first_use_latency_ms", "preparation_ms",
               "total_to_first_result_ms", "steady_submission_median_ms", "steady_submission_p95_ms",
               "translate_repeat_ms", "pipeline_recreate_ms", "control_first_call_ms",
               "control_repeat_call_median_ms", "control_repeat_call_p95_ms"]

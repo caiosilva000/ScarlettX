@@ -244,6 +244,131 @@ struct GuestRig {
         list->Release();
         return 0;
     }
+
+    // --- Timed dispatches: one allocator and command list from the shim, reused; nothing is
+    // filled or read back inside a dispatch. Call PrepareTimed once, then TimedDispatch any
+    // number of times, and ReadBack to look at the buffer. Do not mix with RunDispatch.
+    void* timed_alloc = nullptr;
+    void* timed_list = nullptr;
+    ID3D12CommandAllocator* timed_native_alloc = nullptr;
+    ID3D12GraphicsCommandList* timed_native_list = nullptr;
+    ID3D12CommandAllocator* plumbing_alloc = nullptr;
+    ID3D12GraphicsCommandList* plumbing_list = nullptr;
+
+    int Execute(ID3D12GraphicsCommandList* list, double* wait_ms = nullptr) {
+        ID3D12CommandList* lists[] = {list};
+        LARGE_INTEGER start;
+        LARGE_INTEGER freq;
+        QueryPerformanceCounter(&start);
+        QueryPerformanceFrequency(&freq);
+        queue->ExecuteCommandLists(1, lists);
+        const UINT64 target = ++fence_value;
+        HRESULT hr = queue->Signal(fence, target);
+        if (FAILED(hr)) return Fail("ID3D12CommandQueue::Signal", hr);
+        if (fence->GetCompletedValue() < target) {
+            hr = fence->SetEventOnCompletion(target, event);
+            if (FAILED(hr)) return Fail("ID3D12Fence::SetEventOnCompletion", hr);
+            if (WaitForSingleObject(event, 10000) != WAIT_OBJECT_0) return Fail("fence wait", E_FAIL);
+        }
+        if (fence->GetCompletedValue() < target) {
+            return Fail("ID3D12Fence::GetCompletedValue (fence not reached)", device->GetDeviceRemovedReason());
+        }
+        if (wait_ms) {
+            LARGE_INTEGER end;
+            QueryPerformanceCounter(&end);
+            *wait_ms = static_cast<double>(end.QuadPart - start.QuadPart) * 1000.0 / static_cast<double>(freq.QuadPart);
+        }
+        return 0;
+    }
+
+    int PrepareTimed() {
+        HRESULT hr = device->CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT, IID_PPV_ARGS(&plumbing_alloc));
+        if (FAILED(hr)) return Fail("CreateCommandAllocator(plumbing)", hr);
+        hr = device->CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_DIRECT, plumbing_alloc, nullptr,
+                                       IID_PPV_ARGS(&plumbing_list));
+        if (FAILED(hr)) return Fail("CreateCommandList(plumbing)", hr);
+        // The sentinel once; the buffer then stays in the unordered-access state.
+        plumbing_list->CopyBufferRegion(uav, 0, upload, 0, static_cast<UINT64>(uav_dwords) * 4);
+        Transition(plumbing_list, D3D12_RESOURCE_STATE_COPY_DEST, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
+        plumbing_list->Close();
+        if (const int rc = Execute(plumbing_list)) return rc;
+
+        hr = static_cast<HRESULT>(
+            Call(shim_device, 9, static_cast<uintptr_t>(D3D12_COMMAND_LIST_TYPE_DIRECT), uintptr_t{0}, P(&timed_alloc)));
+        if (FAILED(hr) || !timed_alloc) return Fail("shim CreateCommandAllocator (slot 9)", hr);
+        hr = static_cast<HRESULT>(Call(shim_device, 12, uintptr_t{0},
+                                       static_cast<uintptr_t>(D3D12_COMMAND_LIST_TYPE_DIRECT), P(timed_alloc),
+                                       uintptr_t{0}, uintptr_t{0}, P(&timed_list)));
+        if (FAILED(hr) || !timed_list) return Fail("shim CreateCommandList (slot 12)", hr);
+        SX_REQUIRE(D3D12XboxGetNativeObject(timed_alloc, reinterpret_cast<void**>(&timed_native_alloc)) == 0);
+        SX_REQUIRE(D3D12XboxGetNativeObject(timed_list, reinterpret_cast<void**>(&timed_native_list)) == 0);
+        Call(timed_list, 9, uintptr_t{0}, uintptr_t{0}, uintptr_t{0});  // Close: lists are created open
+        return 0;
+    }
+
+    void Transition(ID3D12GraphicsCommandList* list, D3D12_RESOURCE_STATES before, D3D12_RESOURCE_STATES after) {
+        D3D12_RESOURCE_BARRIER barrier{};
+        barrier.Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
+        barrier.Transition.pResource = uav;
+        barrier.Transition.StateBefore = before;
+        barrier.Transition.StateAfter = after;
+        barrier.Transition.Subresource = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
+        list->ResourceBarrier(1, &barrier);
+    }
+
+    // One dispatch as a title makes it, on the shim's command list. `record_ms` is the reset and
+    // the title's calls up to Close; `submit_ms` is ExecuteCommandLists until the fence completes.
+    int TimedDispatch(void* shim_root, void* shim_pso, const uint32_t* constants, UINT constant_count,
+                      int table_param, const UINT groups[3], double* record_ms, double* submit_ms) {
+        LARGE_INTEGER start;
+        LARGE_INTEGER freq;
+        QueryPerformanceCounter(&start);
+        QueryPerformanceFrequency(&freq);
+        HRESULT hr = timed_native_alloc->Reset();
+        if (FAILED(hr)) return Fail("ID3D12CommandAllocator::Reset", hr);
+        hr = static_cast<HRESULT>(Call(timed_list, 10, P(timed_alloc), uintptr_t{0}, uintptr_t{0}));  // Reset
+        if (FAILED(hr)) return Fail("shim ID3D12GraphicsCommandList::Reset (slot 10)", hr);
+        void* heaps[] = {shim_heap};
+        Call(timed_list, 32, uintptr_t{1}, P(heaps), uintptr_t{0});
+        Call(timed_list, 33, P(shim_root), uintptr_t{0}, uintptr_t{0});
+        Call(timed_list, 25, P(shim_pso), uintptr_t{0}, uintptr_t{0});
+        Call(timed_list, 39, uintptr_t{0}, static_cast<uintptr_t>(constant_count), P(constants), uintptr_t{0});
+        if (table_param >= 0) {
+            Call(timed_list, 35, static_cast<uintptr_t>(table_param), static_cast<uintptr_t>(view_handle.ptr),
+                 uintptr_t{0});
+        }
+        Call(timed_list, 14, static_cast<uintptr_t>(groups[0]), static_cast<uintptr_t>(groups[1]),
+             static_cast<uintptr_t>(groups[2]));
+        hr = static_cast<HRESULT>(Call(timed_list, 9, uintptr_t{0}, uintptr_t{0}, uintptr_t{0}));
+        if (FAILED(hr)) return Fail("shim ID3D12GraphicsCommandList::Close (slot 9)", hr);
+        LARGE_INTEGER recorded;
+        QueryPerformanceCounter(&recorded);
+        if (record_ms) {
+            *record_ms = static_cast<double>(recorded.QuadPart - start.QuadPart) * 1000.0 / static_cast<double>(freq.QuadPart);
+        }
+        return Execute(timed_native_list, submit_ms);
+    }
+
+    // Copies the buffer back and maps it; outside any timing.
+    int ReadBack(std::vector<uint32_t>& out) {
+        HRESULT hr = plumbing_alloc->Reset();
+        if (FAILED(hr)) return Fail("ID3D12CommandAllocator::Reset(plumbing)", hr);
+        hr = plumbing_list->Reset(plumbing_alloc, nullptr);
+        if (FAILED(hr)) return Fail("ID3D12GraphicsCommandList::Reset(plumbing)", hr);
+        const UINT64 bytes = static_cast<UINT64>(uav_dwords) * 4;
+        Transition(plumbing_list, D3D12_RESOURCE_STATE_UNORDERED_ACCESS, D3D12_RESOURCE_STATE_COPY_SOURCE);
+        plumbing_list->CopyBufferRegion(readback, 0, uav, 0, bytes);
+        Transition(plumbing_list, D3D12_RESOURCE_STATE_COPY_SOURCE, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
+        plumbing_list->Close();
+        if (const int rc = Execute(plumbing_list)) return rc;
+        void* mapped = nullptr;
+        hr = readback->Map(0, nullptr, &mapped);
+        if (FAILED(hr) || !mapped) return Fail("ID3D12Resource::Map(Readback)", FAILED(hr) ? hr : E_POINTER);
+        out.resize(uav_dwords);
+        std::memcpy(out.data(), mapped, static_cast<size_t>(bytes));
+        readback->Unmap(0, nullptr);
+        return 0;
+    }
 };
 
 }  // namespace sxrig

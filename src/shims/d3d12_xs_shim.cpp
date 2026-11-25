@@ -219,6 +219,10 @@ std::atomic<uint64_t> g_compute_passed_through{0};
 std::atomic<uint64_t> g_compute_rejected{0};
 std::atomic<uint64_t> g_dispatches_translated{0};
 std::atomic<uint64_t> g_dispatches_skipped{0};
+std::atomic<uint64_t> g_last_translate_us{0};
+std::atomic<uint64_t> g_last_host_pipeline_us{0};
+std::atomic<uint64_t> g_last_native_bytes{0};
+std::atomic<uint64_t> g_last_translated_bytes{0};
 
 #if defined(_WIN32)
 // A compute pipeline made from translated native code. The translated shader does not use the
@@ -3434,9 +3438,11 @@ intptr_t SCARLETTX_GDK_CALLBACK ProxyCreateComputePipelineState(
     scarlettx::VictoryShaderInfo shader_info;
     scarlettx::VictoryComputeBinding binding;
     std::vector<uint8_t> translated;
+    const auto translate_start = std::chrono::steady_clock::now();
     const auto outcome = scarlettx::TranslateVictoryCompute(
         static_cast<const uint8_t*>(desc.CS.pShaderBytecode), desc.CS.BytecodeLength, shader_info, binding,
         translated);
+    const auto translate_end = std::chrono::steady_clock::now();
     auto reject = [&](HRESULT code, const std::string& why) {
         g_compute_rejected.fetch_add(1, std::memory_order_relaxed);
         std::cerr << "[ScarlettX][d3d12_xs] CreateComputePipelineState: native shader refused ("
@@ -3498,6 +3504,13 @@ intptr_t SCARLETTX_GDK_CALLBACK ProxyCreateComputePipelineState(
                 g_translated_compute[translated_proxy] = std::move(pipeline);
             }
             g_compute_translated.fetch_add(1, std::memory_order_relaxed);
+            using Us = std::chrono::microseconds;
+            g_last_translate_us.store(
+                static_cast<uint64_t>(std::chrono::duration_cast<Us>(translate_end - translate_start).count()));
+            g_last_host_pipeline_us.store(static_cast<uint64_t>(
+                std::chrono::duration_cast<Us>(std::chrono::steady_clock::now() - translate_end).count()));
+            g_last_native_bytes.store(desc.CS.BytecodeLength);
+            g_last_translated_bytes.store(translated.size());
             std::cerr << "[ScarlettX][d3d12_xs] CreateComputePipelineState: native compute translated, "
                       << desc.CS.BytecodeLength << " -> " << translated.size() << " bytes, user data "
                       << binding.user_data_dwords << " dwords from " << binding.user_data.size()
@@ -4646,6 +4659,10 @@ int32_t D3D12XboxGetShaderTranslationStats(D3D12XBOX_SHADER_TRANSLATION_STATS* o
     out_stats->compute_rejected = g_compute_rejected.load(std::memory_order_relaxed);
     out_stats->dispatches_translated = g_dispatches_translated.load(std::memory_order_relaxed);
     out_stats->dispatches_skipped = g_dispatches_skipped.load(std::memory_order_relaxed);
+    out_stats->last_translate_us = g_last_translate_us.load(std::memory_order_relaxed);
+    out_stats->last_host_pipeline_us = g_last_host_pipeline_us.load(std::memory_order_relaxed);
+    out_stats->last_native_bytes = g_last_native_bytes.load(std::memory_order_relaxed);
+    out_stats->last_translated_bytes = g_last_translated_bytes.load(std::memory_order_relaxed);
     return 0;
 }
 

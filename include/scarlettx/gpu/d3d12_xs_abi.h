@@ -267,6 +267,12 @@ struct D3D12XBOX_SHADER_TRANSLATION_STATS {
     uint64_t compute_rejected;        // native shaders refused, each with a diagnostic
     uint64_t dispatches_translated;   // dispatches that ran a translated pipeline
     uint64_t dispatches_skipped;      // dispatches dropped because a binding was missing
+    // The last compute pipeline created from translated native code: microseconds spent
+    // translating, and building the host root signature and pipeline, and the shader sizes.
+    uint64_t last_translate_us;
+    uint64_t last_host_pipeline_us;
+    uint64_t last_native_bytes;
+    uint64_t last_translated_bytes;
 };
 SCARLETTX_D3D12_API int32_t D3D12XboxGetShaderTranslationStats(D3D12XBOX_SHADER_TRANSLATION_STATS* out_stats);
 SCARLETTX_D3D12_API int32_t D3D12XboxQueryCapabilities(
