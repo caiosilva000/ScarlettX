@@ -577,6 +577,8 @@ def main() -> int:
             for extra in rest:
                 if extra.startswith("draws="):
                     kw["draws"] = int(extra.split("=")[1])
+                if extra.startswith("idle="):  # guest-memory textures that are never written again
+                    kw["idle-guest-textures"] = int(extra.split("=")[1])
             if "windowed" in rest:
                 kw.update({"path": "windowed", "interval-us": args.interval_us})
             cells.append(cell(mode, variant, **kw))

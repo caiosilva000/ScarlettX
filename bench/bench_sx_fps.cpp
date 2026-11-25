@@ -1546,9 +1546,10 @@ int main(int argc, char** argv) {
 
     // ---- results -----------------------------------------------------------------------------
     FILE* csv = a.csv.empty() ? nullptr : std::fopen(a.csv.c_str(), "a");
-    const std::string param = a.mode == "draws" || a.mode == "tdraws" ? "draws=" + std::to_string(a.draws)
-                              : a.mode == "pixel" ? std::to_string(b.rt_w) + "x" + std::to_string(b.rt_h)
-                                                  : std::to_string(a.upload_count) + "x" + std::to_string(a.upload_size);
+    std::string param = a.mode == "draws" || a.mode == "tdraws" ? "draws=" + std::to_string(a.draws)
+                        : a.mode == "pixel" ? std::to_string(b.rt_w) + "x" + std::to_string(b.rt_h)
+                                            : std::to_string(a.upload_count) + "x" + std::to_string(a.upload_size);
+    if (a.idle_guest_textures) param += ";idle=" + std::to_string(a.idle_guest_textures);
     auto metric = [&](const char* name, double value) {
         std::printf("[bench] %s=%.4f\n", name, value);
         if (csv) {
