@@ -33,6 +33,14 @@
 //                     --variant changing-table      a different descriptor before every dispatch
 //                     --variant changing-constants  the root constants before every dispatch
 //                   Every buffer is read back after the last frame and compared with the CPU.
+//   --mode ttex     a translated pixel program that samples a texture through a guest descriptor
+//                   table (the fixture of tests/test_victory_draw_table.cpp): --draws scissored
+//                   4x4 draws per frame. The shim checks the view a table names whenever the
+//                   arguments or any descriptor changed.
+//                     --variant table-same        one table per frame: the check runs once
+//                     --variant table-changing    the table alternates between two views per draw
+//                     --variant descriptor-write  an unrelated descriptor is written before every
+//                                                 draw, which makes the shim check again
 //   --mode pixel    pixel shading: a fixed scene (floor + 24 beacons) at --width x --height.
 //                     --variant light      one integer hash per pixel
 //                     --variant heavy      the same hash followed by --rounds xorshift rounds
@@ -236,6 +244,20 @@ uint32_t TDrawColor(bool changing, bool pair, uint32_t j, uint32_t frame) {
     return 0xFF000000u | ((frame & 0xFFu) << 16) | (k & 0xFFFFu);
 }
 
+// ttex mode: the two 8x8 textures of the fixture, and the colour a draw adds to what it samples.
+uint32_t TTexTexel(uint32_t which, uint32_t i, uint32_t j) {
+    const uint32_t r = which == 0 ? 8 * i + 3 : 200 - 8 * i;
+    const uint32_t g = which == 0 ? 8 * j + 5 : 190 - 8 * j;
+    const uint32_t b = which == 0 ? 0x40u : 0x80u;
+    return r | (g << 8) | (b << 16) | (200u << 24);
+}
+void TTexAdd(uint32_t frame, uint32_t add[4]) {
+    add[0] = frame & 31u;
+    add[1] = (frame >> 5) & 31u;
+    add[2] = 0;
+    add[3] = 0;
+}
+
 // The frame-number markers of the windowed path: squares of w/32 along the bottom edge.
 // 16 bits of the frame number (white = 1), a block that alternates magenta and cyan, then a red
 // and a green block that never change (for whoever decodes a capture).
@@ -431,6 +453,9 @@ struct Bench {
     void* troot = nullptr;           // tdraws: the title's root signature (four root constants)
     void* pso_t_desktop = nullptr;   // tdraws: HLSL pipeline
     void* pso_t_translated = nullptr;  // tdraws: translated native pipeline (null without the bridge)
+    void* xroot = nullptr;             // ttex: four root constants and a table of one shader resource view
+    void* pso_ttex = nullptr;          // ttex: translated vertex and textured pixel programs
+    void* ttex_texture[2] = {};        // ttex: textures A and B; views in descriptors 1 and 2, 3 is spare
     void* croot = nullptr;             // tdispatch: the title's compute root (four constants, a table of one UAV)
     void* pso_compute = nullptr;       // tdispatch: translated native compute pipeline
     std::vector<void*> ubuf;           // tdispatch: one buffer per descriptor
@@ -464,6 +489,7 @@ struct Bench {
     bool Upload() const { return a.mode == "upload"; }
     bool TDraws() const { return a.mode == "tdraws"; }
     bool TDispatch() const { return a.mode == "tdispatch"; }
+    bool TTex() const { return a.mode == "ttex"; }
     uint32_t MarkerSrvSlot() const { return TDispatch() ? a.descriptors : 0; }
     bool TChanging() const { return a.variant.find("changing") != std::string::npos; }
     bool PerCopy() const { return a.variant == "percopy" || a.variant == "reuse"; }
@@ -740,6 +766,47 @@ struct Bench {
             }
             Call(list, kListRSSetScissorRects, uintptr_t{1}, P(&scissor), uintptr_t{0});
         }
+        if (TTex()) {
+            // The title's root signature and the translated pipeline; the colour once per frame;
+            // per draw a scissor rectangle and, by variant, the table or an unrelated descriptor.
+            const uint32_t cols = rt_w / kCell;
+            const uint32_t cells = cols * (rt_h / kCell);
+            const bool per_table = a.variant == "table-changing";
+            const bool per_write = a.variant == "descriptor-write";
+            Call(list, kListSetGraphicsRootSignature, P(xroot), uintptr_t{0}, uintptr_t{0});
+            Call(list, kListSetPipelineState, P(pso_ttex), uintptr_t{0}, uintptr_t{0});
+            uint32_t add[4];
+            TTexAdd(frame, add);
+            const float colour[4] = {static_cast<float>(add[0]) / 255.0f, static_cast<float>(add[1]) / 255.0f, 0.0f, 0.0f};
+            Call(list, kListSetGraphicsRoot32BitConstants, uintptr_t{0}, uintptr_t{4}, P(colour), uintptr_t{0});
+            ++s.constant_sets;
+            Call(list, kListSetGraphicsRootDescriptorTable, uintptr_t{1}, SrvGpu(1), uintptr_t{0});
+            ++s.table_binds;
+            D3D12_SHADER_RESOURCE_VIEW_DESC view{};
+            view.Format = DXGI_FORMAT_R8G8B8A8_UNORM;
+            view.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE2D;
+            view.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
+            view.Texture2D.MipLevels = 1;
+            for (uint32_t j = 0; j < a.draws; ++j) {
+                const uint32_t cell = DrawCell(j, frame, cells);
+                const LONG x = static_cast<LONG>((cell % cols) * kCell), y = static_cast<LONG>((cell / cols) * kCell);
+                const D3D12_RECT r{x, y, x + static_cast<LONG>(kCell), y + static_cast<LONG>(kCell)};
+                Call(list, kListRSSetScissorRects, uintptr_t{1}, P(&r), uintptr_t{0});
+                if (per_table) {
+                    Call(list, kListSetGraphicsRootDescriptorTable, uintptr_t{1}, SrvGpu(1 + (j & 1u)), uintptr_t{0});
+                    ++s.table_binds;
+                }
+                if (per_write) {
+                    // A descriptor no draw uses, written again: any descriptor write makes the shim
+                    // look at the bound table's view once more.
+                    Call(dev, kDevCreateShaderResourceView, P(ttex_texture[0]), P(&view), SrvCpu(3));
+                    ++s.uploads;  // reported as descriptor writes for this mode
+                }
+                Call(list, kListDrawInstanced, uintptr_t{3}, uintptr_t{1}, uintptr_t{0}, uintptr_t{0});
+                ++s.draws;
+            }
+            Call(list, kListRSSetScissorRects, uintptr_t{1}, P(&scissor), uintptr_t{0});
+        }
         if (TDispatch()) {
             // The title's compute root and the translated pipeline, then per dispatch: the table
             // (once per frame, or a different descriptor every time), the constants (once, or
@@ -815,7 +882,7 @@ struct Bench {
                 DrawQuad(list);
                 ++s.draws;
             }
-        } else if (TDraws() || TDispatch()) {
+        } else if (TDraws() || TDispatch() || TTex()) {
             // done above: tdraws with the title's own root signature, tdispatch on the compute side
         } else if (a.mode == "pixel") {
             static std::vector<Rect> scene;
@@ -850,7 +917,7 @@ struct Bench {
             }
         }
         if (a.markers) {
-            if (TDraws() || TDispatch()) {
+            if (TDraws() || TDispatch() || TTex()) {
                 Call(list, kListSetGraphicsRootDescriptorTable, uintptr_t{1}, SrvGpu(MarkerSrvSlot()), uintptr_t{0});
             }
             Call(list, kListSetPipelineState, P(pso_solid), uintptr_t{0}, uintptr_t{0});
@@ -908,7 +975,24 @@ struct Bench {
     // ---- the CPU's picture of a frame --------------------------------------------------------
     void Expected(uint32_t frame, bool probe, std::vector<uint32_t>& img) const {
         img.assign(static_cast<size_t>(rt_w) * rt_h, kClearDword);
-        if (TDispatch()) {
+        if (TTex()) {
+            // The pixel program samples at (x / 64, y / 64) with a clamping point sampler: texel
+            // (min(x / 8, 7), min(y / 8, 7)) of the texture the draw's table names, plus the colour.
+            const uint32_t cols = rt_w / kCell;
+            const uint32_t cells = cols * (rt_h / kCell);
+            const uint32_t shift = ((frame % cells) * 37u) % cells;
+            uint32_t add[4];
+            TTexAdd(frame, add);
+            for (uint32_t y = 0; y < rt_h; ++y) {
+                for (uint32_t x = 0; x < rt_w; ++x) {
+                    const uint32_t cell = (y / kCell) * cols + x / kCell;
+                    const uint32_t j = (cell + cells - shift) % cells;
+                    if (j >= a.draws) continue;
+                    const uint32_t t = TTexTexel(a.variant == "table-changing" ? (j & 1u) : 0u, std::min(x / 8u, 7u), std::min(y / 8u, 7u));
+                    img[static_cast<size_t>(y) * rt_w + x] = t + add[0] + (add[1] << 8);
+                }
+            }
+        } else if (TDispatch()) {
             // nothing is drawn: the target keeps its clear colour, the buffers are checked apart
         } else if (a.mode == "draws") {
             const uint32_t cols = rt_w / kCell;
@@ -1067,6 +1151,7 @@ bool ParseArgs(int argc, char** argv, Args& a) {
     const bool mode_ok =
         (a.mode == "draws" && (a.variant == "fixed" || a.variant == "pertable")) ||
         (a.mode == "pixel" && (a.variant == "light" || a.variant == "heavy")) ||
+        (a.mode == "ttex" && (a.variant == "table-same" || a.variant == "table-changing" || a.variant == "descriptor-write")) ||
         (a.mode == "tdispatch" && (a.variant == "same" || a.variant == "changing-table" || a.variant == "changing-constants")) ||
         (a.mode == "tdraws" && (a.variant == "translated-same" || a.variant == "translated-changing" ||
                                 a.variant == "desktop-same" || a.variant == "desktop-changing")) ||
@@ -1086,7 +1171,7 @@ int main(int argc, char** argv) {
     Args& a = b.a;
     if (!ParseArgs(argc, argv, a)) {
         std::fprintf(stderr,
-                     "usage: bench_sx_fps --mode draws|tdraws|tdispatch|pixel|upload --variant <see the top of bench_sx_fps.cpp>\n"
+                     "usage: bench_sx_fps --mode draws|tdraws|ttex|tdispatch|pixel|upload --variant <see the top of bench_sx_fps.cpp>\n"
                      "  [--path offscreen|serialized|windowed] [--shader-source desktop|translated]\n"
                      "  [--frames N] [--warmup N] [--inflight N] [--check-frames N] [--seed N]\n"
                      "  [--width N --height N] [--draws N] [--textures N] [--rounds N]\n"
@@ -1175,14 +1260,15 @@ int main(int argc, char** argv) {
         b.rt_h = a.height;
     }
     b.rt_pitch = (b.rt_w * 4 + 255u) & ~255u;
-    if ((a.mode == "draws" || a.mode == "tdraws") && a.draws > (b.rt_w / kCell) * (b.rt_h / kCell)) {
+    if ((a.mode == "draws" || a.mode == "tdraws" || a.mode == "ttex") && a.draws > (b.rt_w / kCell) * (b.rt_h / kCell)) {
         std::fprintf(stderr, "bench_sx_fps: --draws %u does not fit %ux%u\n", a.draws, b.rt_w, b.rt_h);
         return 64;
     }
 
     const uint32_t srv_count = a.mode == "draws" ? a.textures * 2
                                : a.mode == "upload" ? a.upload_count
-                               : a.mode == "tdispatch" ? a.descriptors + 1 : 1;
+                               : a.mode == "tdispatch" ? a.descriptors + 1
+                               : a.mode == "ttex" ? 4 : 1;
     D3D12_DESCRIPTOR_HEAP_DESC heap_desc{};
     heap_desc.Type = D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV;
     heap_desc.NumDescriptors = srv_count;
@@ -1332,6 +1418,49 @@ int main(int argc, char** argv) {
         }
     }
 
+    // ---- ttex: root signature and the translated textured pipeline (its textures come later) ---
+    if (a.mode == "ttex") {
+        D3D12_DESCRIPTOR_RANGE xrange{};
+        xrange.RangeType = D3D12_DESCRIPTOR_RANGE_TYPE_SRV;
+        xrange.NumDescriptors = 1;
+        D3D12_ROOT_PARAMETER xparams[2]{};
+        xparams[0].ParameterType = D3D12_ROOT_PARAMETER_TYPE_32BIT_CONSTANTS;
+        xparams[0].Constants.Num32BitValues = 4;
+        xparams[1].ParameterType = D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE;
+        xparams[1].DescriptorTable.NumDescriptorRanges = 1;
+        xparams[1].DescriptorTable.pDescriptorRanges = &xrange;
+        D3D12_ROOT_SIGNATURE_DESC xrs{};
+        xrs.NumParameters = 2;
+        xrs.pParameters = xparams;
+        ID3DBlob* xrs_blob = nullptr;
+        if (FAILED(D3D12SerializeRootSignature(&xrs, D3D_ROOT_SIGNATURE_VERSION_1, &xrs_blob, &rs_err))) {
+            return Fail("D3D12SerializeRootSignature(ttex)", E_FAIL);
+        }
+        hr = Call(b.dev, kDevCreateRootSignature, uintptr_t{0}, P(xrs_blob->GetBufferPointer()),
+                  static_cast<uintptr_t>(xrs_blob->GetBufferSize()), uintptr_t{0}, P(&b.xroot));
+        if (hr != 0 || !b.xroot) return Fail("shim CreateRootSignature, ttex (slot 16)", hr);
+        std::vector<uint8_t> nvs, nps;
+        if (!scarlettx::BuildVictorySyntheticContainer(9, nvs).ok() || !scarlettx::BuildVictorySyntheticContainer(17, nps).ok()) {
+            std::printf("[fps] ttex NOT AVAILABLE: this build has no victory-shader bridge, or no textured pixel fixture\n");
+            return 5;
+        }
+        D3D12_GRAPHICS_PIPELINE_STATE_DESC d{};
+        d.pRootSignature = static_cast<ID3D12RootSignature*>(b.xroot);
+        d.VS = {nvs.data(), nvs.size()};
+        d.PS = {nps.data(), nps.size()};
+        d.BlendState.RenderTarget[0].RenderTargetWriteMask = D3D12_COLOR_WRITE_ENABLE_ALL;
+        d.SampleMask = 0xFFFFFFFFu;
+        d.RasterizerState.FillMode = D3D12_FILL_MODE_SOLID;
+        d.RasterizerState.CullMode = D3D12_CULL_MODE_NONE;
+        d.RasterizerState.DepthClipEnable = TRUE;
+        d.PrimitiveTopologyType = D3D12_PRIMITIVE_TOPOLOGY_TYPE_TRIANGLE;
+        d.NumRenderTargets = 1;
+        d.RTVFormats[0] = DXGI_FORMAT_R8G8B8A8_UNORM;
+        d.SampleDesc.Count = 1;
+        hr = Call(b.dev, kDevCreateGraphicsPipelineState, P(&d), uintptr_t{0}, P(&b.pso_ttex));
+        if (hr != 0 || !b.pso_ttex) return Fail("shim CreateGraphicsPipelineState, translated textured (slot 10)", hr);
+    }
+
     // ---- tdispatch: the compute root, the translated pipeline, a buffer and a UAV per descriptor
     double compute_pso_ms = 0;
     if (a.mode == "tdispatch") {
@@ -1440,7 +1569,7 @@ int main(int argc, char** argv) {
     srv.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE2D;
     srv.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
     srv.Texture2D.MipLevels = 1;
-    if (a.mode == "draws" || a.mode == "pixel" || a.mode == "tdraws" || a.mode == "tdispatch") {
+    if (a.mode == "draws" || a.mode == "pixel" || a.mode == "tdraws" || a.mode == "tdispatch" || a.mode == "ttex") {
         // 16x16 textures filled once: `textures` with equal contents, then as many with contents
         // of their own for the binding probe. Pixel mode binds one and does not sample it.
         const uint32_t count = a.mode == "draws" ? a.textures * 2 : 1;
@@ -1479,6 +1608,42 @@ int main(int argc, char** argv) {
         }
         b.Unmap(staging);
         b.PlumbRun();
+        if (a.mode == "ttex") {
+            // Textures A and B, 8x8, filled through a staging buffer; views in descriptors 1 and 2.
+            const uint32_t tpitch = 256;
+            void* tstaging = b.CreateBuffer(D3D12_HEAP_TYPE_UPLOAD, static_cast<uint64_t>(tpitch) * 8 * 2);
+            uint8_t* tmapped = b.Map(tstaging);
+            b.PlumbBegin();
+            for (uint32_t which = 0; which < 2; ++which) {
+                for (uint32_t j = 0; j < 8; ++j) {
+                    for (uint32_t i = 0; i < 8; ++i) {
+                        const uint32_t v = TTexTexel(which, i, j);
+                        std::memcpy(tmapped + static_cast<size_t>(which) * tpitch * 8 + j * tpitch + i * 4, &v, 4);
+                    }
+                }
+                void* tex = b.CreateTexture(8, 8, false);
+                b.ttex_texture[which] = tex;
+                Call(b.dev, kDevCreateShaderResourceView, P(tex), P(&srv), b.SrvCpu(1 + which));
+                b.Barrier(b.plumb_list, tex, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE, D3D12_RESOURCE_STATE_COPY_DEST);
+                D3D12_TEXTURE_COPY_LOCATION dst{};
+                dst.pResource = static_cast<ID3D12Resource*>(tex);
+                dst.Type = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX;
+                D3D12_TEXTURE_COPY_LOCATION src{};
+                src.pResource = static_cast<ID3D12Resource*>(tstaging);
+                src.Type = D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT;
+                src.PlacedFootprint.Offset = static_cast<uint64_t>(which) * tpitch * 8;
+                src.PlacedFootprint.Footprint.Format = DXGI_FORMAT_R8G8B8A8_UNORM;
+                src.PlacedFootprint.Footprint.Width = 8;
+                src.PlacedFootprint.Footprint.Height = 8;
+                src.PlacedFootprint.Footprint.Depth = 1;
+                src.PlacedFootprint.Footprint.RowPitch = tpitch;
+                Call(b.plumb_list, kListCopyTextureRegion, P(&dst), uintptr_t{0}, uintptr_t{0}, uintptr_t{0}, P(&src), uintptr_t{0});
+                b.Barrier(b.plumb_list, tex, D3D12_RESOURCE_STATE_COPY_DEST, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE);
+            }
+            b.Unmap(tstaging);
+            b.PlumbRun();
+            Call(b.dev, kDevCreateShaderResourceView, P(b.ttex_texture[0]), P(&srv), b.SrvCpu(3));
+        }
     } else {
         const uint32_t sz = a.upload_size;
         b.staging_pitch = (sz * 4 + 255u) & ~255u;
@@ -1729,7 +1894,7 @@ int main(int argc, char** argv) {
 
     // ---- results -----------------------------------------------------------------------------
     FILE* csv = a.csv.empty() ? nullptr : std::fopen(a.csv.c_str(), "a");
-    std::string param = a.mode == "tdispatch" ? "dispatches=" + std::to_string(a.draws) + ";descriptors=" + std::to_string(a.descriptors)
+    std::string param = a.mode == "ttex" ? "draws=" + std::to_string(a.draws) : a.mode == "tdispatch" ? "dispatches=" + std::to_string(a.draws) + ";descriptors=" + std::to_string(a.descriptors)
                         : a.mode == "draws" || a.mode == "tdraws" ? "draws=" + std::to_string(a.draws)
                         : a.mode == "pixel" ? std::to_string(b.rt_w) + "x" + std::to_string(b.rt_h)
                                             : std::to_string(a.upload_count) + "x" + std::to_string(a.upload_size);
@@ -1812,7 +1977,11 @@ int main(int argc, char** argv) {
         metric("exact_dwords", static_cast<double>(dwords_exact));
         metric("translated_pso_create_ms", compute_pso_ms);
     }
-    if (a.mode == "tdraws") {
+    if (a.mode == "ttex") {
+        metric("descriptor_writes_per_frame", static_cast<double>(uploads) / n);
+        metric("cpu_prep_ns_per_draw", prep_total * 1000.0 / static_cast<double>(draws ? draws : 1));
+    }
+    if (a.mode == "tdraws" || a.mode == "ttex") {
         uint64_t csets = 0;
         for (const FrameSample& fs : samples) csets += fs.constant_sets;
         metric("constant_sets_per_frame", static_cast<double>(csets) / n);
