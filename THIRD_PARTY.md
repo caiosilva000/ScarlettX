@@ -3,7 +3,7 @@
 ## Victory shader translator
 
 `third_party/victory` is a pinned Git submodule at
-`940d32f69b22265690a0b5a15d6ded572ba33baf`, sourced from
+`67e8ae1401df112248aed36d0024483181b718b7`, sourced from
 https://github.com/caiosilva000/VIctory.
 
 Its `victory-shader` crate and the `scarlettx-victory-bridge` C ABI around it

@@ -86,3 +86,9 @@ the host reports waves of the console's size.
 
 `test_victory_draw_e2e` (a translated vertex and pixel program, backend path) needs four completed fences and
 16384 of 16384 pixels exact (`victory_draw` block).
+
+`test_victory_draw_guest` is the translated draw on the guest-facing route: console-shaped vertex and pixel
+containers handed to the shim's device object (`CreateGraphicsPipelineState`), drawn through the shim's command
+list. As a GPU check it needs the native pipeline created and counted as translated, four translated draws with
+16384 of 16384 pixels exact, six completed fences, the desktop pass-through control exact, and no failed check
+line (`victory_draw_guest` block).

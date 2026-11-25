@@ -46,7 +46,8 @@ GPU_TESTS = {
     "test_d3d12_list_layout", "test_d3d12_frame_pacing", "test_d3d12_present_window", "test_d3d12_present_frames",
     "test_d3d12_offscreen_probe", "test_d3d12_offscreen_clear", "test_d3d12_offscreen_indexed",
     "test_victory_compute_e2e", "test_victory_compute_guest", "test_d3d12_blend_mrt",
-    "test_victory_compute_conformance", "test_victory_draw_e2e",
+    "test_victory_compute_conformance", "test_victory_draw_e2e", "test_victory_draw_guest",
+    "test_victory_wave64_exchange", "test_victory_quad_edge",
 }
 # Translated compute (tests/test_victory_compute_e2e.cpp): five dispatches of four dwords each.
 VICTORY_COMPUTE_TEST = "test_victory_compute_e2e"
@@ -488,6 +489,95 @@ def check_victory_conformance(stdout: str) -> dict:
     return info
 
 
+def check_victory_wave(stdout: str) -> dict:
+    """The lane exchange test: each case's class, and what the adapter and the shaders say about waves."""
+    caps = re.search(r"\[victory-wave\] adapter wave capability: query=(0x[0-9a-f]+) wave_ops=(\S+) lanes_min=(\d+) "
+                     r"lanes_max=(\d+)", stdout)
+    cases = {}
+    for name, lanes, lo, hi, reports, cls in re.findall(
+            r"\[victory-wave\] case=(\S+) lanes=(\d+) adapter_range=(\d+)\.\.(\d+) host_reports_wave=(\S+) "
+            r"class=(\S+)", stdout):
+        cases[name] = {"class": cls, "lanes": int(lanes), "host_reports_wave": reports == "yes"}
+    for name, exact, total, b_ok, b_total in re.findall(
+            r"\[victory-wave\] case=(\S+) dispatches=\d+ threads_per_group=\d+ dwords exact (\d+)/(\d+) "
+            r"boundary (\d+)/(\d+)", stdout):
+        cases.setdefault(name, {}).update(dwords_exact=int(exact), dwords_total=int(total),
+                                          boundary_exact=int(b_ok), boundary_total=int(b_total))
+    for name, text in re.findall(r"\[victory-wave\] case=(\S+) translated: (.*)", stdout):
+        cases.setdefault(name, {})["translated"] = text
+    for name, verdict in re.findall(
+            r"\[victory-wave\] case=(\S+) wave size out of the adapter's range: (NOT refused|refused) by the shim",
+            stdout):
+        cases.setdefault(name, {})["out_of_range_refused_by_shim"] = verdict == "refused"
+    fences = [(int(s_), int(c), int(w)) for s_, c, w in
+              re.findall(r"\[victory-wave\] fence signaled=(\d+) completed=(\d+) wait_result=(\d+)", stdout)]
+    info = {
+        "shader_path": ("synthetic console-shaped containers -> d3d12_xs CreateComputePipelineState (device object) "
+                        "-> victory-shader bridge -> DXIL -> shim command list dispatch"),
+        "wave_ops": caps.group(2) if caps else None,
+        "wave_lanes_min": int(caps.group(3)) if caps else None,
+        "wave_lanes_max": int(caps.group(4)) if caps else None,
+        "cases": cases,
+        "fences": len(fences),
+        "fences_completed": sum(1 for s_, c, w in fences if c >= s_ >= 1 and w == 0),
+        "final_line": (re.search(r"\[victory-wave\] (PASS|FAIL) \(\d+ failed\)", stdout) or [None])[0],
+    }
+    # Exact or cleanly refused; exact as a real wave wherever the adapter reports that wave size.
+    def acceptable(c):
+        if c.get("class") == "native_exact":
+            return c.get("host_reports_wave") and c.get("dwords_exact") == c.get("dwords_total")
+        if c.get("class") == "emulated_exact":
+            return not c.get("host_reports_wave") and c.get("dwords_exact") == c.get("dwords_total")
+        return (c.get("class") == "unsupported" and not c.get("host_reports_wave")
+                and c.get("out_of_range_refused_by_shim", True))
+    info["requirements_met"] = bool(
+        caps and set(cases) == {"exchange32", "exchange64"} and all(acceptable(c) for c in cases.values())
+        and info["fences_completed"] == info["fences"]
+        and info["final_line"] == "[victory-wave] PASS (0 failed)")
+    return info
+
+
+def check_victory_quad(stdout: str) -> dict:
+    """The quad-read test at triangle edges: coverage, and where translated and desktop differ."""
+    cov = re.search(r"\[victory-quad\] coverage: cpu=(\d+) desktop=(\d+) \(differs at (\d+)\) translated=(\d+) "
+                    r"\(differs at (\d+)\) of (\d+) pixels", stdout)
+    px = re.search(r"\[victory-quad\] pixels: covered=(\d+) edge=(\d+) interior=(\d+); reads of a lane outside the "
+                   r"triangle: (\d+)", stdout)
+    compares = {}
+    for name, pixels, edge, interior, ddx, ddy, diag, first, hw, ht, ow in re.findall(
+            r"\[victory-quad\] (\w+): differing_pixels=(\d+) edge=(\d+) interior=(\d+) values ddx=(\d+) ddy=(\d+) "
+            r"diagonal=(\d+) first=(\d+) helper_reads_wrong=(\d+)/(\d+) other_reads_wrong=(\d+)", stdout):
+        compares[name] = {"differing_pixels": int(pixels), "edge": int(edge), "interior": int(interior),
+                          "values": {"ddx": int(ddx), "ddy": int(ddy), "diagonal": int(diag), "first": int(first)},
+                          "helper_reads_wrong": int(hw), "helper_reads": int(ht), "other_reads_wrong": int(ow)}
+    fences = [(int(s_), int(c), int(w)) for s_, c, w in
+              re.findall(r"\[victory-quad\] \w+ fence signaled=(\d+) completed=(\d+) wait_result=(\d+)", stdout)]
+    adapter = re.search(r"\[victory-quad\] adapter=(.*?) vendor=", stdout)
+    info = {
+        "shader_path": ("synthetic console-shaped vertex and pixel containers -> victory-shader bridge -> DXIL -> "
+                        "host D3D12 draw; reference: HLSL through D3DCompile"),
+        "adapter": adapter.group(1) if adapter else None,
+        "covered_cpu": int(cov.group(1)) if cov else None,
+        "coverage_differs_desktop": int(cov.group(3)) if cov else None,
+        "coverage_differs_translated": int(cov.group(5)) if cov else None,
+        "edge_pixels": int(px.group(2)) if px else None,
+        "interior_pixels": int(px.group(3)) if px else None,
+        "helper_reads": int(px.group(4)) if px else None,
+        "compares": compares,
+        "fences": len(fences),
+        "fences_completed": sum(1 for s_, c, w in fences if c >= s_ >= 1 and w == 0),
+        "final_line": (re.search(r"\[victory-quad\] (PASS|FAIL) \(edge pixels differing: \d+ of \d+\)", stdout)
+                       or [None])[0],
+    }
+    td = compares.get("translated_vs_desktop", {})
+    info["requirements_met"] = bool(
+        cov and px and info["coverage_differs_desktop"] == 0 and info["coverage_differs_translated"] == 0
+        and info["edge_pixels"] and info["helper_reads"] and td and td["differing_pixels"] == 0
+        and info["fences"] == 2 and info["fences_completed"] == 2
+        and (info["final_line"] or "").startswith("[victory-quad] PASS"))
+    return info
+
+
 def check_victory_draw(stdout: str) -> dict:
     """The requirements of the translated draw test: four draws, every pixel exact."""
     fences = [(int(s_), int(c), int(w)) for s_, c, w in
@@ -509,6 +599,44 @@ def check_victory_draw(stdout: str) -> dict:
         info["first_failing_api"] = {"api": failed.group(1), "hresult": failed.group(2)}
     info["requirements_met"] = bool(pixels and info["fences"] == 4 and info["fences_completed"] == 4
                                     and info["pixels_exact"] == info["pixels_total"] == 16384)
+    return info
+
+
+def check_victory_draw_guest(stdout: str) -> dict:
+    """The requirements of the guest-route draw test: the native pipeline created and counted as
+    translated, four translated draws with every pixel exact, six completed fences (four draws,
+    the dropped control draw and the desktop control), and no failed check."""
+    fences = [(int(s_), int(c), int(w)) for s_, c, w in
+              re.findall(r"\[victory-draw-guest\] fence signaled=(\d+) completed=(\d+) wait_result=(\d+)", stdout)]
+    pixels = re.search(r"\[victory-draw-guest\] pixels exact (\d+)/(\d+), translated draws=\+(\d+)", stdout)
+    created = re.search(r"\[victory-draw-guest\] shim CreateGraphicsPipelineState\(native containers\) hr=(0x[0-9a-f]+) "
+                        r"translated=\+(\d+)", stdout)
+    desktop = re.search(r"\[victory-draw-guest\] desktop control: drawn half exact (\d+)/(\d+), untouched half exact "
+                        r"(\d+)/(\d+)", stdout)
+    failed = re.search(r"\[victory-draw-guest\] FAILED api=(.*?) hr=(0x[0-9a-f]+)", stdout)
+    info = {
+        "shader_path": ("synthetic console-shaped vertex and pixel containers -> d3d12_xs CreateGraphicsPipelineState "
+                        "(device object) -> victory-shader bridge -> DXIL -> shim command list draw"),
+        "native_pipeline_hresult": created.group(1) if created else None,
+        "pipelines_translated": int(created.group(2)) if created else None,
+        "fences": len(fences),
+        "fences_completed": sum(1 for s_, c, w in fences if c >= s_ >= 1 and w == 0),
+        "pixels_exact": int(pixels.group(1)) if pixels else None,
+        "pixels_total": int(pixels.group(2)) if pixels else None,
+        "translated_draws": int(pixels.group(3)) if pixels else None,
+        "desktop_control_exact": (int(desktop.group(1)) + int(desktop.group(3))) if desktop else None,
+        "checks_ok": len(re.findall(r"\[victory-draw-guest\] ok: ", stdout)),
+        "checks_failed": len(re.findall(r"\[victory-draw-guest\] CHECK FAILED: ", stdout)),
+        "final_line": (re.search(r"\[victory-draw-guest\] (PASS|FAIL) \(\d+ failed checks\)", stdout) or [None])[0],
+    }
+    if failed:
+        info["first_failing_api"] = {"api": failed.group(1), "hresult": failed.group(2)}
+    info["requirements_met"] = bool(
+        created and pixels and info["native_pipeline_hresult"] == "0x00000000" and info["pipelines_translated"] == 1
+        and info["fences"] == 6 and info["fences_completed"] == 6
+        and info["pixels_exact"] == info["pixels_total"] == 16384 and info["translated_draws"] == 4
+        and info["desktop_control_exact"] == 4096 and info["checks_failed"] == 0
+        and info["final_line"] == "[victory-draw-guest] PASS (0 failed checks)")
     return info
 
 
@@ -681,6 +809,24 @@ def cmd_regress(args) -> int:
                 verdicts = ", ".join(f"{n} {c.get('verdict')}" for n, c in probe["cases"].items())
                 note = (f"{verdicts}; adapter waves {probe['wave_lanes_min']}..{probe['wave_lanes_max']}"
                         + (f"; SKIPPED: {', '.join(probe['skipped'])}" if probe["skipped"] else ""))
+        if name == "test_victory_quad_edge":
+            probe = check_victory_quad(r["stdout"])
+            details["victory_quad"] = probe
+            td = probe["compares"].get("translated_vs_desktop")
+            if status == PASS and not probe["requirements_met"]:
+                status, note = FAIL, "exit 0 but a quad-read requirement was not met"
+            elif td:
+                note = (f"translated vs desktop: {td['edge']} of {probe['edge_pixels']} edge pixels and "
+                        f"{td['interior']} of {probe['interior_pixels']} interior pixels differ; "
+                        f"{td['helper_reads_wrong']} of {td['helper_reads']} reads of a lane outside the triangle wrong")
+        if name == "test_victory_wave64_exchange":
+            probe = check_victory_wave(r["stdout"])
+            details["victory_wave"] = probe
+            classes = ", ".join(f"{n} {c.get('class')}" for n, c in probe["cases"].items())
+            if status == PASS and not probe["requirements_met"]:
+                status, note = FAIL, "exit 0 but a lane exchange requirement was not met"
+            elif classes:
+                note = f"{classes}; adapter waves {probe['wave_lanes_min']}..{probe['wave_lanes_max']}"
         if name == "test_victory_draw_e2e":
             probe = check_victory_draw(r["stdout"])
             details["victory_draw"] = probe
@@ -689,6 +835,14 @@ def cmd_regress(args) -> int:
             elif status == PASS:
                 note = (f"{probe['pixels_exact']}/{probe['pixels_total']} pixels exact, fences "
                         f"{probe['fences_completed']}/{probe['fences']}, adapter {probe['adapter']}")
+        if name == "test_victory_draw_guest":
+            probe = check_victory_draw_guest(r["stdout"])
+            details["victory_draw_guest"] = probe
+            if status == PASS and not probe["requirements_met"]:
+                status, note = FAIL, "exit 0 but a guest-route draw requirement was not met"
+            elif status == PASS:
+                note = (f"{probe['pixels_exact']}/{probe['pixels_total']} pixels exact through the shim, fences "
+                        f"{probe['fences_completed']}/{probe['fences']}, {probe['checks_ok']} checks")
         # The hash of what ran, so a result can be tied to one artifact.
         details["exe_sha256"] = hashlib.sha256(exe.read_bytes()).hexdigest()
         add(name, category, status, note=note, **details)

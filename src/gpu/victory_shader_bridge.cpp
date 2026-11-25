@@ -55,6 +55,8 @@ int32_t sx_victory_synthetic_draw_salted(uint32_t, SxVictoryByteBuffer*, SxVicto
                                          SxVictoryByteBuffer*, SxVictoryComputeBinding*, SxVictoryShaderInfo*);
 int32_t sx_victory_shader_translate_compute(const uint8_t*, size_t, SxVictoryByteBuffer*, SxVictoryComputeBinding*,
                                             SxVictoryShaderInfo*);
+int32_t sx_victory_shader_translate_stage(const uint8_t*, size_t, uint32_t, SxVictoryByteBuffer*,
+                                          SxVictoryComputeBinding*, SxVictoryShaderInfo*);
 }
 
 void ConvertBinding(const SxVictoryComputeBinding& binding, scarlettx::VictoryComputeBinding& out) {
@@ -243,6 +245,68 @@ VictoryComputeOutcome TranslateVictoryCompute(const uint8_t* data, size_t size, 
 #endif
 }
 
+VictoryComputeOutcome TranslateVictoryStage(const uint8_t* data, size_t size, VictoryStage stage,
+                                            VictoryShaderInfo& out_info, VictoryComputeBinding& out_binding,
+                                            std::vector<uint8_t>& out_dxil) {
+    out_info = VictoryShaderInfo{};
+    out_binding = VictoryComputeBinding{};
+    out_dxil.clear();
+#if !defined(SCARLETTX_VICTORY_SHADER_BRIDGE)
+    (void)data;
+    (void)size;
+    (void)stage;
+    return VictoryComputeOutcome::Unavailable;
+#else
+    if (!data || size == 0) return VictoryComputeOutcome::Desktop;
+    SxVictoryShaderInfo raw{};
+    SxVictoryByteBuffer buffer{};
+    SxVictoryComputeBinding binding{};
+    const int32_t result =
+        sx_victory_shader_translate_stage(data, size, static_cast<uint32_t>(stage), &buffer, &binding, &raw);
+    out_info = Convert(raw);
+    switch (result) {
+        case 0:
+            out_dxil.assign(buffer.data, buffer.data + buffer.size);
+            sx_victory_buffer_free(&buffer);
+            ConvertBinding(binding, out_binding);
+            return VictoryComputeOutcome::Translated;
+        case 1: return VictoryComputeOutcome::Desktop;
+        case 2: return VictoryComputeOutcome::NoNativeCompute;
+        case 3: return VictoryComputeOutcome::Malformed;
+        default: return VictoryComputeOutcome::Refused;
+    }
+#endif
+}
+
+bool VictoryGraphicsBindingSupported(const VictoryComputeBinding& binding, std::string& why) {
+    why.clear();
+    if (binding.user_data_dwords > 32) {
+        // Two stages share a 64-dword root signature.
+        why = "user data of " + std::to_string(binding.user_data_dwords) + " dwords does not fit a stage's root constants";
+    } else if (binding.root_cbv_count) {
+        why = "root constant buffers are not bound yet";
+    } else if (binding.root_srv_count || binding.root_uav_count) {
+        why = "root buffer views are not bound yet";
+    } else if (binding.sampler_count || binding.static_sampler_count) {
+        why = "samplers are not bound yet";
+    } else if (binding.flags) {
+        why = "the shader needs title-memory or heap tables (flags " + std::to_string(binding.flags) + ")";
+    } else {
+        for (const auto& u : binding.user_data) {
+            if (u.index >= binding.user_data_dwords) {
+                why = "a user-data entry lies outside the user data";
+            } else if (u.root == 1) {
+                why = "descriptor tables are not mapped for graphics pipelines yet (root parameter " +
+                      std::to_string(u.slot) + ")";
+            } else if (u.root != 0) {
+                why = "user data from root type " + std::to_string(u.root) + " (only root constants are mapped)";
+            }
+            if (!why.empty()) break;
+        }
+    }
+    return why.empty();
+}
+
 bool VictoryComputeBindingSupported(const VictoryComputeBinding& binding, std::string& why) {
     why.clear();
     // A root signature holds 64 dwords; the user data is its only parameter here.
@@ -288,6 +352,51 @@ Status BuildVictoryVectorKernelContainer(uint32_t k, std::vector<uint8_t>& out_b
     sx_victory_buffer_free(&buffer);
     return Status::Ok();
 #endif
+}
+
+bool DxilExpectedWaveLanes(const uint8_t* data, size_t size, uint32_t& out_min, uint32_t& out_max) noexcept {
+    // A DXBC container: magic, 16 bytes of hash, version, total size, part count, part offsets.
+    // Each part: four characters, its size, its data. PSV0's data starts with the size of the
+    // runtime info, whose dwords 4 and 5 are the two lane counts.
+    auto read32 = [&](size_t at, uint32_t& value) {
+        if (!data || at > size || size - at < 4) return false;
+        std::memcpy(&value, data + at, 4);
+        return true;
+    };
+    if (!data || size < 32 || std::memcmp(data, "DXBC", 4) != 0) return false;
+    uint32_t parts = 0;
+    if (!read32(28, parts) || parts > 256) return false;
+    for (uint32_t i = 0; i < parts; ++i) {
+        uint32_t at = 0;
+        uint32_t part_size = 0;
+        if (!read32(32 + 4 * static_cast<size_t>(i), at) || !read32(static_cast<size_t>(at) + 4, part_size)) return false;
+        if (at > size || size - at < 8 || std::memcmp(data + at, "PSV0", 4) != 0) continue;
+        const size_t body = static_cast<size_t>(at) + 8;
+        uint32_t info_size = 0;
+        if (part_size < 4 || part_size > size - body || !read32(body, info_size)) return false;
+        if (info_size < 24 || info_size > part_size - 4) return false;
+        return read32(body + 4 + 16, out_min) && read32(body + 4 + 20, out_max);
+    }
+    return false;
+}
+
+bool WaveLanesSupported(uint32_t expected_min, uint32_t expected_max, bool adapter_wave_ops, uint32_t adapter_min,
+                        uint32_t adapter_max, std::string& why) {
+    why.clear();
+    if (expected_min == 0 && expected_max == 0xFFFFFFFFu) return true;
+    const std::string wants = expected_min == expected_max
+                                  ? "waves of " + std::to_string(expected_min) + " lanes"
+                                  : "waves of " + std::to_string(expected_min) + " to " + std::to_string(expected_max) + " lanes";
+    if (!adapter_wave_ops) {
+        why = "the shader needs " + wants + "; the adapter has no wave operations";
+        return false;
+    }
+    if (expected_min > adapter_max || expected_max < adapter_min) {
+        why = "the shader needs " + wants + "; the adapter runs waves of " + std::to_string(adapter_min) + " to " +
+              std::to_string(adapter_max);
+        return false;
+    }
+    return true;
 }
 
 Status BuildVictorySyntheticContainer(uint32_t variant, std::vector<uint8_t>& out_bytes) {

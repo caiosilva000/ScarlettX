@@ -86,14 +86,44 @@ VictoryComputeOutcome TranslateVictoryCompute(const uint8_t* data, size_t size, 
                                               VictoryComputeBinding& out_binding,
                                               std::vector<uint8_t>& out_dxil);
 
+// The same for one stage of a graphics pipeline. NoNativeCompute then means the container is
+// console-shaped but carries no native program of that stage.
+enum class VictoryStage : uint32_t { Vertex = 0, Pixel = 1, Compute = 2 };
+VictoryComputeOutcome TranslateVictoryStage(const uint8_t* data, size_t size, VictoryStage stage,
+                                            VictoryShaderInfo& out_info, VictoryComputeBinding& out_binding,
+                                            std::vector<uint8_t>& out_dxil);
+
+// Whether the first graphics route can bind this stage: its user data fed from the title's root
+// constants only. `why` names the first thing it cannot do.
+bool VictoryGraphicsBindingSupported(const VictoryComputeBinding& binding, std::string& why);
+
 // Whether the first host route can bind this shader: user data as root constants at b0 fed from
 // the title's root constants and descriptor tables, views taken from the title's heap by index.
 // `why` names the first thing it cannot do.
 bool VictoryComputeBindingSupported(const VictoryComputeBinding& binding, std::string& why);
 
+// The wave lane range a DXIL container says it expects: MinimumExpectedWaveLaneCount and
+// MaximumExpectedWaveLaneCount of the runtime info in its PSV0 part. A shader that does not depend
+// on the wave size says 0 and 0xFFFFFFFF. False when the container has no readable PSV0 part.
+bool DxilExpectedWaveLanes(const uint8_t* data, size_t size, uint32_t& out_min, uint32_t& out_max) noexcept;
+
+// Whether an adapter that runs waves of adapter_min to adapter_max lanes can run a shader that
+// expects expected_min to expected_max, as D3D12 specifies for a declared wave size. `why` says
+// what is missing. A shader without a requirement (0 to 0xFFFFFFFF) runs anywhere.
+bool WaveLanesSupported(uint32_t expected_min, uint32_t expected_max, bool adapter_wave_ops, uint32_t adapter_min,
+                        uint32_t adapter_max, std::string& why);
+
 // Test fixtures: console-shaped containers written by the bridge, no title data.
 //   0 the synthetic compute fixture   1 the same, native stream cut short (malformed)
 //   2 console index without native code   3 a native program the translator refuses
+//   4 to 7 the compute conformance programs
+//   9 the draw fixture's vertex program   10 its pixel program, each with its signature parts
+//   11 the vertex program, native stream cut short   12 a pixel program that also stores to a
+//   descriptor table's UAV (bindings beyond root constants)
+//   13 a lane exchange in a wave of 32 (ds_bpermute_b32: the wave reversed, the halves
+//   exchanged)   14 the same in a wave of 64
+//   15 the quad-read fixture's vertex program (a triangle with three diagonal edges)
+//   16 its pixel program (derivatives and quad reads of a computed value, by DPP quad_perm)
 Status BuildVictorySyntheticContainer(uint32_t variant, std::vector<uint8_t>& out_bytes);
 
 // An integer kernel over a vector, for comparing host backends on the same numbers, as a

@@ -275,6 +275,15 @@ struct D3D12XBOX_SHADER_TRANSLATION_STATS {
     uint64_t last_translated_bytes;
 };
 SCARLETTX_D3D12_API int32_t D3D12XboxGetShaderTranslationStats(D3D12XBOX_SHADER_TRANSLATION_STATS* out_stats);
+// The same for graphics pipelines and draws.
+struct D3D12XBOX_GRAPHICS_TRANSLATION_STATS {
+    uint64_t graphics_translated;      // pipelines created from translated native vertex and pixel code
+    uint64_t graphics_passed_through;  // pipelines whose shaders went to the host as they were
+    uint64_t graphics_rejected;        // native shaders refused, each with a diagnostic
+    uint64_t draws_translated;         // draws that ran a translated pipeline
+    uint64_t draws_skipped;            // draws dropped because a binding was missing
+};
+SCARLETTX_D3D12_API int32_t D3D12XboxGetGraphicsTranslationStats(D3D12XBOX_GRAPHICS_TRANSLATION_STATS* out_stats);
 SCARLETTX_D3D12_API int32_t D3D12XboxQueryCapabilities(
     uint64_t device_handle,
     D3D12XBOX_CAPABILITIES* out_caps);
