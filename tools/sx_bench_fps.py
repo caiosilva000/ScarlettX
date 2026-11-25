@@ -441,7 +441,7 @@ def main() -> int:
     ap.add_argument("--interval-us", type=int, default=16667)
     ap.add_argument("--modes", nargs="+", default=["draws", "pixel", "upload"], choices=["draws", "pixel", "upload"])
     ap.add_argument("--ab-cells", nargs="+", default=["upload:guestmem", "upload:batched-reuse", "draws:fixed", "pixel:heavy"],
-                    help="suite ab: mode:variant cells to run on both builds")
+                    help="suite ab: mode:variant cells to run on both builds; add :windowed for the windowed path")
     ap.add_argument("--timeout", type=int, default=240)
     ap.add_argument("--busy-wait", type=int, default=600, help="seconds to wait for other builds or tests to finish")
     ap.add_argument("--winlist", default=str(Path.home() / "m4-feasibility/winlist"),
@@ -549,8 +549,10 @@ def main() -> int:
     else:
         cells = []
         for spec in args.ab_cells:
-            mode, variant = spec.split(":")
+            mode, variant, *rest = spec.split(":")
             kw = {"draws": 4000} if mode == "draws" else (size(args.resolutions[-1]) if mode == "pixel" else {})
+            if rest and rest[0] == "windowed":
+                kw.update({"path": "windowed", "interval-us": args.interval_us})
             cells.append(cell(mode, variant, **kw))
         flip = False
         for _ in range(args.repetitions):
@@ -571,15 +573,15 @@ def main() -> int:
             if int(r["launch"]) not in ok or "discard" in r["series"]:
                 continue
             side = r["series"].split("-", 1)[0]
-            per.setdefault((r["mode"], r["variant"], r["param"], r["metric"]), {"A": [], "B": []})[side].append(float(r["value"]))
+            per.setdefault((r["mode"], r["variant"], r["path"], r["param"], r["metric"]), {"A": [], "B": []})[side].append(float(r["value"]))
         ab = []
-        for (mode, variant, param, metric), v in sorted(per.items()):
+        for (mode, variant, path, param, metric), v in sorted(per.items()):
             k = min(len(v["A"]), len(v["B"]))
             if k == 0 or metric not in KEY_METRICS:
                 continue
             diffs = [v["B"][i] - v["A"][i] for i in range(k)]
             ma = statistics.median(v["A"])
-            ab.append({"mode": mode, "variant": variant, "param": param, "metric": metric, "pairs": k,
+            ab.append({"mode": mode, "variant": variant, "path": path, "param": param, "metric": metric, "pairs": k,
                        "median_A": ma, "median_B": statistics.median(v["B"]),
                        "min_A": min(v["A"]), "max_A": max(v["A"]), "min_B": min(v["B"]), "max_B": max(v["B"]),
                        "median_paired_difference": statistics.median(diffs),
