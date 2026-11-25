@@ -1793,6 +1793,8 @@ int main(int argc, char** argv) {
     D3D12XBOX_TRANSLATED_DRAW_BIND_STATS bind0{}, bind1{};
     D3D12XBOX_GRAPHICS_TRANSLATION_STATS gfx0{}, gfx1{};
     D3D12XboxGetTranslatedDrawBindStats(&bind0);
+    D3D12XBOX_TRANSLATED_VIEW_CHECK_STATS views0{}, views1{};
+    D3D12XboxGetTranslatedViewCheckStats(&views0);
     D3D12XboxGetGraphicsTranslationStats(&gfx0);
     const unsigned long long loop_unix_us = UnixMicros();
     const int64_t loop_start = Ticks();
@@ -1804,6 +1806,7 @@ int main(int argc, char** argv) {
     b.WaitFor(b.fence_value);  // drain
     const int64_t loop_end = Ticks();
     D3D12XboxGetTranslatedDrawBindStats(&bind1);
+    D3D12XboxGetTranslatedViewCheckStats(&views1);
     D3D12XboxGetGraphicsTranslationStats(&gfx1);
     D3D12XboxGetTranslatedDispatchBindStats(&cbind1);
     D3D12XboxGetShaderTranslationStats(&cst1);
@@ -1993,6 +1996,10 @@ int main(int argc, char** argv) {
         metric("title_arguments_replayed_per_frame",
                static_cast<double>(bind1.title_arguments_replayed - bind0.title_arguments_replayed) / n);
         metric("translated_pso_create_ms", translated_pso_ms);
+        // How often the shim looked at the descriptors the draws' tables name.
+        metric("bindings_built_per_frame", static_cast<double>(views1.bindings_built - views0.bindings_built) / n);
+        metric("views_validated_per_frame", static_cast<double>(views1.views_validated - views0.views_validated) / n);
+        metric("slot_rechecks_per_frame", static_cast<double>(views1.slot_rechecks - views0.slot_rechecks) / n);
     }
     metric("submissions_per_frame", static_cast<double>(submissions) / n);
     metric("uploads_per_frame", static_cast<double>(uploads) / n);
