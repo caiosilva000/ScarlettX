@@ -8,8 +8,15 @@
 #include <cstdint>
 #include <cstdio>
 #include <cstring>
+#include <cstddef>
+#include <cstdlib>
 #include <memory>
+#include <string>
 #include <vector>
+
+#if defined(_WIN32)
+#include <windows.h>
+#endif
 
 namespace xg = scarlettx::gpu::xg;
 
@@ -280,6 +287,155 @@ void TestComputer() {
     SX_REQUIRE(Slot<RefFn>(linear, 1)(linear) == 0);
 }
 
+// ---------------------------------------------------------------------------------------------
+// Parity with a reference xg_xs.dll, and what ScarlettX reports for mip tails.
+//
+// The descriptions are generated here: a mip chain that crosses into the packed tail, arrays of
+// several slices with a mip tail, and single-mip controls. For each, the layout ScarlettX reports
+// is printed (tail boundary, and per mip its mode, offset and the two per-mip fields a title
+// reads), and every subresource is written with its own pattern, checked for overlap with every
+// other, and read back.
+//
+// With SCARLETTX_XG_REFERENCE_DLL set to a reference library (Microsoft's offline PC xg_xs.dll,
+// which is not in this repository and must stay local), the same descriptions are given to it
+// through the same exported entry and vtable slot a title uses, and the two layouts are compared
+// dword by dword, mismatches listed by field. Without it the external comparison is BLOCKED and
+// says so; nothing is assumed about what the reference would answer.
+struct ParityCase {
+    const char* name;
+    XG_TEXTURE2D_DESC desc;
+};
+
+std::vector<ParityCase> ParityCases() {
+    return {
+        {"single-mip control 256x256 RGBA8", Desc(256, 256, 1, kRgba8)},
+        {"single-mip control 700x284 RGBA8", Desc(700, 284, 1, kRgba8)},
+        {"mip chain into the tail 256x256x9 RGBA8", Desc(256, 256, 9, kRgba8)},
+        {"mip chain into the tail 100x60x7 RGBA8", Desc(100, 60, 7, kRgba8)},
+        {"mip chain into the tail 256x256x9 BC1", Desc(256, 256, 9, kBc1)},
+        {"array of 2 with a mip tail 256x256x9 RGBA8", Desc(256, 256, 9, kRgba8, 2)},
+        {"array of 3 with a mip tail 64x64x7 BC3", Desc(64, 64, 7, kBc3, 3)},
+        {"array of 4 with a mip tail 128x128x8 RGBA8", Desc(128, 128, 8, kRgba8, 4)},
+    };
+}
+
+// What a field at `offset` of XG_RESOURCE_LAYOUT is, for the mismatch table.
+std::string FieldName(size_t offset) {
+    char text[96];
+    const size_t plane0 = offsetof(XG_RESOURCE_LAYOUT, Plane);
+    const size_t mips0 = plane0 + offsetof(XG_PLANE_LAYOUT, MipLayout);
+    if (offset < plane0) {
+        static const char* const kHead[] = {"SizeBytes", "SizeBytes+4", "BaseAlignmentBytes", "BaseAlignmentBytes+4", "MipLevels", "Planes"};
+        return offset / 4 < 6 ? kHead[offset / 4] : "resource header";
+    }
+    if (offset >= sizeof(XG_PLANE_LAYOUT) + plane0) {
+        std::snprintf(text, sizeof(text), "beyond plane 0 (+0x%zx)", offset);
+        return text;
+    }
+    if (offset < mips0) {
+        std::snprintf(text, sizeof(text), "plane 0 +0x%02zx%s", offset - plane0,
+                      offset - plane0 == offsetof(XG_PLANE_LAYOUT, Reserved2C) ? " (first tail mip)"
+                      : offset - plane0 == offsetof(XG_PLANE_LAYOUT, Reserved30) ? " (tail mips)" : "");
+        return text;
+    }
+    const size_t mip = (offset - mips0) / sizeof(XG_MIPLEVEL_LAYOUT);
+    const size_t in = (offset - mips0) % sizeof(XG_MIPLEVEL_LAYOUT);
+    const char* what = in == 0x00 ? "SizeBytes" : in == 0x08 ? "OffsetBytes" : in == 0x10 ? "Slice2DSizeBytes"
+                       : in == 0x18 ? "PitchPixels" : in == 0x1C ? "PitchBytes" : in == 0x20 ? "AlignmentBytes"
+                       : in == 0x24 ? "PaddedWidthElements" : in == 0x28 ? "PaddedHeightElements"
+                       : in == 0x30 ? "WidthElements" : in == 0x34 ? "HeightElements"
+                       : in == 0x48 ? "SwizzleMode" : in == 0x60 ? "Reserved60" : in == 0x64 ? "Reserved64 (in tail)" : "";
+    std::snprintf(text, sizeof(text), "mip %zu +0x%02zx %s", mip, in, what);
+    return text;
+}
+
+void TestParity() {
+    using CreateFn = int32_t (SCARLETTX_XG_CALL*)(const XG_TEXTURE2D_DESC*, void**);
+    using LayoutFn = int32_t (SCARLETTX_XG_CALL*)(void*, void*);
+    using RefFn = uint32_t (SCARLETTX_XG_CALL*)(void*);
+    CreateFn reference = nullptr;
+#if defined(_WIN32)
+    const char* path = std::getenv("SCARLETTX_XG_REFERENCE_DLL");
+    if (path && path[0]) {
+        const HMODULE module = LoadLibraryExA(path, nullptr, LOAD_WITH_ALTERED_SEARCH_PATH);
+        if (!module) {
+            std::printf("[xg-parity] external parity: BLOCKED (LoadLibrary failed for the reference library, error %lu)\n", GetLastError());
+        } else {
+            reference = reinterpret_cast<CreateFn>(reinterpret_cast<void*>(GetProcAddress(module, "XGCreateTexture2DComputer")));
+            WIN32_FILE_ATTRIBUTE_DATA info{};
+            GetFileAttributesExA(path, GetFileExInfoStandard, &info);
+            std::printf("[xg-parity] reference library: %s, %lu bytes%s (record its version and SHA-256 beside this log)\n", path,
+                        info.nFileSizeLow, reference ? "" : ", but it has no XGCreateTexture2DComputer");
+            if (!reference) std::printf("[xg-parity] external parity: BLOCKED (the library does not export the entry)\n");
+        }
+    } else {
+        std::printf("[xg-parity] external parity: BLOCKED (no reference library; set SCARLETTX_XG_REFERENCE_DLL to a local one)\n");
+    }
+#else
+    std::printf("[xg-parity] external parity: BLOCKED (not a Windows build)\n");
+#endif
+
+    uint32_t mismatches = 0;
+    uint32_t compared = 0;
+    for (const ParityCase& c : ParityCases()) {
+        auto ours = std::make_unique<XG_RESOURCE_LAYOUT>();
+        void* computer = nullptr;
+        SX_REQUIRE(XGCreateTexture2DComputer(&c.desc, &computer) == 0 && computer);
+        std::memset(ours.get(), 0, sizeof(*ours));
+        SX_REQUIRE(Slot<LayoutFn>(computer, 2)(computer, ours.get()) == 0);
+        Slot<RefFn>(computer, 1)(computer);
+        const XG_PLANE_LAYOUT& p = ours->Plane[0];
+        std::printf("[xg-parity] case \"%s\": size 0x%llx, mips %u, slices %u, slice stride 0x%llx, first tail mip %u, tail mips %u\n",
+                    c.name, static_cast<unsigned long long>(ours->SizeBytes), ours->MipLevels, c.desc.ArraySize,
+                    static_cast<unsigned long long>(p.Reserved10), p.Reserved2C, p.Reserved30);
+        for (uint32_t m = 0; m < ours->MipLevels; ++m) {
+            const XG_MIPLEVEL_LAYOUT& mip = p.MipLayout[m];
+            std::printf("[xg-parity]   mip %u: mode %u offset 0x%llx size 0x%llx padded %ux%u in_tail %u reserved60 %u\n", m,
+                        mip.SwizzleMode, static_cast<unsigned long long>(mip.OffsetBytes),
+                        static_cast<unsigned long long>(mip.SizeBytes), mip.PaddedWidthElements, mip.PaddedHeightElements,
+                        mip.Reserved64, mip.Reserved60);
+        }
+        // Every subresource written with its own pattern, none overlapping another, all read back.
+        RoundTrip(c.desc);
+        std::printf("[xg-parity]   round trip: %u subresources written, checked for overlap and read back exactly\n",
+                    ours->MipLevels * c.desc.ArraySize);
+        if (!reference) continue;
+        // The reference may write past our structure (records we do not model): give it room.
+        std::vector<uint8_t> theirs(0x4000, 0);
+        void* ref_computer = nullptr;
+        if (reference(&c.desc, &ref_computer) != 0 || !ref_computer) {
+            std::printf("[xg-parity]   reference refused this description\n");
+            ++mismatches;
+            continue;
+        }
+        Slot<LayoutFn>(ref_computer, 2)(ref_computer, theirs.data());
+        Slot<RefFn>(ref_computer, 1)(ref_computer);
+        ++compared;
+        const size_t used = offsetof(XG_RESOURCE_LAYOUT, Plane) + offsetof(XG_PLANE_LAYOUT, MipLayout) +
+                            ours->MipLevels * sizeof(XG_MIPLEVEL_LAYOUT);
+        uint32_t here = 0;
+        for (size_t at = 0; at + 4 <= used; at += 4) {
+            uint32_t a = 0, b = 0;
+            std::memcpy(&a, reinterpret_cast<const uint8_t*>(ours.get()) + at, 4);
+            std::memcpy(&b, theirs.data() + at, 4);
+            if (a == b) continue;
+            ++here;
+            std::printf("[xg-parity]   MISMATCH +0x%04zx %-40s scarlettx 0x%08x reference 0x%08x\n", at, FieldName(at).c_str(), a, b);
+        }
+        // What the reference wrote beyond the records ScarlettX models (tiling records live there).
+        size_t beyond = 0;
+        for (size_t at = sizeof(XG_RESOURCE_LAYOUT); at < theirs.size(); ++at) beyond += theirs[at] != 0;
+        std::printf("[xg-parity]   compared %zu bytes: %u mismatching dwords; reference wrote %zu non-zero bytes beyond ScarlettX's structure\n",
+                    used, here, beyond);
+        mismatches += here;
+    }
+    if (reference) {
+        std::printf("[xg-parity] external parity: %s (%u descriptions compared, %u mismatching dwords)\n",
+                    mismatches == 0 ? "PASS" : "FAIL", compared, mismatches);
+        SX_REQUIRE(mismatches == 0);
+    }
+}
+
 }  // namespace
 
 int main() {
@@ -287,6 +443,7 @@ int main() {
     TestMipChain();
     TestRoundTrip();
     TestComputer();
+    TestParity();
     std::printf("test_xg_layout: OK\n");
     return 0;
 }
