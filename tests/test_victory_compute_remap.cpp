@@ -321,10 +321,44 @@ int main() {
     r.Expect(a, "6 A: the other program, new table and constants", 9, k1);
     r.Expect(c, "6 C: first program again, same table", 9, k0);
 
+    // 7. one list, two descriptor heaps: a dispatch through the first heap's slot 0 (C), then
+    //    SetDescriptorHeaps with a second heap whose slot 0 views A, the table from that heap,
+    //    and the same program again. The second dispatch must write A, not C: the index is the
+    //    same, the heap is not.
+    {
+        D3D12_DESCRIPTOR_HEAP_DESC hd2{};
+        hd2.Type = D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV;
+        hd2.NumDescriptors = 4;
+        hd2.Flags = D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE;
+        void* heap2 = nullptr;
+        SX_REQUIRE(Call(r.device, 14, P(&hd2), uintptr_t{0}, P(&heap2)) == 0 && heap2);
+        const uintptr_t cpu2 = static_cast<uintptr_t>(Call(heap2, 9));
+        const uintptr_t gpu2 = static_cast<uintptr_t>(Call(heap2, 10));
+        D3D12_UNORDERED_ACCESS_VIEW_DESC view{};
+        view.Format = DXGI_FORMAT_R32_TYPELESS;
+        view.ViewDimension = D3D12_UAV_DIMENSION_BUFFER;
+        view.Buffer.NumElements = kDwords;
+        view.Buffer.Flags = D3D12_BUFFER_UAV_FLAG_RAW;
+        Call(r.device, 19, P(a), uintptr_t{0}, P(&view), cpu2);  // heap 2, slot 0 -> A
+
+        void* list = r.NewList(0);                               // heap 1 bound; slot 0 -> C
+        r.Table(list, 0);
+        r.Constants(list, 10);
+        r.Dispatch(list);                                        // C <- 10
+        void* heaps[] = {heap2};
+        Call(list, 32, uintptr_t{1}, P(heaps), uintptr_t{0});    // SetDescriptorHeaps(heap 2)
+        Call(list, 35, uintptr_t{1}, gpu2, uintptr_t{0});        // the table: heap 2, slot 0
+        r.Constants(list, 11);
+        r.Dispatch(list);                                        // A <- 11
+        r.Wait(r.Submit(list));
+    }
+    r.Expect(a, "7 A: through the second heap's slot 0", 11, k0);
+    r.Expect(c, "7 C: only the dispatch before the heap changed", 10, k0);
+
     SX_REQUIRE(D3D12XboxGetShaderTranslationStats(&st) == 0);
-    std::printf("[remap] translated dispatches %llu (want 11), skipped %llu (want 0)\n",
+    std::printf("[remap] translated dispatches %llu (want 13), skipped %llu (want 0)\n",
                 static_cast<unsigned long long>(st.dispatches_translated), static_cast<unsigned long long>(st.dispatches_skipped));
-    if (st.dispatches_translated != 11 || st.dispatches_skipped != 0) ++r.failures;
+    if (st.dispatches_translated != 13 || st.dispatches_skipped != 0) ++r.failures;
     if (r.failures) {
         std::printf("test_victory_compute_remap: FAIL\n");
         return 1;
