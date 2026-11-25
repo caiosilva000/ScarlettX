@@ -36,6 +36,10 @@ tools/sx_regress.py boot-diag --build <build> --package <package dir> --out <dir
   title, about once a second, and adds two stages from those captures: `guest_window_visible` and
   `guest_window_content` (at least 1% of the client area differs from the most common colour). A boot that
   times out says which of the three it saw: content, a blank window, or no window.
+- A boot whose log shows the guest crashing (`Unhandled page fault` or `Unhandled exception`, recorded as
+  `first_guest_fault`) is FAIL whatever else happened, including a window that showed content for the whole
+  `--until-window` period. A crash after the runner has already ended the boot is not seen. What the title writes
+  on its own screen is not read, so a title that draws an error message still passes the window check.
 - `--allow-pc-target` passes the emulator's flag of the same name, for GDK packages built for PC
   (`TargetDeviceFamily="PC"`, for example Microsoft's desktop GDK samples). Such a title draws through the
   desktop `d3d12.dll`, not the `d3d12_xs` shim, so it logs no frames and `--frames` never ends it.

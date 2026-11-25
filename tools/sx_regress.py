@@ -592,6 +592,10 @@ def analyse_presentation(stdout: str, cap: WindowCapture, pdir: Path) -> dict:
     (pdir / "capture-report.json").write_text(json.dumps(report, indent=1))
     return report
 
+# A crash of the guest itself, as the host reports it. Narrower than CRASH_RE on purpose: a
+# failed check inside a test or an unimplemented import is diagnosis, this decides the verdict.
+GUEST_FAULT_RE = re.compile(r"Unhandled page fault[^\n]*|Unhandled exception[^\n]*")
+
 
 # --------------------------------------------------------------------------------------------
 # boot-diag
@@ -673,7 +677,8 @@ def cmd_boot_diag(args) -> int:
         out.mkdir(parents=True, exist_ok=True)
         (out / "boot-diag.json").write_text(json.dumps(diag, indent=1))
         print(json.dumps({k: diag.get(k) for k in ("status", "reason", "last_stage", "first_missing_import",
-                                                    "first_failing_graphics_call", "first_error", "frame_captures",
+                                                    "first_failing_graphics_call", "first_error", "first_guest_fault",
+                                                    "frame_captures",
                                                     "package_unchanged")}, indent=1))
         print(f"-> {out / 'boot-diag.json'}")
         return 0 if status == PASS else 1
@@ -834,6 +839,7 @@ def cmd_boot_diag(args) -> int:
         diag["first_missing_import"] = {"import": static_stubs[0]["import"], "how": "left as a stub at map time, not called"}
     diag["first_failing_graphics_call"] = first_match(GRAPHICS_FAIL_RE, all_err, all_out)
     diag["first_error"] = first_match(re.compile(CRASH_RE.pattern + "|" + LOADER_ERR_RE.pattern), all_err, all_out)
+    diag["first_guest_fault"] = first_match(GUEST_FAULT_RE, all_err, all_out)
 
     # Frames: what the shim dumped, what the emulator was asked to dump, and window captures.
     frames = sorted(str(p) for p in (out / "frames").glob("*") if p.is_file())
@@ -865,6 +871,17 @@ def cmd_boot_diag(args) -> int:
     if not boot:
         return finish(FAIL, "inspection failed: " + str(diag["first_error"]))
     gw = diag.get("guest_window")
+    fault = diag["first_guest_fault"]
+    if fault:
+        # A picture on screen does not make a crashed guest a pass.
+        if gw and gw["content_seconds"] is not None:
+            seen = f"its window '{gw['title']}' had shown rendered content for {gw['content_seconds']} s"
+        else:
+            seen = "no rendered window was seen"
+        how = ("the runner then ended the boot" if boot.get("stopped_by_runner") else
+               "the boot then timed out" if boot["timed_out"] else f"the boot then exited with {boot['exit_code']}")
+        return finish(FAIL, f"the guest crashed ({fault.strip()[:160]}); {seen}; {how} "
+                            f"(last stage: {diag['last_stage']})")
     if boot.get("stopped_by_runner"):
         return finish(PASS, f"guest window '{gw['title']}' showed rendered content for {gw['content_seconds']} s; "
                             f"the runner ended the boot (--until-window {args.until_window:g})")
