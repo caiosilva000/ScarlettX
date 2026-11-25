@@ -96,4 +96,11 @@ bool VictoryComputeBindingSupported(const VictoryComputeBinding& binding, std::s
 //   2 console index without native code   3 a native program the translator refuses
 Status BuildVictorySyntheticContainer(uint32_t variant, std::vector<uint8_t>& out_bytes);
 
+// An integer kernel over a vector, for comparing host backends on the same numbers, as a
+// console-shaped container. 32 threads per group; element i = 32 * group.x + lane:
+//   x = i + c0;  x ^= x << 13;  x ^= x >> 17;  x ^= x << 5;  out[i] = (x + c1) ^ k
+// c0 and c1 are its first two root constants, `out` the raw UAV of its table, and `k` a literal
+// in the code, so each k is a different shader with a known result.
+Status BuildVictoryVectorKernelContainer(uint32_t k, std::vector<uint8_t>& out_bytes);
+
 }  // namespace scarlettx

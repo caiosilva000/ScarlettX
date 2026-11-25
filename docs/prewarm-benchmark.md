@@ -59,3 +59,24 @@ The driver records the cache directories' size before and after each series, the
 libraries the first launch has mapped.
 
 Correctness is required in every launch: completed fences, exact dwords or pixels, exit 0.
+
+## Host-backend comparison (`tools/sx_bench_backends.py`)
+
+One integer kernel on two host backends on the same Mac, same numbers:
+
+```text
+element i:  x = i + c0;  x ^= x << 13;  x ^= x >> 17;  x ^= x << 5;  out[i] = (x + c1) ^ k
+```
+
+- `crossover`: `bench_victory_prewarm --workload vector`, the kernel as a synthetic GFX10 container, translated by
+  the bridge to DXIL and dispatched by `D3D12Backend` under CrossOver.
+- `metal`: `bench/metal_vector_kernel.swift`, the kernel written in Metal Shading Language on the native Metal
+  device. Nothing is translated.
+
+Both use 32 threads per group and N / 32 groups, check every element against their own CPU version, and print a
+hash of the output for fixed constants. The driver computes that hash a third time in Python and requires all
+three to agree. It reports the cold path (front end or translation, pipeline creation, first dispatch) and the
+warm dispatch (each dispatch submitted and waited for) separately.
+
+This compares host backends. It is not a measure of RDNA2 translation coverage, and the two programs are not the
+same code. `k` is a literal in the shader, so the `unseen` series gives both backends a shader new to their caches.

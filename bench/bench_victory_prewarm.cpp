@@ -7,6 +7,9 @@
 //                         D3D12Backend probe session (backend path, not the shim's guest route)
 //   --workload draw       translated draw: synthetic GFX10 vertex + pixel programs -> bridge ->
 //                         DXIL -> D3D12Backend probe session (backend path)
+//   --workload vector     an integer kernel over --elements dwords (salt = its literal k), for
+//                         comparing host backends on the same numbers: cold path, warm dispatch
+//                         and a hash of the output for fixed constants
 //   --workload control    graphics control without translation: the existing offscreen indexed
 //                         draw (HLSL -> d3dcompiler, pipeline built inside every call)
 //
@@ -81,6 +84,7 @@ struct Args {
     uint32_t salt = 0;
     uint32_t launch = 0;
     uint32_t hold_ms = 0;
+    uint32_t elements = 1u << 20;
 };
 
 struct Recorder {
@@ -325,6 +329,131 @@ int RunTranslated(const Args& args, scarlettx::D3D12Backend& backend, Recorder& 
     return 0;
 }
 
+// The vector kernel, for comparing host backends on the same numbers (see
+// BuildVictoryVectorKernelContainer): element i gets (xorshift(i + c0) + c1) ^ k. One launch
+// measures the cold path (translate, build the pipeline, first dispatch) and then the warm
+// dispatch, and prints a hash of the output for fixed constants so another backend's output can
+// be compared with it.
+uint32_t VectorKernel(uint32_t i, uint32_t c0, uint32_t c1, uint32_t k) {
+    uint32_t x = i + c0;
+    x ^= x << 13;
+    x ^= x >> 17;
+    x ^= x << 5;
+    return (x + c1) ^ k;
+}
+
+int RunVector(const Args& args, scarlettx::D3D12Backend& backend, Recorder& rec, double init_ms) {
+    const uint32_t n = args.elements;
+    const uint32_t k = args.salt;
+    LARGE_INTEGER start = Now();
+    std::vector<uint8_t> container;
+    scarlettx::VictoryShaderInfo info;
+    scarlettx::VictoryComputeBinding binding;
+    std::vector<uint8_t> dxil;
+    const bool built = scarlettx::BuildVictoryVectorKernelContainer(k, container).ok();
+    const auto outcome = built ? scarlettx::TranslateVictoryCompute(container.data(), container.size(), info, binding, dxil)
+                               : scarlettx::VictoryComputeOutcome::Unavailable;
+    const double translate_ms = MsBetween(start, Now());
+    std::string why;
+    if (outcome != scarlettx::VictoryComputeOutcome::Translated ||
+        !scarlettx::VictoryComputeBindingSupported(binding, why)) {
+        std::printf("[bench] translate FAILED: %s %s %s\n", scarlettx::VictoryComputeOutcomeName(outcome),
+                    info.message.c_str(), why.c_str());
+        return 4;
+    }
+    rec.shader_hash = Fnv(dxil);
+    std::printf("[bench] shader bytes=%zu fnv=%016llx elements=%u k=%u groups=%u threads_per_group=%u\n", dxil.size(),
+                static_cast<unsigned long long>(rec.shader_hash), n, k, n / 32, binding.threads[0]);
+
+    scarlettx::ComputeProbeDesc desc;
+    desc.shader = dxil.data();
+    desc.shader_size = dxil.size();
+    desc.root_constants.assign(binding.user_data_dwords, 0);
+    desc.uav_dwords = n;
+    desc.uav_fill = kSentinel;
+    desc.groups[0] = n / 32;
+    scarlettx::OffscreenProbeReport report;
+    scarlettx::ProbePrepareTiming prepare;
+    uint32_t session = 0;
+    auto st = backend.PrepareComputeProbe(desc, session, report, &prepare);
+    if (!st.ok()) return Fail("prepare", st, report);
+
+    auto constants = [&](uint32_t c0, uint32_t c1) {
+        std::vector<uint32_t> user_data(binding.user_data_dwords, 0);
+        for (const auto& u : binding.user_data) {
+            if (u.root == 0 && u.dword == 0) user_data[u.index] = c0;
+            if (u.root == 0 && u.dword == 1) user_data[u.index] = c1;
+        }
+        return user_data;
+    };
+    uint64_t exact = 0;
+    uint64_t total = 0;
+    std::vector<uint32_t> out;
+    auto validate = [&](const char* when, uint32_t c0, uint32_t c1) -> int {
+        scarlettx::OffscreenProbeReport read;
+        const auto rs = backend.ReadComputeProbe(session, out, read);
+        if (!rs.ok()) return Fail("read-back", rs, read);
+        uint32_t ok = 0;
+        for (uint32_t i = 0; i < n; ++i) ok += out[i] == VectorKernel(i, c0, c1, k);
+        std::printf("[bench] validate %s: dwords exact %u/%u\n", when, ok, n);
+        exact += ok;
+        total += n;
+        return ok == n ? 0 : 1;
+    };
+
+    // Cold: the first dispatch, with everything it needed.
+    scarlettx::ProbeSubmitTiming first;
+    st = backend.SubmitProbeWork(session, constants(1, 2), report, &first);
+    if (!st.ok()) return Fail("first submission", st, report);
+    const double first_ms = first.record_ms + first.submit_to_fence_ms;
+    rec.Metric("backend_init_ms", init_ms);
+    rec.Metric("elements", static_cast<double>(n));
+    rec.Metric("translate_ms", translate_ms);
+    rec.Metric("pipeline_create_ms", prepare.root_signature_ms + prepare.pipeline_ms);
+    rec.Metric("resources_ms", prepare.resources_ms);
+    rec.Metric("first_submission_ms", first_ms);
+    rec.Metric("cold_compile_ms", translate_ms + prepare.root_signature_ms + prepare.pipeline_ms + first_ms);
+    if (const int rc = validate("first dispatch", 1, 2)) return rc;
+
+    // Warm: dispatches with the pipeline in place, each waited for; nothing read back inside.
+    std::vector<double> warm;
+    uint32_t c0 = 0;
+    uint32_t c1 = 0;
+    for (uint32_t i = 0; i < args.iterations; ++i) {
+        c0 = 0x1000u + i * 7919u;
+        c1 = 0xABCD0000u ^ i;
+        scarlettx::ProbeSubmitTiming t;
+        st = backend.SubmitProbeWork(session, constants(c0, c1), report, &t);
+        if (!st.ok()) return Fail("warm submission", st, report);
+        if (report.fence_completed < report.fence_signaled || report.wait_result != 0) return 2;
+        warm.push_back(t.record_ms + t.submit_to_fence_ms);
+        rec.Sample(i, t);
+    }
+    if (const int rc = validate("after the warm loop", c0, c1)) return rc;
+    rec.Metric("warm_iterations", static_cast<double>(warm.size()));
+    rec.Metric("warm_dispatch_median_ms", Percentile(warm, 0.5));
+    rec.Metric("warm_dispatch_p95_ms", Percentile(warm, 0.95));
+    rec.Metric("warm_dispatch_min_ms", Percentile(warm, 0.0));
+
+    // The output for fixed constants, hashed, to set beside another backend's.
+    st = backend.SubmitProbeWork(session, constants(0x12345678u, 0x9E3779B9u), report, nullptr);
+    if (!st.ok()) return Fail("canonical submission", st, report);
+    if (const int rc = validate("canonical constants", 0x12345678u, 0x9E3779B9u)) return rc;
+    uint64_t h = 14695981039346656037ull;
+    for (uint32_t v : out) {
+        for (int b = 0; b < 4; ++b) {
+            h ^= (v >> (8 * b)) & 0xFF;
+            h *= 1099511628211ull;
+        }
+    }
+    std::printf("[bench] canonical_output_fnv=%016llx first=%08x last=%08x\n", static_cast<unsigned long long>(h), out[0],
+                out[n - 1]);
+    rec.Metric("validated_exact", static_cast<double>(exact));
+    rec.Metric("validated_total", static_cast<double>(total));
+    backend.ReleaseProbe(session);
+    return 0;
+}
+
 // The untranslated control: the existing indexed-draw probe, which compiles its HLSL and builds
 // its pipeline inside every call.
 int RunControl(const Args& args, scarlettx::D3D12Backend& backend, Recorder& rec, double init_ms) {
@@ -381,6 +510,7 @@ int main(int argc, char** argv) {
         else if (a == "--iterations") args.iterations = static_cast<uint32_t>(std::strtoul(next().c_str(), nullptr, 10));
         else if (a == "--salt") args.salt = static_cast<uint32_t>(std::strtoul(next().c_str(), nullptr, 10));
         else if (a == "--launch") args.launch = static_cast<uint32_t>(std::strtoul(next().c_str(), nullptr, 10));
+        else if (a == "--elements") args.elements = static_cast<uint32_t>(std::strtoul(next().c_str(), nullptr, 10));
         else if (a == "--hold-ms") args.hold_ms = static_cast<uint32_t>(std::strtoul(next().c_str(), nullptr, 10));
         else {
             std::fprintf(stderr, "bench_victory_prewarm: unknown argument %s\n", a.c_str());
@@ -390,15 +520,21 @@ int main(int argc, char** argv) {
     const bool translated = args.workload == "compute" || args.workload == "draw";
     const bool known_condition = args.condition == "cold" || args.condition == "prewarmed" ||
                                  args.condition == "primed" || args.condition == "steady";
-    if ((!translated && args.workload != "control") || !known_condition || args.iterations == 0) {
-        std::fprintf(stderr, "usage: bench_victory_prewarm --workload compute|draw|control --condition "
+    const bool vector = args.workload == "vector";
+    if (vector && (args.elements == 0 || args.elements % 32 != 0)) {
+        std::fprintf(stderr, "bench_victory_prewarm: --elements must be a positive multiple of 32\n");
+        return 64;
+    }
+    if ((!translated && !vector && args.workload != "control") || !known_condition || args.iterations == 0) {
+        std::fprintf(stderr, "usage: bench_victory_prewarm --workload compute|draw|control|vector --condition "
                              "cold|prewarmed|primed|steady [--iterations N] [--salt S] [--launch N] [--series NAME] "
-                             "[--csv FILE] [--samples FILE] [--hold-ms MS]\n");
+                             "[--csv FILE] [--samples FILE] [--hold-ms MS] [--elements N]\n");
         return 64;
     }
     const char* shader_path =
         args.workload == "compute" ? "translated compute: GFX10 -> victory-shader bridge -> DXIL -> D3D12Backend (backend path)"
         : args.workload == "draw" ? "translated draw: GFX10 VS+PS -> victory-shader bridge -> DXIL -> D3D12Backend (backend path)"
+        : vector ? "vector kernel: GFX10 container -> victory-shader bridge -> DXIL -> D3D12Backend (backend path)"
                                   : "control: HLSL -> d3dcompiler -> D3D12Backend indexed draw, pipeline built per call";
     Recorder rec{args, shader_path};
     if (!args.csv.empty()) rec.csv = std::fopen(args.csv.c_str(), "a");
@@ -419,7 +555,8 @@ int main(int argc, char** argv) {
     std::printf("[bench] backend=D3D12 adapter=\"%s\" vendor=0x%04x device=0x%04x warp=%s\n", adapter.description.c_str(),
                 adapter.vendor_id, adapter.device_id, adapter.is_warp ? "yes" : "no");
 
-    const int rc = translated ? RunTranslated(args, backend, rec, init_ms) : RunControl(args, backend, rec, init_ms);
+    const int rc = translated ? RunTranslated(args, backend, rec, init_ms)
+                   : vector ? RunVector(args, backend, rec, init_ms) : RunControl(args, backend, rec, init_ms);
     if (rec.csv) std::fclose(rec.csv);
     if (rec.samples) std::fclose(rec.samples);
     std::printf("[bench] %s\n", rc == 0 ? "PASS" : "FAIL");

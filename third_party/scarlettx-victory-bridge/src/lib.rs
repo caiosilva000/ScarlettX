@@ -1098,6 +1098,59 @@ pub unsafe extern "C" fn sx_victory_synthetic_draw_salted(
     0
 }
 
+const V_LSHRREV_B32: u8 = 0x16;
+
+/// An integer kernel over a vector, for comparing host backends on the same
+/// numbers. Element i (group x times 32 plus the lane; 32 threads per group):
+///
+/// ```text
+/// x = i + c0;  x ^= x << 13;  x ^= x >> 17;  x ^= x << 5;  out[i] = (x + c1) ^ k
+/// ```
+///
+/// c0 and c1 are root constants; `k` is a literal in the code (0 leaves the
+/// last step out), so each `k` is a different shader with a known result.
+fn synthetic_vector_kernel_program(k: u32) -> NativeProgram {
+    let mut w = vec![s_mov_b32(5, 0x80)];
+    w.extend_from_slice(&s_load_dwordx4(8, 4));
+    w.push(vop1(V_MOV_B32, 5, 6)); // v5 = group x
+    w.push(vop2(V_LSHLREV_B32, 5, int(5), 5)); // v5 *= 32
+    w.push(vop2(V_ADD_NC_U32, 5, vgpr(5), 0)); // v5 = i
+    w.push(vop2(V_LSHLREV_B32, 16, int(2), 5)); // v16 = 4 i
+    w.push(vop2(V_ADD_NC_U32, 1, 0, 5)); // x = c0 + i
+    w.push(vop2(V_LSHLREV_B32, 2, int(13), 1));
+    w.push(vop2(V_XOR_B32, 1, vgpr(1), 2)); // x ^= x << 13
+    w.push(vop2(V_LSHRREV_B32, 2, int(17), 1));
+    w.push(vop2(V_XOR_B32, 1, vgpr(1), 2)); // x ^= x >> 17
+    w.push(vop2(V_LSHLREV_B32, 2, int(5), 1));
+    w.push(vop2(V_XOR_B32, 1, vgpr(1), 2)); // x ^= x << 5
+    w.push(vop2(V_ADD_NC_U32, 1, 1, 1)); // x += c1
+    if k != 0 {
+        w.push(vop2(V_XOR_B32, 1, 255, 1)); // x ^= k
+        w.push(k);
+    }
+    w.extend_from_slice(&buffer_store_dword_at(1, 16, 8));
+    w.push(S_ENDPGM);
+    // Six user SGPRs, then the group id x in s6 (TGID_X_EN).
+    constants_and_table(6, 1 << 7, [32, 1, 1], false, &w)
+}
+
+/// The vector kernel ([`synthetic_vector_kernel_program`]) as a console-shaped
+/// container. Returns 0, or -1 for a null argument. Release `out` with
+/// `sx_victory_buffer_free`.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn sx_victory_synthetic_vector_container(k: u32, out: *mut SxVictoryByteBuffer) -> i32 {
+    if out.is_null() {
+        return -1;
+    }
+    // SAFETY: the C++ caller passes a live, exclusive object.
+    let output = unsafe { &mut *out };
+    hand_over(
+        output,
+        console_container(&[(KIND_NATIVE, xbch(&fssm_compute(&synthetic_vector_kernel_program(k))))]),
+    );
+    0
+}
+
 /// The synthetic containers the tests use. 0: the compute fixture. 1: the same
 /// with its native stream cut short (malformed). 2: a console-shaped container
 /// whose index lists no native code (missing). 3: a compute program that reads
@@ -1324,6 +1377,25 @@ mod tests {
         assert_ne!(ps1.dxil, ps2.dxil);
         assert_eq!(vs1.dxil, vs2.dxil, "the salt is in the pixel program only");
         assert_eq!(ps0.user_data, ps1.user_data);
+    }
+
+    #[test]
+    fn the_vector_kernel_translates_and_its_literal_changes_the_shader() {
+        let translate = |k: u32| {
+            let bytes = console_container(&[(KIND_NATIVE, xbch(&fssm_compute(&synthetic_vector_kernel_program(k))))]);
+            match translate_compute_container(&bytes) {
+                ComputeInput::Translated(shader, threads) => {
+                    assert_eq!(threads, [32, 1, 1]);
+                    assert_eq!(shader.user_data_dwords(), 8, "{:?}", shader.user_data);
+                    shader.dxil
+                }
+                ComputeInput::Refused(text) => panic!("refused: {text}"),
+                _ => panic!("not translated"),
+            }
+        };
+        let (plain, a, b) = (translate(0), translate(0x1357_9BDF), translate(0x1357_9BE0));
+        assert_ne!(plain, a);
+        assert_ne!(a, b);
     }
 
     #[test]
