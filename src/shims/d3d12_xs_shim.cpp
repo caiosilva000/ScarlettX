@@ -1,5 +1,6 @@
 #define SCARLETTX_BUILDING_D3D12_XS 1
 #include "scarlettx/gpu/d3d12_xs_abi.h"
+#include "scarlettx/gpu/blend_normalize.h"
 
 #include <algorithm>
 #include <array>
@@ -208,6 +209,9 @@ bool TraceEnabled() {
     }();
     return enabled;
 }
+
+// Graphics pipelines created with blending switched off for an unblendable render target.
+std::atomic<uint64_t> g_blend_adjusted_pipelines{0};
 
 bool RealTitleMode() {
     const char* v = std::getenv("SCARLETTX_REAL_TITLE");
@@ -3242,6 +3246,16 @@ intptr_t SCARLETTX_GDK_CALLBACK ProxyCreateGraphicsPipelineState(
         desc.pRootSignature = reinterpret_cast<ID3D12RootSignature*>(
             reinterpret_cast<XboxD3D12SimpleObjectProxy*>(desc.pRootSignature)->pc_obj);
     }
+    // The console leaves blending out for formats that cannot blend (integer targets); host
+    // D3D12 refuses the whole pipeline. Take it off those targets, keep it on the others.
+    const auto blend_fix = scarlettx::NormalizeBlendForDevice(obj->pc_device, desc);
+    if (blend_fix.changed()) {
+        g_blend_adjusted_pipelines.fetch_add(1, std::memory_order_relaxed);
+        std::cerr << "[ScarlettX][d3d12_xs] CreateGraphicsPipelineState: blending off for render targets the "
+                     "host cannot blend into, mask=0x"
+                  << std::hex << blend_fix.disabled_mask << std::dec
+                  << (blend_fix.expanded ? " (shared blend state split per target)" : "") << "\n";
+    }
     ID3D12PipelineState* pc_pso = nullptr;
     const HRESULT hr = obj->pc_device->CreateGraphicsPipelineState(&desc, IID_PPV_ARGS(&pc_pso));
     if (TraceEnabled()) {
@@ -4406,6 +4420,34 @@ int32_t D3D12XboxDestroyDevice(uint64_t device_handle) {
     }
     g_devices.erase(it);
     return 0;
+}
+
+uint64_t D3D12XboxBlendAdjustedPipelineCount(void) {
+    return g_blend_adjusted_pipelines.load(std::memory_order_relaxed);
+}
+
+int32_t D3D12XboxGetNativeObject(void* shim_object, void** out_native_object) {
+    if (!shim_object || !out_native_object) {
+        return -1;
+    }
+    *out_native_object = nullptr;
+#if defined(_WIN32)
+    const void* vtbl = *reinterpret_cast<const void* const*>(shim_object);
+    IUnknown* native = nullptr;
+    if (vtbl == kXboxDeviceProxyVtbl.data()) {
+        native = static_cast<XboxD3D12DeviceProxy*>(shim_object)->pc_device;
+    } else if (vtbl == kXboxSimpleObjProxyVtbl.data()) {
+        native = static_cast<XboxD3D12SimpleObjectProxy*>(shim_object)->pc_obj;
+    }
+    if (!native) {
+        return -2;
+    }
+    native->AddRef();
+    *out_native_object = native;
+    return 0;
+#else
+    return -2;
+#endif
 }
 
 int32_t D3D12XboxGetNativeDevice(uint64_t device_handle, void** out_id3d12_device) {
