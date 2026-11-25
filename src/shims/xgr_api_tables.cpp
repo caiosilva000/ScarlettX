@@ -260,6 +260,24 @@ XGameResult SCARLETTX_GDK_CALLBACK UserGetGamertag(void* self, XUserHandle user,
     return UserGetGamertagComponent(self, user, 0, size, gamertag, used);
 }
 
+XGameResult SCARLETTX_GDK_CALLBACK UserGetGamerPictureAsync(void*, XUserHandle user, uint32_t size, XAsyncBlock* async) {
+    const XGameResult hr = XUserGetGamerPictureAsync(user, static_cast<XUserGamerPictureSize>(size), async);
+    if (Trace()) {
+        std::fprintf(stderr, "[ScarlettX][xgameruntime] XUserGetGamerPictureAsync(size=%u, async=%p) -> 0x%08X\n",
+                     static_cast<unsigned>(size), static_cast<void*>(async), static_cast<unsigned>(hr));
+    }
+    return hr;
+}
+
+XGameResult SCARLETTX_GDK_CALLBACK UserGetGamerPictureResultSize(void*, XAsyncBlock* async, size_t* size) {
+    return XUserGetGamerPictureResultSize(async, size);
+}
+
+XGameResult SCARLETTX_GDK_CALLBACK UserGetGamerPictureResult(void*, XAsyncBlock* async, size_t size, void* buffer,
+                                                             size_t* used) {
+    return XUserGetGamerPictureResult(async, size, buffer, used);
+}
+
 XGameResult SCARLETTX_GDK_CALLBACK UserGetAgeGroup(void*, XUserHandle user, XUserAgeGroup* age_group) {
     return XUserGetAgeGroup(user, age_group);
 }
@@ -306,6 +324,9 @@ std::array<Slot, kUserSlots> MakeUserVtbl(std::index_sequence<I...>) {
     vtbl[13] = reinterpret_cast<Slot>(&UserGetIsGuest);
     vtbl[14] = reinterpret_cast<Slot>(&UserGetState);
     vtbl[15] = reinterpret_cast<Slot>(&UserGetGamertag);
+    vtbl[16] = reinterpret_cast<Slot>(&UserGetGamerPictureAsync);
+    vtbl[17] = reinterpret_cast<Slot>(&UserGetGamerPictureResultSize);
+    vtbl[18] = reinterpret_cast<Slot>(&UserGetGamerPictureResult);
     vtbl[19] = reinterpret_cast<Slot>(&UserGetAgeGroup);
     vtbl[20] = reinterpret_cast<Slot>(&UserCheckPrivilege);
     vtbl[33] = reinterpret_cast<Slot>(&UserRegisterForChangeEvent);

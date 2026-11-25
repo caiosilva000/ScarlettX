@@ -286,6 +286,13 @@ enum XUserGamertagComponent : uint32_t {
     XUserGamertagComponent_UniqueModern = 3,
 };
 
+enum XUserGamerPictureSize : uint32_t {
+    XUserGamerPictureSize_Small = 0,       // 64 x 64
+    XUserGamerPictureSize_Medium = 1,      // 208 x 208
+    XUserGamerPictureSize_Large = 2,       // 424 x 424
+    XUserGamerPictureSize_ExtraLarge = 3,  // 1080 x 1080
+};
+
 enum XUserState : uint32_t {
     XUserState_SignedIn = 0,
     XUserState_SigningOut = 1,
@@ -348,6 +355,18 @@ SCARLETTX_XGR_API XGameResult XUserGetGamertag(
     size_t gamertagSize,
     char* gamertag,
     size_t* gamertagUsed);
+// The picture is a PNG file. There is no profile service behind this shim, so
+// every user gets the same generated placeholder at the requested size.
+SCARLETTX_XGR_API XGameResult XUserGetGamerPictureAsync(
+    XUserHandle user,
+    XUserGamerPictureSize pictureSize,
+    XAsyncBlock* async);
+SCARLETTX_XGR_API XGameResult XUserGetGamerPictureResultSize(XAsyncBlock* async, size_t* bufferSize);
+SCARLETTX_XGR_API XGameResult XUserGetGamerPictureResult(
+    XAsyncBlock* async,
+    size_t bufferSize,
+    void* buffer,
+    size_t* bufferUsed);
 SCARLETTX_XGR_API XGameResult XUserGetState(XUserHandle user, XUserState* state);
 SCARLETTX_XGR_API XGameResult XUserGetAgeGroup(XUserHandle user, XUserAgeGroup* ageGroup);
 SCARLETTX_XGR_API XGameResult XUserGetIsGuest(XUserHandle user, bool* isGuest);

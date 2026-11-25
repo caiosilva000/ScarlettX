@@ -245,6 +245,31 @@ int main() {
     CHECK(XUserGetGamertag(user, XUserGamertagComponent_UniqueModern, sizeof(gt), gt, &gt_used) == XGR_S_OK);
     CHECK(std::strchr(gt, '#') != nullptr);
 
+    // Gamer picture: a PNG of the requested size, with the usual two-call buffer protocol.
+    {
+        XAsyncBlock pic_async{};
+        pic_async.queue = tp_q;
+        CHECK(XUserGetGamerPictureAsync(nullptr, XUserGamerPictureSize_Medium, &pic_async) == XGR_E_INVALIDARG);
+        CHECK(XUserGetGamerPictureAsync(user, static_cast<XUserGamerPictureSize>(99), &pic_async) == XGR_E_INVALIDARG);
+        CHECK(XUserGetGamerPictureAsync(user, XUserGamerPictureSize_Medium, &pic_async) == XGR_S_OK);
+        CHECK(XAsyncGetStatus(&pic_async, true) == XGR_S_OK);
+        size_t pic_size = 0;
+        CHECK(XUserGetGamerPictureResultSize(&pic_async, &pic_size) == XGR_S_OK && pic_size > 64);
+        std::vector<uint8_t> pic(pic_size);
+        size_t pic_used = 0;
+        CHECK(XUserGetGamerPictureResult(&pic_async, 8, pic.data(), &pic_used) == XGR_E_NOT_SUFFICIENT_BUFFER);
+        CHECK(pic_used == pic_size);
+        CHECK(XUserGetGamerPictureResult(&pic_async, pic.size(), pic.data(), &pic_used) == XGR_S_OK);
+        const uint8_t png_magic[8] = {0x89, 'P', 'N', 'G', 0x0D, 0x0A, 0x1A, 0x0A};
+        CHECK(std::memcmp(pic.data(), png_magic, sizeof(png_magic)) == 0);
+        CHECK(std::memcmp(pic.data() + 12, "IHDR", 4) == 0);
+        const auto be32 = [&pic](size_t at) {
+            return (uint32_t{pic[at]} << 24) | (uint32_t{pic[at + 1]} << 16) | (uint32_t{pic[at + 2]} << 8) | pic[at + 3];
+        };
+        CHECK(be32(16) == 208 && be32(20) == 208);
+        CHECK(std::memcmp(pic.data() + pic.size() - 8, "IEND", 4) == 0);
+    }
+
     XUserState ustate = XUserState_SignedOut;
     CHECK(XUserGetState(user, &ustate) == XGR_S_OK && ustate == XUserState_SignedIn);
     XUserAgeGroup age = XUserAgeGroup_Unknown;

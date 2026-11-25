@@ -449,6 +449,133 @@ XGameResult XUserAddResult(XAsyncBlock* async, XUserHandle* newUser) {
     return XGR_S_OK;
 }
 
+namespace {
+
+uint32_t Crc32(const uint8_t* data, size_t size, uint32_t crc = 0) {
+    crc = ~crc;
+    for (size_t i = 0; i < size; ++i) {
+        crc ^= data[i];
+        for (int bit = 0; bit < 8; ++bit) {
+            crc = (crc >> 1) ^ (0xEDB88320u & (0u - (crc & 1u)));
+        }
+    }
+    return ~crc;
+}
+
+void AppendBe32(std::vector<uint8_t>& out, uint32_t value) {
+    for (int shift = 24; shift >= 0; shift -= 8) {
+        out.push_back(static_cast<uint8_t>(value >> shift));
+    }
+}
+
+void AppendPngChunk(std::vector<uint8_t>& out, const char type[4], const std::vector<uint8_t>& body) {
+    AppendBe32(out, static_cast<uint32_t>(body.size()));
+    const size_t start = out.size();
+    out.insert(out.end(), type, type + 4);
+    out.insert(out.end(), body.begin(), body.end());
+    AppendBe32(out, Crc32(out.data() + start, out.size() - start));
+}
+
+// An 8-bit RGB PNG of a light disc on a dark green field, written with stored
+// (uncompressed) deflate blocks so no compression library is needed.
+std::vector<uint8_t> BuildPlaceholderGamerPicture(uint32_t side) {
+    std::vector<uint8_t> raw;
+    raw.reserve(static_cast<size_t>(side) * (side * 3 + 1));
+    const int64_t centre = side / 2;
+    const int64_t radius_sq = static_cast<int64_t>(side) * side * 9 / 100;  // radius = 0.3 * side
+    for (uint32_t y = 0; y < side; ++y) {
+        raw.push_back(0);  // filter type: none
+        for (uint32_t x = 0; x < side; ++x) {
+            const int64_t dx = static_cast<int64_t>(x) - centre;
+            const int64_t dy = static_cast<int64_t>(y) - centre;
+            const bool disc = dx * dx + dy * dy <= radius_sq;
+            raw.push_back(disc ? 0xE6 : 0x10);
+            raw.push_back(disc ? 0xF2 : 0x7C);
+            raw.push_back(disc ? 0xE6 : 0x10);
+        }
+    }
+
+    std::vector<uint8_t> zlib = {0x78, 0x01};
+    uint32_t adler_a = 1;
+    uint32_t adler_b = 0;
+    for (const uint8_t byte : raw) {
+        adler_a = (adler_a + byte) % 65521u;
+        adler_b = (adler_b + adler_a) % 65521u;
+    }
+    for (size_t offset = 0; offset < raw.size();) {
+        const size_t len = std::min<size_t>(raw.size() - offset, 0xFFFF);
+        zlib.push_back(offset + len == raw.size() ? 1 : 0);  // final-block flag, type 0 = stored
+        zlib.push_back(static_cast<uint8_t>(len));
+        zlib.push_back(static_cast<uint8_t>(len >> 8));
+        zlib.push_back(static_cast<uint8_t>(~len));
+        zlib.push_back(static_cast<uint8_t>(~len >> 8));
+        zlib.insert(zlib.end(), raw.begin() + static_cast<std::ptrdiff_t>(offset),
+                    raw.begin() + static_cast<std::ptrdiff_t>(offset + len));
+        offset += len;
+    }
+    AppendBe32(zlib, (adler_b << 16) | adler_a);
+
+    std::vector<uint8_t> png = {0x89, 'P', 'N', 'G', 0x0D, 0x0A, 0x1A, 0x0A};
+    std::vector<uint8_t> header;
+    AppendBe32(header, side);
+    AppendBe32(header, side);
+    header.insert(header.end(), {8, 2, 0, 0, 0});  // 8 bits per channel, RGB, no interlace
+    AppendPngChunk(png, "IHDR", header);
+    AppendPngChunk(png, "IDAT", zlib);
+    AppendPngChunk(png, "IEND", {});
+    return png;
+}
+
+}  // namespace
+
+XGameResult XUserGetGamerPictureAsync(XUserHandle user, XUserGamerPictureSize pictureSize, XAsyncBlock* async) {
+    if (!user || !async || !IsRegisteredHandle(user)) {
+        return XGR_E_INVALIDARG;
+    }
+    uint32_t side = 0;
+    switch (pictureSize) {
+        case XUserGamerPictureSize_Small: side = 64; break;
+        case XUserGamerPictureSize_Medium: side = 208; break;
+        case XUserGamerPictureSize_Large: side = 424; break;
+        case XUserGamerPictureSize_ExtraLarge: side = 1080; break;
+        default: return XGR_E_INVALIDARG;
+    }
+    return BeginAsyncOperation(async, [side](XAsyncState* st) {
+        st->result_payload = BuildPlaceholderGamerPicture(side);
+        CompleteAsyncState(st, XGR_S_OK, st->result_payload.size());
+    });
+}
+
+XGameResult XUserGetGamerPictureResultSize(XAsyncBlock* async, size_t* bufferSize) {
+    if (!async || !bufferSize) {
+        return XGR_E_INVALIDARG;
+    }
+    return XAsyncGetResultSize(async, bufferSize);
+}
+
+XGameResult XUserGetGamerPictureResult(XAsyncBlock* async, size_t bufferSize, void* buffer, size_t* bufferUsed) {
+    if (!async || !buffer) {
+        return XGR_E_INVALIDARG;
+    }
+    XGameResult hr = XAsyncGetStatus(async, false);
+    if (hr != XGR_S_OK) {
+        return hr;
+    }
+    auto state = GetAsyncState(async);
+    if (!state || state->result_payload.empty()) {
+        return XGR_E_FAIL;
+    }
+    if (bufferUsed) {
+        *bufferUsed = state->result_payload.size();
+    }
+    if (bufferSize < state->result_payload.size()) {
+        return XGR_E_NOT_SUFFICIENT_BUFFER;
+    }
+    std::memcpy(buffer, state->result_payload.data(), state->result_payload.size());
+    xgr::ReleaseHleAsyncResult(async);
+    return XGR_S_OK;
+}
+
 XGameResult XUserDuplicateHandle(XUserHandle handle, XUserHandle* duplicatedHandle) {
     if (!handle || !duplicatedHandle) {
         return XGR_E_INVALIDARG;
