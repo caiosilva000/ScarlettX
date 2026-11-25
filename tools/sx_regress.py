@@ -46,6 +46,7 @@ GPU_TESTS = {
     "test_d3d12_list_layout", "test_d3d12_frame_pacing", "test_d3d12_present_window", "test_d3d12_present_frames",
     "test_d3d12_offscreen_probe", "test_d3d12_offscreen_clear", "test_d3d12_offscreen_indexed",
     "test_victory_compute_e2e", "test_victory_compute_guest", "test_d3d12_blend_mrt",
+    "test_victory_compute_conformance", "test_victory_draw_e2e",
 }
 # Translated compute (tests/test_victory_compute_e2e.cpp): five dispatches of four dwords each.
 VICTORY_COMPUTE_TEST = "test_victory_compute_e2e"
@@ -449,6 +450,68 @@ def check_victory_guest(stdout: str) -> dict:
     return info
 
 
+def check_victory_conformance(stdout: str) -> dict:
+    """Per-case verdicts of the compute conformance test and the adapter's wave capability."""
+    caps = re.search(r"\[victory-conf\] adapter wave capability: query=(0x[0-9a-f]+) wave_ops=(\S+) lanes_min=(\d+) "
+                     r"lanes_max=(\d+)", stdout)
+    cases = {}
+    for name, dispatches, lanes, exact, total, verdict in re.findall(
+            r"\[victory-conf\] case=(\S+) dispatches=(\d+) groups=\S+ threads_per_group=(\d+) dwords exact (\d+)/(\d+) "
+            r"verdict=(\S+)", stdout):
+        cases[name] = {"verdict": verdict, "dispatches": int(dispatches), "threads_per_group": int(lanes),
+                       "dwords_exact": int(exact), "dwords_total": int(total)}
+    for name, verdict, why in re.findall(r"\[victory-conf\] case=(\S+) verdict=(SKIP|FAIL) \((.*?)\)\n", stdout):
+        cases[name] = {"verdict": verdict, "reason": why}
+    for name, text in re.findall(r"\[victory-conf\] case=(\S+) wave: (.*)", stdout):
+        cases.setdefault(name, {})["wave"] = text
+    fences = [(int(s_), int(c), int(w)) for s_, c, w in
+              re.findall(r"\[victory-conf\] fence signaled=(\d+) completed=(\d+) wait_result=(\d+)", stdout)]
+    info = {
+        "shader_path": ("synthetic console-shaped containers -> d3d12_xs CreateComputePipelineState (device object) "
+                        "-> victory-shader bridge -> DXIL -> shim command list dispatch"),
+        "wave_ops": caps.group(2) if caps else None,
+        "wave_lanes_min": int(caps.group(3)) if caps else None,
+        "wave_lanes_max": int(caps.group(4)) if caps else None,
+        "cases": cases,
+        "skipped": sorted(n for n, c in cases.items() if c.get("verdict") == "SKIP"),
+        "fences": len(fences),
+        "fences_completed": sum(1 for s_, c, w in fences if c >= s_ >= 1 and w == 0),
+        "final_line": (re.search(r"\[victory-conf\] (PASS|FAIL) \(\d+ failed\)", stdout) or [None])[0],
+    }
+    required = ("groups", "lanes32")
+    info["requirements_met"] = bool(
+        caps and all(cases.get(n, {}).get("verdict") == "PASS" for n in required)
+        and all(c.get("verdict") in ("PASS", "SKIP") for c in cases.values()) and len(cases) == 4
+        and all(c.get("dwords_exact") == c.get("dwords_total") for c in cases.values() if c.get("verdict") == "PASS")
+        and info["fences"] >= 1 and info["fences_completed"] == info["fences"]
+        and info["final_line"] == "[victory-conf] PASS (0 failed)")
+    return info
+
+
+def check_victory_draw(stdout: str) -> dict:
+    """The requirements of the translated draw test: four draws, every pixel exact."""
+    fences = [(int(s_), int(c), int(w)) for s_, c, w in
+              re.findall(r"\[victory-draw\] fence signaled=(\d+) completed=(\d+) wait_result=(\d+)", stdout)]
+    pixels = re.search(r"\[victory-draw\] pixels exact (\d+)/(\d+)", stdout)
+    backend = re.search(r'\[victory-draw\] backend=(\S+) adapter="([^"]*)" vendor=(\S+) device=(\S+) warp=(\S+)', stdout)
+    failed = re.search(r"\[victory-draw\] FAILED api=(.*?) hr=(0x[0-9a-f]+)", stdout)
+    info = {
+        "shader_path": ("synthetic GFX10 vertex and pixel programs -> victory-shader bridge -> DXIL -> "
+                        "D3D12Backend::RunDrawProbe (backend path, not the shim's guest route)"),
+        "fences": len(fences),
+        "fences_completed": sum(1 for s_, c, w in fences if c >= s_ >= 1 and w == 0),
+        "pixels_exact": int(pixels.group(1)) if pixels else None,
+        "pixels_total": int(pixels.group(2)) if pixels else None,
+        "adapter": backend.group(2) if backend else None,
+        "warp": backend.group(5) if backend else None,
+    }
+    if failed:
+        info["first_failing_api"] = {"api": failed.group(1), "hresult": failed.group(2)}
+    info["requirements_met"] = bool(pixels and info["fences"] == 4 and info["fences_completed"] == 4
+                                    and info["pixels_exact"] == info["pixels_total"] == 16384)
+    return info
+
+
 def read_build_info(build: Path) -> dict:
     """build-info.txt as tools/macos_cross_build.sh writes it: `key=value` lines."""
     info = {}
@@ -609,6 +672,23 @@ def cmd_regress(args) -> int:
             elif status == PASS:
                 note = (f"{probe['dwords_exact']}/{probe['dwords_total']} dwords exact through the shim, fences "
                         f"{probe['fences_completed']}/{probe['fences_expected']}, {probe['checks_ok']} checks")
+        if name == "test_victory_compute_conformance":
+            probe = check_victory_conformance(r["stdout"])
+            details["victory_conformance"] = probe
+            if status == PASS and not probe["requirements_met"]:
+                status, note = FAIL, "exit 0 but a conformance requirement was not met"
+            elif status == PASS:
+                verdicts = ", ".join(f"{n} {c.get('verdict')}" for n, c in probe["cases"].items())
+                note = (f"{verdicts}; adapter waves {probe['wave_lanes_min']}..{probe['wave_lanes_max']}"
+                        + (f"; SKIPPED: {', '.join(probe['skipped'])}" if probe["skipped"] else ""))
+        if name == "test_victory_draw_e2e":
+            probe = check_victory_draw(r["stdout"])
+            details["victory_draw"] = probe
+            if status == PASS and not probe["requirements_met"]:
+                status, note = FAIL, "exit 0 but a fence or the exact-pixel requirement was not met"
+            elif status == PASS:
+                note = (f"{probe['pixels_exact']}/{probe['pixels_total']} pixels exact, fences "
+                        f"{probe['fences_completed']}/{probe['fences']}, adapter {probe['adapter']}")
         # The hash of what ran, so a result can be tied to one artifact.
         details["exe_sha256"] = hashlib.sha256(exe.read_bytes()).hexdigest()
         add(name, category, status, note=note, **details)

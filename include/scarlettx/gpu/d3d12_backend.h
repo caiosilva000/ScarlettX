@@ -50,6 +50,22 @@ struct ComputeProbeDesc {
     uint32_t groups[3] = {1, 1, 1};
 };
 
+// Draw probe: a vertex and a pixel shader given as DXIL, each with its user data as 32-bit root
+// constants at b0 (space 0; root parameter 0 for the vertex stage, 1 for the pixel stage), no
+// vertex buffers, three vertices into an RGBA8 render target.
+struct DrawProbeDesc {
+    const uint8_t* vs = nullptr;
+    size_t vs_size = 0;
+    const uint8_t* ps = nullptr;
+    size_t ps_size = 0;
+    std::vector<uint32_t> vs_constants;  // may be empty: one unused dword is declared
+    std::vector<uint32_t> ps_constants;
+    uint32_t width = 64;
+    uint32_t height = 64;
+    uint32_t viewport_width = 64;        // the viewport starts at 0,0 and spans the full height
+    uint8_t clear_rgba[4] = {0, 0, 0, 0};
+};
+
 class D3D12Backend {
 public:
     D3D12Backend();
@@ -78,6 +94,10 @@ public:
     // Fills the UAV, dispatches the shader once, waits on a fence and reads the whole UAV back.
     Status RunComputeProbe(const ComputeProbeDesc& desc, std::vector<uint32_t>& out_dwords,
                            OffscreenProbeReport& report);
+
+    // Clears the target, draws three vertices with the two shaders, waits on a fence and reads
+    // every pixel back.
+    Status RunDrawProbe(const DrawProbeDesc& desc, FrameBufferRgba8& out_frame, OffscreenProbeReport& report);
 
 private:
     struct Impl;

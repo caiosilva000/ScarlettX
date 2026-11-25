@@ -445,6 +445,11 @@ if(SCARLETTX_VICTORY_SHADER_BRIDGE)
     # command list (the guest-facing route), with controls.
     scarlettx_add_test(test_victory_compute_guest tests/test_victory_compute_guest.cpp)
     target_link_libraries(test_victory_compute_guest PRIVATE d3d12_xs)
+    # A translated vertex and pixel program drawn offscreen, every pixel read back.
+    scarlettx_add_test(test_victory_draw_e2e tests/test_victory_draw_e2e.cpp)
+    # Group ids, offset stores and lane masks (wave32, wave64) on the same route.
+    scarlettx_add_test(test_victory_compute_conformance tests/test_victory_compute_conformance.cpp)
+    target_link_libraries(test_victory_compute_conformance PRIVATE d3d12_xs)
 endif()
 
 # Offscreen D3D12Backend probe: exact render-target clear, then an indexed draw, each with fence

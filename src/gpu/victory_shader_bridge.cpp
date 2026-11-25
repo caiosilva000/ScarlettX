@@ -49,6 +49,8 @@ struct SxVictoryComputeBinding {
 };
 int32_t sx_victory_synthetic_compute(SxVictoryByteBuffer*, SxVictoryComputeBinding*, SxVictoryShaderInfo*);
 int32_t sx_victory_synthetic_container(uint32_t, SxVictoryByteBuffer*);
+int32_t sx_victory_synthetic_draw(SxVictoryByteBuffer*, SxVictoryComputeBinding*, SxVictoryByteBuffer*,
+                                  SxVictoryComputeBinding*, SxVictoryShaderInfo*);
 int32_t sx_victory_shader_translate_compute(const uint8_t*, size_t, SxVictoryByteBuffer*, SxVictoryComputeBinding*,
                                             SxVictoryShaderInfo*);
 }
@@ -157,6 +159,39 @@ Status TranslateVictorySyntheticCompute(VictoryShaderInfo& out_info, VictoryComp
     out_dxil.assign(buffer.data, buffer.data + buffer.size);
     sx_victory_buffer_free(&buffer);
     ConvertBinding(binding, out_binding);
+    return Status::Ok();
+#endif
+}
+
+Status TranslateVictorySyntheticDraw(VictoryShaderInfo& out_info, VictoryComputeBinding& out_vs_binding,
+                                     std::vector<uint8_t>& out_vs_dxil, VictoryComputeBinding& out_ps_binding,
+                                     std::vector<uint8_t>& out_ps_dxil) {
+    out_info = VictoryShaderInfo{};
+    out_vs_binding = VictoryComputeBinding{};
+    out_ps_binding = VictoryComputeBinding{};
+    out_vs_dxil.clear();
+    out_ps_dxil.clear();
+#if !defined(SCARLETTX_VICTORY_SHADER_BRIDGE)
+    return Status::Error(StatusCode::NotImplemented,
+                         "victory-shader bridge was not enabled at configure time");
+#else
+    SxVictoryShaderInfo raw{};
+    SxVictoryByteBuffer vs{};
+    SxVictoryByteBuffer ps{};
+    SxVictoryComputeBinding vs_binding{};
+    SxVictoryComputeBinding ps_binding{};
+    const int32_t result = sx_victory_synthetic_draw(&vs, &vs_binding, &ps, &ps_binding, &raw);
+    out_info = Convert(raw);
+    if (result != 0) {
+        return Status::Error(StatusCode::UnsupportedFormat,
+                             "Victory synthetic draw translation failed: " + out_info.message);
+    }
+    out_vs_dxil.assign(vs.data, vs.data + vs.size);
+    out_ps_dxil.assign(ps.data, ps.data + ps.size);
+    sx_victory_buffer_free(&vs);
+    sx_victory_buffer_free(&ps);
+    ConvertBinding(vs_binding, out_vs_binding);
+    ConvertBinding(ps_binding, out_ps_binding);
     return Status::Ok();
 #endif
 }

@@ -685,6 +685,362 @@ fn synthetic_refused_program() -> NativeProgram {
     }
 }
 
+/// MUBUF `buffer_store_dword vdata, vaddr, s[srsrc:srsrc+3], 0 offen`: the
+/// byte offset comes from a VGPR.
+const fn buffer_store_dword_at(vdata: u8, vaddr: u8, srsrc: u8) -> [u32; 2] {
+    [
+        0x38 << 26 | 0x1C << 18 | 1 << 12,
+        0x80 << 24 | (srsrc as u32 >> 2) << 16 | (vdata as u32) << 8 | vaddr as u32,
+    ]
+}
+
+/// VOPC `op vcc, src0, vsrc1`.
+const fn vopc(op: u16, src0: u16, vsrc1: u8) -> u32 {
+    0x7C00_0000 | (op as u32) << 17 | (vsrc1 as u32) << 9 | (src0 as u32 & 0x1FF)
+}
+
+/// SOP1 `op sdst, src0`.
+const fn sop1(op: u16, sdst: u8, src0: u16) -> u32 {
+    0xBE80_0000 | (sdst as u32) << 16 | (op as u32) << 8 | (src0 as u32 & 0xFF)
+}
+
+/// An inline integer constant operand, 0 to 64.
+const fn int(k: u16) -> u16 {
+    128 + k
+}
+
+const VCC: u16 = 106;
+const EXEC: u8 = 126;
+const V_LSHLREV_B32: u8 = 0x1A;
+const V_CMP_GT_U32: u16 = 0xC4;
+const S_MOV_B32: u16 = 0x03;
+const S_MOV_B64: u16 = 0x04;
+const S_BCNT1_I32_B32: u16 = 0x0F;
+const S_AND_SAVEEXEC_B64: u16 = 0x24;
+const S_AND_SAVEEXEC_B32: u16 = 0x3C;
+
+/// The root layout the conformance programs share: four root constants in
+/// s0..s3, the table of one raw UAV in s4, `user` user SGPRs in all.
+fn constants_and_table(user: u32, rsrc2_bits: u32, threads: [u32; 3], wave64: bool, words: &[u32]) -> NativeProgram {
+    NativeProgram {
+        stage: HwStage::Cs,
+        wave64,
+        vgprs: 24,
+        layout: vec![
+            RootParam {
+                root: RootType::Constants,
+                table_offset_dwords: 0,
+                sgprs: 4,
+                base_register: 0,
+                user_data: 0,
+                slot: 0,
+            },
+            RootParam {
+                root: RootType::Table,
+                table_offset_dwords: 0,
+                sgprs: 1,
+                base_register: 0,
+                user_data: 4,
+                slot: 1,
+            },
+        ],
+        used: vec![UsedResource {
+            kind: ResourceType::Uav,
+            root: RootType::Table,
+            table_offset_dwords: 0,
+            lower_bound: 0,
+            stride: 0,
+            dwords: 4,
+            user_data: 4,
+            slot: 1,
+        }],
+        io: StageIo::Cs(ComputeIo {
+            rsrc2: user << 1 | rsrc2_bits,
+            threads,
+        }),
+        code: words.iter().flat_map(|w| w.to_le_bytes()).collect(),
+    }
+}
+
+/// Dispatch group ids and an offset store. One thread per group; the group
+/// id arrives in s6 (x) and s7 (y) after six user SGPRs. Each group writes
+/// `((c0 + x) ^ c1) + (y << 16)` to dword `2 + x + 3y`.
+fn synthetic_group_id_program() -> NativeProgram {
+    let mut w = vec![s_mov_b32(5, 0x80)];
+    w.extend_from_slice(&s_load_dwordx4(8, 4));
+    w.push(vop1(V_MOV_B32, 1, 0)); // v1 = c0
+    w.push(vop1(V_MOV_B32, 2, 1)); // v2 = c1
+    w.push(vop1(V_MOV_B32, 5, 6)); // v5 = group x
+    w.push(vop1(V_MOV_B32, 6, 7)); // v6 = group y
+    w.push(vop2(V_LSHLREV_B32, 7, int(1), 6)); // v7 = 2y
+    w.push(vop2(V_ADD_NC_U32, 7, vgpr(7), 6)); // v7 = 3y
+    w.push(vop2(V_ADD_NC_U32, 7, vgpr(7), 5)); // v7 = x + 3y
+    w.push(vop2(V_LSHLREV_B32, 8, int(2), 7)); // v8 = 4 (x + 3y)
+    w.push(vop2(V_ADD_NC_U32, 8, int(8), 8)); // v8 += 8: two dwords in
+    w.push(vop2(V_ADD_NC_U32, 0, vgpr(1), 5)); // v0 = c0 + x
+    w.push(vop2(V_XOR_B32, 0, vgpr(0), 2)); // v0 ^= c1
+    w.push(vop2(V_LSHLREV_B32, 9, int(16), 6)); // v9 = y << 16
+    w.push(vop2(V_ADD_NC_U32, 0, vgpr(0), 9)); // v0 += v9
+    w.extend_from_slice(&buffer_store_dword_at(0, 8, 8));
+    w.push(S_ENDPGM);
+    // TGID_X_EN (bit 7) and TGID_Y_EN (bit 8).
+    constants_and_table(6, 1 << 7 | 1 << 8, [1, 1, 1], false, &w)
+}
+
+/// A lane mask. `lanes` threads in one group, one wave: lane l (its thread
+/// id, in v0) writes `l + c2` to dword l when `l < c0`, and `c1` otherwise.
+/// The lanes under the compare are selected with EXEC (`s_and_saveexec`),
+/// which is restored before the store. With `count`, the number of selected
+/// lanes (`s_bcnt1` of the mask, a cross-lane value) also goes to dword
+/// `lanes`.
+fn synthetic_lane_mask_program(wave64: bool, count: bool) -> NativeProgram {
+    let lanes: u32 = if wave64 { 64 } else { 32 };
+    let mut w = vec![s_mov_b32(5, 0x80)];
+    w.extend_from_slice(&s_load_dwordx4(8, 4));
+    w.push(vop2(V_LSHLREV_B32, 16, int(2), 0)); // v16 = 4 lane
+    w.push(vop1(V_MOV_B32, 3, 1)); // v3 = c1
+    w.push(vopc(V_CMP_GT_U32, 0, 0)); // vcc = c0 > lane
+    if count {
+        w.push(sop1(S_BCNT1_I32_B32, 21, VCC)); // s21 = lanes selected
+    }
+    if wave64 {
+        w.push(sop1(S_AND_SAVEEXEC_B64, 22, VCC)); // s[22:23] = exec; exec &= vcc
+    } else {
+        w.push(sop1(S_AND_SAVEEXEC_B32, 22, VCC)); // s22 = exec; exec &= vcc
+    }
+    w.push(vop2(V_ADD_NC_U32, 3, 2, 0)); // selected lanes: v3 = c2 + lane
+    if wave64 {
+        w.push(sop1(S_MOV_B64, EXEC, 22));
+    } else {
+        w.push(sop1(S_MOV_B32, EXEC, 22));
+    }
+    w.extend_from_slice(&buffer_store_dword_at(3, 16, 8));
+    if count {
+        w.push(vop1(V_MOV_B32, 4, 21)); // v4 = the count
+        w.extend_from_slice(&buffer_store_dword(4, 8, (lanes * 4) as u16));
+    }
+    w.push(S_ENDPGM);
+    constants_and_table(5, 0, [lanes, 1, 1], wave64, &w)
+}
+
+// ---------------------------------------------------------------------------
+// Synthetic draw: a vertex and a pixel program
+// ---------------------------------------------------------------------------
+
+/// `exp <target> v<a>, v<b>, v<c>, v<d>` with all four channels, `done`
+/// (and `vm` for the pixel program's last colour export).
+const fn exp(target: u32, vsrc: [u8; 4], vm: bool) -> [u32; 2] {
+    [
+        0xF800_0000 | 0xF | target << 4 | 1 << 11 | (vm as u32) << 12,
+        vsrc[0] as u32 | (vsrc[1] as u32) << 8 | (vsrc[2] as u32) << 16 | (vsrc[3] as u32) << 24,
+    ]
+}
+
+const EXP_MRT0: u32 = 0;
+const EXP_POS0: u32 = 12;
+const V_ADD_F32: u8 = 0x03;
+const V_MUL_F32: u8 = 0x08;
+const V_AND_B32: u8 = 0x1B;
+const V_CVT_F32_U32: u16 = 0x06;
+/// Inline float constants.
+const F_ONE: u16 = 242;
+const F_MINUS_ONE: u16 = 243;
+const F_TWO: u16 = 244;
+
+/// A vertex program without attributes: vertex n of a triangle that covers
+/// the viewport, from the vertex id in v0 (x = 2 * ((n << 1) & 2) - 1,
+/// y = 2 * (n & 2) - 1, z = 0, w = 1).
+fn synthetic_vertex_program() -> NativeProgram {
+    let mut w = vec![
+        vop2(V_LSHLREV_B32, 1, int(1), 0),      // v1 = id << 1
+        vop2(V_AND_B32, 1, int(2), 1),          // v1 &= 2
+        vop2(V_AND_B32, 2, int(2), 0),          // v2 = id & 2
+        vop1(V_CVT_F32_U32, 1, vgpr(1)),        // to float
+        vop1(V_CVT_F32_U32, 2, vgpr(2)),
+        vop2(V_MUL_F32, 1, F_TWO, 1),           // * 2
+        vop2(V_MUL_F32, 2, F_TWO, 2),
+        vop2(V_ADD_F32, 1, F_MINUS_ONE, 1),     // - 1
+        vop2(V_ADD_F32, 2, F_MINUS_ONE, 2),
+        vop1(V_MOV_B32, 3, int(0)),             // z = 0
+        vop1(V_MOV_B32, 4, F_ONE),              // w = 1
+    ];
+    w.extend_from_slice(&exp(EXP_POS0, [1, 2, 3, 4], false));
+    w.push(S_ENDPGM);
+    NativeProgram {
+        stage: HwStage::Vs,
+        wave64: false,
+        vgprs: 8,
+        layout: vec![],
+        used: vec![],
+        io: StageIo::Vs { inputs: vec![], outputs: vec![] },
+        code: w.iter().flat_map(|w| w.to_le_bytes()).collect(),
+    }
+}
+
+/// A pixel program that writes its four root constants (s0..s3, float bits)
+/// to render target 0.
+fn synthetic_pixel_program() -> NativeProgram {
+    let mut w = Vec::new();
+    for i in 0..4u8 {
+        w.push(vop1(V_MOV_B32, i, u16::from(i))); // v<i> = s<i>
+    }
+    w.extend_from_slice(&exp(EXP_MRT0, [0, 1, 2, 3], true));
+    w.push(S_ENDPGM);
+    NativeProgram {
+        stage: HwStage::Ps,
+        wave64: false,
+        vgprs: 4,
+        layout: vec![RootParam {
+            root: RootType::Constants,
+            table_offset_dwords: 0,
+            sgprs: 4,
+            base_register: 0,
+            user_data: 0,
+            slot: 0,
+        }],
+        used: vec![],
+        io: StageIo::Ps {
+            inputs: vec![],
+            input_addr: 0,
+            db_shader_control: 0,
+            patches: vec![],
+        },
+        code: w.iter().flat_map(|w| w.to_le_bytes()).collect(),
+    }
+}
+
+/// An `ISG1`/`OSG1` part: (name, D3D system value, component type, register, mask) per element.
+fn signature_part(elements: &[(&str, u32, u32, u32, u8)]) -> Vec<u8> {
+    let mut out = Vec::new();
+    out.extend_from_slice(&(elements.len() as u32).to_le_bytes());
+    out.extend_from_slice(&8u32.to_le_bytes());
+    let mut name_at = 8 + 32 * elements.len();
+    for (name, system_value, component, register, mask) in elements {
+        for v in [0u32, name_at as u32, 0, *system_value, *component, *register] {
+            out.extend_from_slice(&v.to_le_bytes());
+        }
+        out.extend_from_slice(&[*mask, *mask, 0, 0]);
+        out.extend_from_slice(&0u32.to_le_bytes());
+        name_at += name.len() + 1;
+    }
+    for (name, ..) in elements {
+        out.extend_from_slice(name.as_bytes());
+        out.push(0);
+    }
+    while out.len() % 4 != 0 {
+        out.push(0);
+    }
+    out
+}
+
+/// A DXBC envelope of these parts.
+fn envelope(parts: &[(&[u8; 4], Vec<u8>)]) -> Vec<u8> {
+    let table = 32 + 4 * parts.len();
+    let total = table + parts.iter().map(|(_, d)| 8 + d.len()).sum::<usize>();
+    let mut out = b"DXBC".to_vec();
+    out.extend_from_slice(&[0; 16]);
+    out.extend_from_slice(&1u16.to_le_bytes());
+    out.extend_from_slice(&0u16.to_le_bytes());
+    out.extend_from_slice(&(total as u32).to_le_bytes());
+    out.extend_from_slice(&(parts.len() as u32).to_le_bytes());
+    let mut offset = table;
+    for (_, d) in parts {
+        out.extend_from_slice(&(offset as u32).to_le_bytes());
+        offset += 8 + d.len();
+    }
+    for (fourcc, d) in parts {
+        out.extend_from_slice(*fourcc);
+        out.extend_from_slice(&(d.len() as u32).to_le_bytes());
+        out.extend_from_slice(d);
+    }
+    out
+}
+
+/// D3D system values and component types of signature parts.
+const NAME_POSITION: u32 = 1;
+const NAME_VERTEX_ID: u32 = 6;
+const NAME_TARGET: u32 = 64;
+const COMPONENT_UINT: u32 = 1;
+const COMPONENT_FLOAT: u32 = 3;
+
+fn translate_graphics(native: &NativeProgram, signatures: Vec<u8>) -> Result<victory_shader::emit::HostShader, String> {
+    let container = Container::parse(&signatures).map_err(|e| e.to_string())?;
+    let (program, structured) = victory_shader::range::build(&native.patched_code(), native.wave64, native.vgprs)
+        .map_err(|e| e.to_string())?;
+    let structured = structured.map_err(|e| e.to_string())?;
+    let resources =
+        victory_shader::resource::track(&program, &native.layout, native.stage, Some(&structured))
+            .map_err(|e| e.to_string())?;
+    let io = victory_shader::io::raise(&program, native).map_err(|e| e.to_string())?;
+    victory_shader::emit::emit(&container, native, &program, &structured, &io, &resources).map_err(|e| e.to_string())
+}
+
+fn translate_synthetic_draw() -> Result<(victory_shader::emit::HostShader, victory_shader::emit::HostShader), String> {
+    let vs = translate_graphics(
+        &synthetic_vertex_program(),
+        envelope(&[
+            (b"ISG1", signature_part(&[("SV_VertexID", NAME_VERTEX_ID, COMPONENT_UINT, 0, 0x1)])),
+            (b"OSG1", signature_part(&[("SV_Position", NAME_POSITION, COMPONENT_FLOAT, 0, 0xF)])),
+        ]),
+    )
+    .map_err(|e| format!("vertex program: {e}"))?;
+    let ps = translate_graphics(
+        &synthetic_pixel_program(),
+        envelope(&[
+            (b"ISG1", signature_part(&[("SV_Position", NAME_POSITION, COMPONENT_FLOAT, 0, 0xF)])),
+            (b"OSG1", signature_part(&[("SV_Target", NAME_TARGET, COMPONENT_FLOAT, 0, 0xF)])),
+        ]),
+    )
+    .map_err(|e| format!("pixel program: {e}"))?;
+    Ok((vs, ps))
+}
+
+/// Translates the synthetic vertex and pixel programs to host DXIL and
+/// reports what the host binds for each. Returns 0, 2 when the translator
+/// refuses one (reason in `info.message`), 3 when one reads more user data
+/// than a binding holds, -1 for invalid arguments. Release both buffers with
+/// `sx_victory_buffer_free`.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn sx_victory_synthetic_draw(
+    vs_out: *mut SxVictoryByteBuffer,
+    vs_binding: *mut SxVictoryComputeBinding,
+    ps_out: *mut SxVictoryByteBuffer,
+    ps_binding: *mut SxVictoryComputeBinding,
+    info: *mut SxVictoryShaderInfo,
+) -> i32 {
+    if vs_out.is_null() || vs_binding.is_null() || ps_out.is_null() || ps_binding.is_null() || info.is_null() {
+        return -1;
+    }
+    // SAFETY: the C++ caller passes five live, exclusive objects.
+    let (vs_out, vs_binding, ps_out, ps_binding, report) =
+        unsafe { (&mut *vs_out, &mut *vs_binding, &mut *ps_out, &mut *ps_binding, &mut *info) };
+    for buffer in [&mut *vs_out, &mut *ps_out] {
+        buffer.data = std::ptr::null_mut();
+        buffer.size = 0;
+    }
+    clear(report);
+    let (vs, ps) = match translate_synthetic_draw() {
+        Ok(done) => done,
+        Err(text) => {
+            message(report, text);
+            return 2;
+        }
+    };
+    if vs.user_data.len() > SYNTHETIC_USER_DATA_CAPACITY || ps.user_data.len() > SYNTHETIC_USER_DATA_CAPACITY {
+        message(report, "a shader reads more user data than the binding holds");
+        return 3;
+    }
+    report.container_status = 0;
+    report.native_status = 0;
+    report.native_program_count = 2;
+    report.stage_mask = stage_bit(vs.stage) | stage_bit(ps.stage);
+    fill_binding(vs_binding, &vs, [0, 0, 0]);
+    fill_binding(ps_binding, &ps, [0, 0, 0]);
+    hand_over(vs_out, vs.dxil);
+    hand_over(ps_out, ps.dxil);
+    0
+}
+
 /// The synthetic containers the tests use. 0: the compute fixture. 1: the same
 /// with its native stream cut short (malformed). 2: a console-shaped container
 /// whose index lists no native code (missing). 3: a compute program that reads
@@ -699,6 +1055,12 @@ fn synthetic_container(variant: u32) -> Option<Vec<u8>> {
         }
         2 => Some(console_container(&[(0x10, vec![0u8; 16])])),
         3 => Some(console_container(&[(KIND_NATIVE, xbch(&fssm_compute(&synthetic_refused_program())))])),
+        // Conformance programs (see their functions): 4 group ids and an offset store,
+        // 5 a wave32 lane mask, 6 the same with a cross-lane count, 7 a wave64 lane mask.
+        4 => Some(console_container(&[(KIND_NATIVE, xbch(&fssm_compute(&synthetic_group_id_program())))])),
+        5 => Some(console_container(&[(KIND_NATIVE, xbch(&fssm_compute(&synthetic_lane_mask_program(false, false))))])),
+        6 => Some(console_container(&[(KIND_NATIVE, xbch(&fssm_compute(&synthetic_lane_mask_program(false, true))))])),
+        7 => Some(console_container(&[(KIND_NATIVE, xbch(&fssm_compute(&synthetic_lane_mask_program(true, false))))])),
         _ => None,
     }
 }
@@ -857,6 +1219,37 @@ mod tests {
             ComputeInput::Refused(text) => assert!(text.contains("is not supported"), "{text}"),
             _ => panic!("the translator was expected to refuse this program"),
         }
+    }
+
+    #[test]
+    fn the_conformance_programs_translate() {
+        for (variant, threads) in [(4u32, [1u32, 1, 1]), (5, [32, 1, 1]), (6, [32, 1, 1]), (7, [64, 1, 1])] {
+            match translate_compute_container(&synthetic_container(variant).unwrap()) {
+                ComputeInput::Translated(shader, t) => {
+                    assert_eq!(t, threads, "variant {variant}");
+                    assert_eq!(shader.user_data_dwords(), 8, "variant {variant}: {:?}", shader.user_data);
+                    assert!(shader.root_cbvs.is_empty() && shader.root_srvs.is_empty() && shader.root_uavs.is_empty());
+                    assert!(!shader.memory && !shader.heap, "variant {variant}");
+                    eprintln!("variant {variant}: {} bytes of DXIL", shader.dxil.len());
+                }
+                ComputeInput::Refused(text) => panic!("variant {variant} refused: {text}"),
+                ComputeInput::Malformed(text) => panic!("variant {variant} malformed: {text}"),
+                _ => panic!("variant {variant} not translated"),
+            }
+        }
+    }
+
+    #[test]
+    fn the_synthetic_draw_translates() {
+        let (vs, ps) = translate_synthetic_draw().expect("translate");
+        assert_eq!((vs.stage, ps.stage), (HwStage::Vs, HwStage::Ps));
+        assert!(vs.user_data.is_empty(), "{:?}", vs.user_data);
+        assert_eq!(ps.user_data_dwords(), 4, "{:?}", ps.user_data);
+        for shader in [&vs, &ps] {
+            assert!(Container::parse(&shader.dxil).unwrap().part(FourCC::DXIL).is_some());
+            assert!(shader.root_cbvs.is_empty() && shader.samplers.is_empty() && !shader.memory && !shader.heap);
+        }
+        eprintln!("vs {} bytes, ps {} bytes", vs.dxil.len(), ps.dxil.len());
     }
 
     #[test]

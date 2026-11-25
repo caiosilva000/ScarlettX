@@ -77,3 +77,12 @@ build it holds the Victory gitlink, the bridge's `Cargo.lock` hash and the Rust 
 the shim's device object, dispatched through the shim's command list. As a GPU check it needs the native pipeline
 created and counted as translated, seven completed fences, 20 of 20 dwords, five translated dispatches and no
 failed check line (`victory_guest` block).
+
+`test_victory_compute_conformance` (group ids with offset stores, a wave32 lane mask, the same with a cross-lane
+count, a wave64 lane mask) is a GPU check on the guest route: `groups` and `lanes32` must pass with every dword
+of the 96-dword buffer exact; a lane case whose pipeline the host refuses is an explicit skip, listed in the note
+and in `victory_conformance.skipped`. The block records the adapter's wave lane range and, per lane case, whether
+the host reports waves of the console's size.
+
+`test_victory_draw_e2e` (a translated vertex and pixel program, backend path) needs four completed fences and
+16384 of 16384 pixels exact (`victory_draw` block).

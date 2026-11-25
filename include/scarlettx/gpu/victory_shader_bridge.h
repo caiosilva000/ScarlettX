@@ -58,6 +58,14 @@ struct VictoryComputeBinding {
 Status TranslateVictorySyntheticCompute(VictoryShaderInfo& out_info, VictoryComputeBinding& out_binding,
                                         std::vector<uint8_t>& out_dxil);
 
+// Translates the bridge's synthetic vertex and pixel programs (hand-assembled, no title data).
+// The vertex program makes a triangle covering the viewport from the vertex id; the pixel
+// program writes its four root constants (float bits) to render target 0. The bindings are
+// per stage, in the same form as a compute shader's.
+Status TranslateVictorySyntheticDraw(VictoryShaderInfo& out_info, VictoryComputeBinding& out_vs_binding,
+                                     std::vector<uint8_t>& out_vs_dxil, VictoryComputeBinding& out_ps_binding,
+                                     std::vector<uint8_t>& out_ps_dxil);
+
 // What a shader container is, for a compute pipeline.
 enum class VictoryComputeOutcome {
     Translated,       // console-shaped with a native compute program: out_dxil and out_binding are set
