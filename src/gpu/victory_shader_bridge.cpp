@@ -50,7 +50,7 @@ struct SxVictoryComputeBinding {
 int32_t sx_victory_synthetic_compute_salted(uint32_t, SxVictoryByteBuffer*, SxVictoryComputeBinding*,
                                             SxVictoryShaderInfo*);
 int32_t sx_victory_synthetic_container(uint32_t, SxVictoryByteBuffer*);
-int32_t sx_victory_synthetic_vector_container(uint32_t, SxVictoryByteBuffer*);
+int32_t sx_victory_synthetic_vector_container_rounds(uint32_t, uint32_t, SxVictoryByteBuffer*);
 int32_t sx_victory_synthetic_draw_salted(uint32_t, SxVictoryByteBuffer*, SxVictoryComputeBinding*,
                                          SxVictoryByteBuffer*, SxVictoryComputeBinding*, SxVictoryShaderInfo*);
 int32_t sx_victory_shader_translate_compute(const uint8_t*, size_t, SxVictoryByteBuffer*, SxVictoryComputeBinding*,
@@ -272,15 +272,16 @@ bool VictoryComputeBindingSupported(const VictoryComputeBinding& binding, std::s
     return why.empty();
 }
 
-Status BuildVictoryVectorKernelContainer(uint32_t k, std::vector<uint8_t>& out_bytes) {
+Status BuildVictoryVectorKernelContainer(uint32_t k, std::vector<uint8_t>& out_bytes, uint32_t rounds) {
     out_bytes.clear();
 #if !defined(SCARLETTX_VICTORY_SHADER_BRIDGE)
     (void)k;
+    (void)rounds;
     return Status::Error(StatusCode::NotImplemented,
                          "victory-shader bridge was not enabled at configure time");
 #else
     SxVictoryByteBuffer buffer{};
-    if (sx_victory_synthetic_vector_container(k, &buffer) != 0) {
+    if (sx_victory_synthetic_vector_container_rounds(k, rounds, &buffer) != 0) {
         return Status::Error(StatusCode::InvalidArgument, "The vector kernel container could not be built");
     }
     out_bytes.assign(buffer.data, buffer.data + buffer.size);

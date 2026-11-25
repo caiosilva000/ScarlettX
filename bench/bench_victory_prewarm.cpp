@@ -10,6 +10,10 @@
 //   --workload vector     an integer kernel over --elements dwords (salt = its literal k), for
 //                         comparing host backends on the same numbers: cold path, warm dispatch
 //                         and a hash of the output for fixed constants
+//   --workload cache      what a cache could save for a shader of --rounds size: the translator's
+//                         first call apart from this shader's translation, pipeline creation the
+//                         first time and again, and pipeline blobs (--corrupt-blob also offers
+//                         the host a damaged one)
 //   --workload control    graphics control without translation: the existing offscreen indexed
 //                         draw (HLSL -> d3dcompiler, pipeline built inside every call)
 //
@@ -36,6 +40,7 @@
 #include <vector>
 
 #include <windows.h>
+#include <d3d12.h>
 
 #include "scarlettx/gpu/d3d12_backend.h"
 #include "scarlettx/gpu/victory_shader_bridge.h"
@@ -85,6 +90,8 @@ struct Args {
     uint32_t launch = 0;
     uint32_t hold_ms = 0;
     uint32_t elements = 1u << 20;
+    uint32_t rounds = 1;
+    bool corrupt_blob = false;
 };
 
 struct Recorder {
@@ -454,6 +461,157 @@ int RunVector(const Args& args, scarlettx::D3D12Backend& backend, Recorder& rec,
     return 0;
 }
 
+// What a cache could save, for a shader of a chosen size (--rounds): the translator's first call
+// in the process apart from the cost of translating this shader, pipeline creation the first time
+// and again, and whether the host hands out pipeline blobs a persistent cache could store.
+uint32_t VectorKernelRounds(uint32_t i, uint32_t c0, uint32_t c1, uint32_t k, uint32_t rounds) {
+    uint32_t x = i + c0;
+    for (uint32_t r = 0; r < rounds; ++r) {
+        x ^= x << 13;
+        x ^= x >> 17;
+        x ^= x << 5;
+    }
+    return (x + c1) ^ k;
+}
+
+int RunCacheAssessment(const Args& args, scarlettx::D3D12Backend& backend, Recorder& rec, double init_ms) {
+    const uint32_t k = args.salt;
+    const uint32_t n = 4096;
+    auto translate = [](uint32_t kk, uint32_t rounds, std::vector<uint8_t>& container,
+                        scarlettx::VictoryComputeBinding& binding, std::vector<uint8_t>& dxil, double& ms) {
+        scarlettx::VictoryShaderInfo info;
+        if (!scarlettx::BuildVictoryVectorKernelContainer(kk, container, rounds).ok()) return false;
+        const LARGE_INTEGER start = Now();
+        const auto outcome = scarlettx::TranslateVictoryCompute(container.data(), container.size(), info, binding, dxil);
+        ms = MsBetween(start, Now());
+        return outcome == scarlettx::VictoryComputeOutcome::Translated;
+    };
+    std::vector<uint8_t> container;
+    std::vector<uint8_t> dxil;
+    scarlettx::VictoryComputeBinding binding;
+    double first_call_ms = 0;
+    double target_ms = 0;
+    double repeat_ms = 0;
+    // A different, small shader first: the translator's first call in this process.
+    if (!translate(k ^ 0x5A5A5A5Au, 1, container, binding, dxil, first_call_ms) ||
+        !translate(k, args.rounds, container, binding, dxil, target_ms)) {
+        std::printf("[bench] translate FAILED\n");
+        return 4;
+    }
+    std::vector<uint8_t> again;
+    scarlettx::VictoryComputeBinding binding_again;
+    std::vector<uint8_t> container_again;
+    if (!translate(k, args.rounds, container_again, binding_again, again, repeat_ms) || again != dxil) {
+        std::printf("[bench] FAILED: translating the same container twice gave different shaders\n");
+        return 1;
+    }
+    rec.shader_hash = Fnv(dxil);
+    std::printf("[bench] rounds=%u container=%zu bytes dxil=%zu bytes fnv=%016llx deterministic=yes\n", args.rounds,
+                container.size(), dxil.size(), static_cast<unsigned long long>(rec.shader_hash));
+    rec.Metric("backend_init_ms", init_ms);
+    rec.Metric("rounds", static_cast<double>(args.rounds));
+    rec.Metric("container_bytes", static_cast<double>(container.size()));
+    rec.Metric("dxil_bytes", static_cast<double>(dxil.size()));
+    rec.Metric("translate_first_call_ms", first_call_ms);
+    rec.Metric("translate_target_ms", target_ms);
+    rec.Metric("translate_target_repeat_ms", repeat_ms);
+
+    // Pipeline creation on the host device, the first time and again, and pipeline blobs.
+    auto* device = static_cast<ID3D12Device*>(backend.NativeDevice());
+    D3D12_ROOT_PARAMETER user_data{};
+    user_data.ParameterType = D3D12_ROOT_PARAMETER_TYPE_32BIT_CONSTANTS;
+    user_data.Constants.Num32BitValues = binding.user_data_dwords;
+    D3D12_ROOT_SIGNATURE_DESC rs_desc{};
+    rs_desc.NumParameters = 1;
+    rs_desc.pParameters = &user_data;
+    rs_desc.Flags = static_cast<D3D12_ROOT_SIGNATURE_FLAGS>(D3D12_ROOT_SIGNATURE_FLAG_CBV_SRV_UAV_HEAP_DIRECTLY_INDEXED |
+                                                            D3D12_ROOT_SIGNATURE_FLAG_SAMPLER_HEAP_DIRECTLY_INDEXED);
+    ID3DBlob* rs_blob = nullptr;
+    ID3DBlob* rs_error = nullptr;
+    ID3D12RootSignature* root = nullptr;
+    HRESULT hr = D3D12SerializeRootSignature(&rs_desc, D3D_ROOT_SIGNATURE_VERSION_1, &rs_blob, &rs_error);
+    if (SUCCEEDED(hr)) {
+        hr = device->CreateRootSignature(0, rs_blob->GetBufferPointer(), rs_blob->GetBufferSize(), IID_PPV_ARGS(&root));
+    }
+    if (FAILED(hr)) {
+        std::printf("[bench] FAILED api=CreateRootSignature hr=0x%08x\n", static_cast<uint32_t>(hr));
+        return 2;
+    }
+    D3D12_COMPUTE_PIPELINE_STATE_DESC pso_desc{};
+    pso_desc.pRootSignature = root;
+    pso_desc.CS = {dxil.data(), dxil.size()};
+    auto create = [&](const char* metric, ID3D12PipelineState** out) {
+        const LARGE_INTEGER start = Now();
+        const HRESULT r = device->CreateComputePipelineState(&pso_desc, IID_PPV_ARGS(out));
+        const double ms = MsBetween(start, Now());
+        std::printf("[bench] %s hr=0x%08x\n", metric, static_cast<uint32_t>(r));
+        if (SUCCEEDED(r)) rec.Metric(metric, ms);
+        return r;
+    };
+    ID3D12PipelineState* pso = nullptr;
+    ID3D12PipelineState* pso2 = nullptr;
+    if (FAILED(create("pipeline_create_ms", &pso)) || FAILED(create("pipeline_recreate_ms", &pso2))) return 2;
+
+    // Pipeline blobs: what a persistent pipeline cache would store and hand back.
+    ID3DBlob* blob = nullptr;
+    const HRESULT blob_hr = pso->GetCachedBlob(&blob);
+    const size_t blob_bytes = SUCCEEDED(blob_hr) && blob ? blob->GetBufferSize() : 0;
+    std::printf("[bench] GetCachedBlob hr=0x%08x bytes=%zu\n", static_cast<uint32_t>(blob_hr), blob_bytes);
+    rec.Metric("cached_blob_available", SUCCEEDED(blob_hr) && blob_bytes ? 1.0 : 0.0);
+    rec.Metric("cached_blob_bytes", static_cast<double>(blob_bytes));
+    if (SUCCEEDED(blob_hr) && blob_bytes) {
+        std::vector<uint8_t> bytes(static_cast<const uint8_t*>(blob->GetBufferPointer()),
+                                   static_cast<const uint8_t*>(blob->GetBufferPointer()) + blob_bytes);
+        pso_desc.CachedPSO = {bytes.data(), bytes.size()};
+        ID3D12PipelineState* from_blob = nullptr;
+        const HRESULT r = create("pipeline_from_blob_ms", &from_blob);
+        rec.Metric("pipeline_from_blob_ok", SUCCEEDED(r) ? 1.0 : 0.0);
+        if (args.corrupt_blob) {
+            // A damaged entry must be refused, not crash the process or build a wrong pipeline.
+            for (size_t i = bytes.size() / 2; i < bytes.size() / 2 + 16 && i < bytes.size(); ++i) bytes[i] ^= 0xFF;
+            ID3D12PipelineState* from_corrupt = nullptr;
+            std::printf("[bench] creating a pipeline from a corrupted blob\n");
+            const HRESULT c = device->CreateComputePipelineState(&pso_desc, IID_PPV_ARGS(&from_corrupt));
+            std::printf("[bench] corrupted blob hr=0x%08x pso=%s\n", static_cast<uint32_t>(c), from_corrupt ? "created" : "none");
+            rec.Metric("corrupt_blob_refused", FAILED(c) ? 1.0 : 0.0);
+            bytes.resize(bytes.size() / 2);
+            pso_desc.CachedPSO = {bytes.data(), bytes.size()};
+            from_corrupt = nullptr;
+            const HRESULT t = device->CreateComputePipelineState(&pso_desc, IID_PPV_ARGS(&from_corrupt));
+            std::printf("[bench] truncated blob hr=0x%08x pso=%s\n", static_cast<uint32_t>(t), from_corrupt ? "created" : "none");
+            rec.Metric("truncated_blob_refused", FAILED(t) ? 1.0 : 0.0);
+        }
+        pso_desc.CachedPSO = {};
+    }
+
+    // The shader has to be right, whatever its size.
+    scarlettx::ComputeProbeDesc desc;
+    desc.shader = dxil.data();
+    desc.shader_size = dxil.size();
+    desc.root_constants.assign(binding.user_data_dwords, 0);
+    desc.uav_dwords = n;
+    desc.uav_fill = kSentinel;
+    desc.groups[0] = n / 32;
+    for (const auto& u : binding.user_data) {
+        if (u.root == 0 && u.dword == 0) desc.root_constants[u.index] = 0x12345678u;
+        if (u.root == 0 && u.dword == 1) desc.root_constants[u.index] = 0x9E3779B9u;
+    }
+    std::vector<uint32_t> out;
+    scarlettx::OffscreenProbeReport report;
+    const LARGE_INTEGER start = Now();
+    const auto st = backend.RunComputeProbe(desc, out, report);
+    if (!st.ok()) return Fail("dispatch", st, report);
+    rec.Metric("probe_run_ms", MsBetween(start, Now()));
+    uint32_t exact = 0;
+    for (uint32_t i = 0; i < n; ++i) exact += out[i] == VectorKernelRounds(i, 0x12345678u, 0x9E3779B9u, k, args.rounds);
+    std::printf("[bench] validate: dwords exact %u/%u (fence %llu/%llu wait %u)\n", exact, n,
+                static_cast<unsigned long long>(report.fence_completed), static_cast<unsigned long long>(report.fence_signaled),
+                report.wait_result);
+    rec.Metric("validated_exact", static_cast<double>(exact));
+    rec.Metric("validated_total", static_cast<double>(n));
+    return exact == n ? 0 : 1;
+}
+
 // The untranslated control: the existing indexed-draw probe, which compiles its HLSL and builds
 // its pipeline inside every call.
 int RunControl(const Args& args, scarlettx::D3D12Backend& backend, Recorder& rec, double init_ms) {
@@ -511,6 +669,8 @@ int main(int argc, char** argv) {
         else if (a == "--salt") args.salt = static_cast<uint32_t>(std::strtoul(next().c_str(), nullptr, 10));
         else if (a == "--launch") args.launch = static_cast<uint32_t>(std::strtoul(next().c_str(), nullptr, 10));
         else if (a == "--elements") args.elements = static_cast<uint32_t>(std::strtoul(next().c_str(), nullptr, 10));
+        else if (a == "--rounds") args.rounds = static_cast<uint32_t>(std::strtoul(next().c_str(), nullptr, 10));
+        else if (a == "--corrupt-blob") args.corrupt_blob = true;
         else if (a == "--hold-ms") args.hold_ms = static_cast<uint32_t>(std::strtoul(next().c_str(), nullptr, 10));
         else {
             std::fprintf(stderr, "bench_victory_prewarm: unknown argument %s\n", a.c_str());
@@ -525,16 +685,22 @@ int main(int argc, char** argv) {
         std::fprintf(stderr, "bench_victory_prewarm: --elements must be a positive multiple of 32\n");
         return 64;
     }
-    if ((!translated && !vector && args.workload != "control") || !known_condition || args.iterations == 0) {
-        std::fprintf(stderr, "usage: bench_victory_prewarm --workload compute|draw|control|vector --condition "
+    const bool cache = args.workload == "cache";
+    if (cache && (args.rounds == 0 || args.rounds > 4096)) {
+        std::fprintf(stderr, "bench_victory_prewarm: --rounds must be 1 to 4096\n");
+        return 64;
+    }
+    if ((!translated && !vector && !cache && args.workload != "control") || !known_condition || args.iterations == 0) {
+        std::fprintf(stderr, "usage: bench_victory_prewarm --workload compute|draw|control|vector|cache --condition "
                              "cold|prewarmed|primed|steady [--iterations N] [--salt S] [--launch N] [--series NAME] "
-                             "[--csv FILE] [--samples FILE] [--hold-ms MS] [--elements N]\n");
+                             "[--csv FILE] [--samples FILE] [--hold-ms MS] [--elements N] [--rounds N] "
+                             "[--corrupt-blob]\n");
         return 64;
     }
     const char* shader_path =
         args.workload == "compute" ? "translated compute: GFX10 -> victory-shader bridge -> DXIL -> D3D12Backend (backend path)"
         : args.workload == "draw" ? "translated draw: GFX10 VS+PS -> victory-shader bridge -> DXIL -> D3D12Backend (backend path)"
-        : vector ? "vector kernel: GFX10 container -> victory-shader bridge -> DXIL -> D3D12Backend (backend path)"
+        : vector || cache ? "vector kernel: GFX10 container -> victory-shader bridge -> DXIL -> D3D12Backend (backend path)"
                                   : "control: HLSL -> d3dcompiler -> D3D12Backend indexed draw, pipeline built per call";
     Recorder rec{args, shader_path};
     if (!args.csv.empty()) rec.csv = std::fopen(args.csv.c_str(), "a");
@@ -556,7 +722,8 @@ int main(int argc, char** argv) {
                 adapter.vendor_id, adapter.device_id, adapter.is_warp ? "yes" : "no");
 
     const int rc = translated ? RunTranslated(args, backend, rec, init_ms)
-                   : vector ? RunVector(args, backend, rec, init_ms) : RunControl(args, backend, rec, init_ms);
+                   : vector ? RunVector(args, backend, rec, init_ms)
+                   : cache ? RunCacheAssessment(args, backend, rec, init_ms) : RunControl(args, backend, rec, init_ms);
     if (rec.csv) std::fclose(rec.csv);
     if (rec.samples) std::fclose(rec.samples);
     std::printf("[bench] %s\n", rc == 0 ? "PASS" : "FAIL");

@@ -1110,6 +1110,12 @@ const V_LSHRREV_B32: u8 = 0x16;
 /// c0 and c1 are root constants; `k` is a literal in the code (0 leaves the
 /// last step out), so each `k` is a different shader with a known result.
 fn synthetic_vector_kernel_program(k: u32) -> NativeProgram {
+    synthetic_vector_kernel_rounds(k, 1)
+}
+
+/// The vector kernel with its three shift-and-xor steps repeated `rounds`
+/// times: the same kind of work in a shader of any size.
+fn synthetic_vector_kernel_rounds(k: u32, rounds: u32) -> NativeProgram {
     let mut w = vec![s_mov_b32(5, 0x80)];
     w.extend_from_slice(&s_load_dwordx4(8, 4));
     w.push(vop1(V_MOV_B32, 5, 6)); // v5 = group x
@@ -1117,12 +1123,14 @@ fn synthetic_vector_kernel_program(k: u32) -> NativeProgram {
     w.push(vop2(V_ADD_NC_U32, 5, vgpr(5), 0)); // v5 = i
     w.push(vop2(V_LSHLREV_B32, 16, int(2), 5)); // v16 = 4 i
     w.push(vop2(V_ADD_NC_U32, 1, 0, 5)); // x = c0 + i
-    w.push(vop2(V_LSHLREV_B32, 2, int(13), 1));
-    w.push(vop2(V_XOR_B32, 1, vgpr(1), 2)); // x ^= x << 13
-    w.push(vop2(V_LSHRREV_B32, 2, int(17), 1));
-    w.push(vop2(V_XOR_B32, 1, vgpr(1), 2)); // x ^= x >> 17
-    w.push(vop2(V_LSHLREV_B32, 2, int(5), 1));
-    w.push(vop2(V_XOR_B32, 1, vgpr(1), 2)); // x ^= x << 5
+    for _ in 0..rounds.max(1) {
+        w.push(vop2(V_LSHLREV_B32, 2, int(13), 1));
+        w.push(vop2(V_XOR_B32, 1, vgpr(1), 2)); // x ^= x << 13
+        w.push(vop2(V_LSHRREV_B32, 2, int(17), 1));
+        w.push(vop2(V_XOR_B32, 1, vgpr(1), 2)); // x ^= x >> 17
+        w.push(vop2(V_LSHLREV_B32, 2, int(5), 1));
+        w.push(vop2(V_XOR_B32, 1, vgpr(1), 2)); // x ^= x << 5
+    }
     w.push(vop2(V_ADD_NC_U32, 1, 1, 1)); // x += c1
     if k != 0 {
         w.push(vop2(V_XOR_B32, 1, 255, 1)); // x ^= k
@@ -1139,14 +1147,31 @@ fn synthetic_vector_kernel_program(k: u32) -> NativeProgram {
 /// `sx_victory_buffer_free`.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn sx_victory_synthetic_vector_container(k: u32, out: *mut SxVictoryByteBuffer) -> i32 {
+    // SAFETY: the same contract as the form with rounds.
+    unsafe { sx_victory_synthetic_vector_container_rounds(k, 1, out) }
+}
+
+/// [`sx_victory_synthetic_vector_container`] with the kernel's shift-and-xor
+/// steps repeated `rounds` times (at most 4096), for shaders of different sizes.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn sx_victory_synthetic_vector_container_rounds(
+    k: u32,
+    rounds: u32,
+    out: *mut SxVictoryByteBuffer,
+) -> i32 {
     if out.is_null() {
         return -1;
     }
     // SAFETY: the C++ caller passes a live, exclusive object.
     let output = unsafe { &mut *out };
+    output.data = std::ptr::null_mut();
+    output.size = 0;
+    if rounds == 0 || rounds > 4096 {
+        return 1;
+    }
     hand_over(
         output,
-        console_container(&[(KIND_NATIVE, xbch(&fssm_compute(&synthetic_vector_kernel_program(k))))]),
+        console_container(&[(KIND_NATIVE, xbch(&fssm_compute(&synthetic_vector_kernel_rounds(k, rounds))))]),
     );
     0
 }
@@ -1396,6 +1421,25 @@ mod tests {
         let (plain, a, b) = (translate(0), translate(0x1357_9BDF), translate(0x1357_9BE0));
         assert_ne!(plain, a);
         assert_ne!(a, b);
+    }
+
+    #[test]
+    fn large_kernels_translate() {
+        for rounds in [1u32, 32, 256, 1024] {
+            let native = synthetic_vector_kernel_rounds(7, rounds);
+            let bytes = console_container(&[(KIND_NATIVE, xbch(&fssm_compute(&native)))]);
+            let start = std::time::Instant::now();
+            match translate_compute_container(&bytes) {
+                ComputeInput::Translated(shader, _) => eprintln!(
+                    "rounds {rounds}: {} code bytes -> {} DXIL bytes in {:?}",
+                    native.code.len(),
+                    shader.dxil.len(),
+                    start.elapsed()
+                ),
+                ComputeInput::Refused(text) => panic!("rounds {rounds} refused: {text}"),
+                _ => panic!("rounds {rounds} not translated"),
+            }
+        }
     }
 
     #[test]

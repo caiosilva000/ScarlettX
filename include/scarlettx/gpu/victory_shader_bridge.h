@@ -101,6 +101,7 @@ Status BuildVictorySyntheticContainer(uint32_t variant, std::vector<uint8_t>& ou
 //   x = i + c0;  x ^= x << 13;  x ^= x >> 17;  x ^= x << 5;  out[i] = (x + c1) ^ k
 // c0 and c1 are its first two root constants, `out` the raw UAV of its table, and `k` a literal
 // in the code, so each k is a different shader with a known result.
-Status BuildVictoryVectorKernelContainer(uint32_t k, std::vector<uint8_t>& out_bytes);
+// `rounds` repeats the three shift-and-xor steps (1 to 4096): the same work in a larger shader.
+Status BuildVictoryVectorKernelContainer(uint32_t k, std::vector<uint8_t>& out_bytes, uint32_t rounds = 1);
 
 }  // namespace scarlettx
