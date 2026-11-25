@@ -42,7 +42,7 @@ WINDOW_TITLE = "ScarlettX - Xbox"
 
 # Tests that create a D3D12 device; everything else in an inventory counts as CPU/loader.
 GPU_TESTS = {
-    "test_d3d12_warp", "test_rt_pipeline", "test_shader_pipeline", "test_d3d12_xs_abi", "test_d3d12_guest_texture",
+    "test_d3d12_warp", "test_rt_pipeline", "test_shader_pipeline", "test_d3d12_xs_abi", "test_d3d12_guest_texture", "test_d3d12_guest_texture_order",
     "test_d3d12_list_layout", "test_d3d12_frame_pacing", "test_d3d12_present_window", "test_d3d12_present_frames",
     "test_d3d12_offscreen_probe", "test_d3d12_offscreen_clear", "test_d3d12_offscreen_indexed",
     "test_victory_compute_e2e", "test_victory_compute_guest", "test_d3d12_blend_mrt",
