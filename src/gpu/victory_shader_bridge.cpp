@@ -46,6 +46,23 @@ struct SxVictoryComputeBinding {
     uint32_t static_sampler_count;
     uint32_t flags;
     uint32_t threads[3];
+    struct StaticSampler {
+        uint32_t filter;
+        uint32_t address[3];
+        float mip_lod_bias;
+        uint32_t max_anisotropy;
+        uint32_t comparison;
+        uint32_t border;
+        float min_lod;
+        float max_lod;
+    } static_samplers[4];
+    uint32_t view_count;
+    struct View {
+        uint32_t kind;
+        uint32_t slot;
+        uint32_t table_offset_dwords;
+        uint32_t dwords;
+    } views[8];
 };
 int32_t sx_victory_synthetic_compute_salted(uint32_t, SxVictoryByteBuffer*, SxVictoryComputeBinding*,
                                             SxVictoryShaderInfo*);
@@ -73,6 +90,24 @@ void ConvertBinding(const SxVictoryComputeBinding& binding, scarlettx::VictoryCo
     out.static_sampler_count = binding.static_sampler_count;
     out.flags = binding.flags;
     for (int i = 0; i < 3; ++i) out.threads[i] = binding.threads[i];
+    for (uint32_t i = 0; i < binding.static_sampler_count && i < 4; ++i) {
+        const auto& s = binding.static_samplers[i];
+        scarlettx::VictoryStaticSampler sampler;
+        sampler.filter = s.filter;
+        for (int k = 0; k < 3; ++k) sampler.address[k] = s.address[k];
+        sampler.mip_lod_bias = s.mip_lod_bias;
+        sampler.max_anisotropy = s.max_anisotropy;
+        sampler.comparison = s.comparison;
+        sampler.border = s.border;
+        sampler.min_lod = s.min_lod;
+        sampler.max_lod = s.max_lod;
+        out.static_samplers.push_back(sampler);
+    }
+    out.view_count = binding.view_count;
+    for (uint32_t i = 0; i < binding.view_count && i < 8; ++i) {
+        const auto& v = binding.views[i];
+        out.views.push_back({v.kind, v.slot, v.table_offset_dwords, v.dwords});
+    }
 }
 
 scarlettx::VictoryShaderInfo Convert(const SxVictoryShaderInfo& input) {
@@ -287,21 +322,44 @@ bool VictoryGraphicsBindingSupported(const VictoryComputeBinding& binding, std::
         why = "root constant buffers are not bound yet";
     } else if (binding.root_srv_count || binding.root_uav_count) {
         why = "root buffer views are not bound yet";
-    } else if (binding.sampler_count || binding.static_sampler_count) {
-        why = "samplers are not bound yet";
+    } else if (binding.sampler_count != binding.static_sampler_count) {
+        why = "samplers taken from a heap or a table are not bound yet (only immediate samplers are)";
+    } else if (binding.static_sampler_count > 1 || binding.static_samplers.size() != binding.static_sampler_count) {
+        why = std::to_string(binding.static_sampler_count) + " immediate samplers (one is supported)";
     } else if (binding.flags) {
         why = "the shader needs title-memory or heap tables (flags " + std::to_string(binding.flags) + ")";
+    } else if (binding.view_count > 1 || binding.views.size() != binding.view_count) {
+        why = std::to_string(binding.view_count) + " views in descriptor tables (one texture is supported)";
     } else {
+        static const char* const kKinds[] = {"a constant buffer view", "a shader resource view",
+                                             "an unordered access view", "a sampler"};
+        for (const auto& v : binding.views) {
+            if (v.kind != 1 || v.dwords != 8) {
+                why = "the view in the descriptor table of root parameter " + std::to_string(v.slot) + " is " +
+                      (v.kind < 4 ? kKinds[v.kind] : "of an unknown kind") +
+                      (v.kind == 1 ? " of a buffer" : "") + " (only a texture read as a shader resource is mapped)";
+            } else if (v.table_offset_dwords != 0) {
+                why = "a view that is not the first descriptor of its table (root parameter " +
+                      std::to_string(v.slot) + ")";
+            }
+        }
         for (const auto& u : binding.user_data) {
+            if (!why.empty()) break;
             if (u.index >= binding.user_data_dwords) {
                 why = "a user-data entry lies outside the user data";
             } else if (u.root == 1) {
-                why = "descriptor tables are not mapped for graphics pipelines yet (root parameter " +
-                      std::to_string(u.slot) + ")";
+                bool named = false;
+                for (const auto& v : binding.views) named = named || v.slot == u.slot;
+                if (u.dword != 0) {
+                    why = "a descriptor table entry other than its first dword";
+                } else if (!named) {
+                    why = "the descriptor table of root parameter " + std::to_string(u.slot) +
+                          " is read without a view the program names";
+                }
             } else if (u.root != 0) {
-                why = "user data from root type " + std::to_string(u.root) + " (only root constants are mapped)";
+                why = "user data from root type " + std::to_string(u.root) +
+                      " (only root constants and descriptor tables are mapped)";
             }
-            if (!why.empty()) break;
         }
     }
     return why.empty();

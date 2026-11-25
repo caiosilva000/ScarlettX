@@ -478,6 +478,10 @@ if(SCARLETTX_VICTORY_SHADER_BRIDGE)
     # root bindings, command list and draw, with controls.
     scarlettx_add_test(test_victory_draw_guest tests/test_victory_draw_guest.cpp)
     target_link_libraries(test_victory_draw_guest PRIVATE d3d12_xs)
+    # A translated pixel shader sampling a texture through a guest descriptor table: bindings,
+    # controls and objects released in flight.
+    scarlettx_add_test(test_victory_draw_table tests/test_victory_draw_table.cpp)
+    target_link_libraries(test_victory_draw_table PRIVATE d3d12_xs)
     # A translated pipeline's bindings from one draw to the next: reused, changed, and given
     # back to the title's root signature when a desktop pipeline draws.
     # Directly indexed descriptors: a slot given another buffer's view, a buffer released while a

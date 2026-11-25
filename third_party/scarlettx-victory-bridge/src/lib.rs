@@ -230,6 +230,42 @@ pub struct SxVictoryComputeBinding {
     pub static_sampler_count: u32,
     pub flags: u32,
     pub threads: [u32; 3],
+    /// The immediate samplers, decoded: static sampler `s<n>, space 0` is entry n.
+    pub static_samplers: [SxVictoryStaticSampler; STATIC_SAMPLER_CAPACITY],
+    /// The views the native program takes from descriptor tables, as its own resource list
+    /// names them. More than the capacity: `view_count` says how many there were.
+    pub view_count: u32,
+    pub views: [SxVictoryView; VIEW_CAPACITY],
+}
+
+const STATIC_SAMPLER_CAPACITY: usize = 4;
+const VIEW_CAPACITY: usize = 8;
+
+/// A static sampler the host's root signature declares, in D3D12's own values (filter, address
+/// modes, comparison function, border colour).
+#[repr(C)]
+#[derive(Clone, Copy, Default)]
+pub struct SxVictoryStaticSampler {
+    pub filter: u32,
+    pub address: [u32; 3],
+    pub mip_lod_bias: f32,
+    pub max_anisotropy: u32,
+    pub comparison: u32,
+    pub border: u32,
+    pub min_lod: f32,
+    pub max_lod: f32,
+}
+
+/// A view a native program reads through a descriptor table. `kind`: 0 constant buffer,
+/// 1 shader resource, 2 unordered access, 3 sampler, 255 other. `dwords` is the size of the
+/// console descriptor it loads: 8 for a texture, 4 for a buffer.
+#[repr(C)]
+#[derive(Clone, Copy, Default)]
+pub struct SxVictoryView {
+    pub kind: u32,
+    pub slot: u32,
+    pub table_offset_dwords: u32,
+    pub dwords: u32,
 }
 
 const S_ENDPGM: u32 = 0xBF81_0000;
@@ -468,6 +504,21 @@ fn fill_binding(binding: &mut SxVictoryComputeBinding, shader: &victory_shader::
         | u32::from(shader.heap_writes) << 4
         | u32::from(shader.view_marks) << 5;
     binding.threads = threads;
+    binding.static_samplers = [SxVictoryStaticSampler::default(); STATIC_SAMPLER_CAPACITY];
+    for (dst, src) in binding.static_samplers.iter_mut().zip(&shader.static_samplers) {
+        *dst = SxVictoryStaticSampler {
+            filter: src.filter,
+            address: src.address,
+            mip_lod_bias: src.mip_lod_bias,
+            max_anisotropy: src.max_anisotropy,
+            comparison: src.comparison,
+            border: src.border,
+            min_lod: src.min_lod,
+            max_lod: src.max_lod,
+        };
+    }
+    binding.view_count = 0;
+    binding.views = [SxVictoryView::default(); VIEW_CAPACITY];
 }
 
 // ---------------------------------------------------------------------------
@@ -1161,6 +1212,95 @@ fn synthetic_quad_read_pixel_program() -> NativeProgram {
     }
 }
 
+/// SMEM `s_load_dwordx8 s[dst:dst+7], s[base:base+1], 0`.
+const fn s_load_dwordx8(dst: u8, base: u8) -> [u32; 2] {
+    [
+        0x3D << 26 | 0x03 << 18 | (dst as u32) << 6 | (base as u32 >> 1),
+        125 << 25,
+    ]
+}
+
+/// MIMG `image_sample_lz v[vdata:vdata+3], v[vaddr:vaddr+1], s[srsrc:srsrc+7], s[ssamp:ssamp+3]
+/// dmask:0xf dim:2D`.
+const fn image_sample_lz(vdata: u8, vaddr: u8, srsrc: u8, ssamp: u8) -> [u32; 2] {
+    [
+        0x3C << 26 | 0x27 << 18 | 0xF << 8 | 1 << 3,
+        (ssamp as u32 >> 2) << 21 | (srsrc as u32 >> 2) << 16 | (vdata as u32) << 8 | vaddr as u32,
+    ]
+}
+
+/// The first word of the textured fixture's immediate sampler: clamp in x, y and z. With the
+/// other three words zero it is a point sampler of the base level.
+pub const TEXTURED_SAMPLER_WORD0: u32 = 0x92;
+
+/// A pixel program that samples a texture taken from a descriptor table. From the pixel
+/// position (x in v0, y in v1; `input_addr` asks for both) it samples at (x / 64, y / 64) with
+/// an immediate point sampler that clamps, adds the four root constants (floats) channel by
+/// channel, and writes the sum to render target 0.
+///
+/// Root layout: four root constants in s0..s3 (root parameter 0), a table whose first
+/// descriptor is the texture in s4 (root parameter 1).
+fn synthetic_textured_pixel_program() -> NativeProgram {
+    let mut w = vec![s_mov_b32(5, 0x80)]; // s5 = 0: the table address's high half
+    w.extend_from_slice(&s_load_dwordx8(8, 4)); // s[8:15] = the texture descriptor
+    w.push(sop1(S_MOV_B32, 20, LITERAL));
+    w.push(TEXTURED_SAMPLER_WORD0);
+    for s in 21..24u8 {
+        w.push(s_mov_b32(s, 0x80)); // the sampler's other words: 0
+    }
+    w.push(vop2(V_MUL_F32, 2, LITERAL, 0));
+    w.push((1.0f32 / 64.0).to_bits()); // u = x / 64
+    w.push(vop2(V_MUL_F32, 3, LITERAL, 1));
+    w.push((1.0f32 / 64.0).to_bits()); // v = y / 64
+    w.push(S_WAITCNT_LGKM);
+    w.extend_from_slice(&image_sample_lz(4, 2, 8, 20)); // v[4:7] = the texel
+    for i in 0..4u8 {
+        w.push(vop2(V_ADD_F32, 4 + i, u16::from(i), 4 + i)); // + s<i>
+    }
+    w.extend_from_slice(&exp(EXP_MRT0, [4, 5, 6, 7], true));
+    w.push(S_ENDPGM);
+    NativeProgram {
+        stage: HwStage::Ps,
+        wave64: false,
+        vgprs: 8,
+        layout: vec![
+            RootParam {
+                root: RootType::Constants,
+                table_offset_dwords: 0,
+                sgprs: 4,
+                base_register: 0,
+                user_data: 0,
+                slot: 0,
+            },
+            RootParam {
+                root: RootType::Table,
+                table_offset_dwords: 0,
+                sgprs: 1,
+                base_register: 0,
+                user_data: 4,
+                slot: 1,
+            },
+        ],
+        used: vec![UsedResource {
+            kind: ResourceType::Srv,
+            root: RootType::Table,
+            table_offset_dwords: 0,
+            lower_bound: 0,
+            stride: 0,
+            dwords: 8,
+            user_data: 4,
+            slot: 1,
+        }],
+        io: StageIo::Ps {
+            inputs: vec![],
+            input_addr: PS_ADDR_POS_X | PS_ADDR_POS_Y,
+            db_shader_control: 0,
+            patches: vec![],
+        },
+        code: w.iter().flat_map(|w| w.to_le_bytes()).collect(),
+    }
+}
+
 /// An `ISG1`/`OSG1` part: (name, D3D system value, component type, register, mask) per element.
 fn signature_part(elements: &[(&str, u32, u32, u32, u8)]) -> Vec<u8> {
     let mut out = Vec::new();
@@ -1481,6 +1621,11 @@ fn synthetic_container(variant: u32) -> Option<Vec<u8>> {
             let native = synthetic_quad_read_pixel_program();
             Some(graphics_container(&native, pixel_signatures(), xbch(&fssm_program(&native))))
         }
+        // 17: a pixel program that samples a texture taken from a descriptor table.
+        17 => {
+            let native = synthetic_textured_pixel_program();
+            Some(graphics_container(&native, pixel_signatures(), xbch(&fssm_program(&native))))
+        }
         // The lane exchange (see its function): 13 in a wave of 32, 14 in a wave of 64.
         13 => Some(console_container(&[(KIND_NATIVE, xbch(&fssm_compute(&synthetic_lane_exchange_program(false))))])),
         14 => Some(console_container(&[(KIND_NATIVE, xbch(&fssm_compute(&synthetic_lane_exchange_program(true))))])),
@@ -1640,9 +1785,35 @@ fn translate_stage_into(
                 return 5;
             }
             fill_binding(binding, &shader, threads);
+            fill_views(binding, input, stage);
             hand_over(output, shader.dxil);
             0
         }
+    }
+}
+
+/// The views the stage's native program takes from descriptor tables, from its resource list.
+fn fill_views(binding: &mut SxVictoryComputeBinding, container: &[u8], stage: HwStage) {
+    let Ok(parsed) = Container::parse(container) else { return };
+    let Some(part) = parsed.part(FourCC::DXIL).or(parsed.part(FourCC::ACCC)) else { return };
+    let Ok(programs) = native_programs(part.data) else { return };
+    let Some(native) = programs.iter().find(|p| p.stage == stage) else { return };
+    for used in native.used.iter().filter(|u| u.root == RootType::Table) {
+        if let Some(dst) = binding.views.get_mut(binding.view_count as usize) {
+            *dst = SxVictoryView {
+                kind: match used.kind {
+                    ResourceType::Cbv => 0,
+                    ResourceType::Srv => 1,
+                    ResourceType::Uav => 2,
+                    ResourceType::Sampler => 3,
+                    ResourceType::Other(_) => 255,
+                },
+                slot: u32::from(used.slot),
+                table_offset_dwords: used.table_offset_dwords,
+                dwords: u32::from(used.dwords),
+            };
+        }
+        binding.view_count += 1;
     }
 }
 
@@ -1825,6 +1996,38 @@ mod tests {
         let py = |a: f32, b: f32| ((1.0 - (0.898_437_5 - 0.093_75 * a - 0.890_625 * b)) * 32.0 * 4.0) as i32;
         let made = [[px(0.0, 0.0), py(0.0, 0.0)], [px(1.0, 0.0), py(1.0, 0.0)], [px(0.0, 2.0), py(0.0, 2.0)]];
         assert_eq!(made, EDGE_TRIANGLE_QUARTER_PIXELS);
+    }
+
+    #[test]
+    fn the_textured_pixel_program_translates_with_a_table_and_a_static_sampler() {
+        let bytes = synthetic_container(17).unwrap();
+        let container = Container::parse(&bytes).unwrap();
+        let parsed = native_programs(container.part(FourCC::DXIL).unwrap().data).unwrap();
+        assert_eq!(parsed, [synthetic_textured_pixel_program()]);
+        let ComputeInput::Translated(shader, _) = translate_stage_container(&bytes, HwStage::Ps) else {
+            panic!("not translated");
+        };
+        eprintln!("variant 17: {} bytes of DXIL, user data {:?}", shader.dxil.len(), shader.user_data);
+        // Four root constants and the table.
+        assert_eq!(shader.user_data_dwords(), 8);
+        let tables: Vec<_> = shader.user_data.iter().filter(|u| u.root == RootType::Table).collect();
+        assert_eq!(tables.len(), 1);
+        assert_eq!((tables[0].slot, tables[0].dword), (1, 0));
+        assert_eq!(shader.user_data.iter().filter(|u| u.root == RootType::Constants).count(), 4);
+        // One immediate sampler: point, clamped, the base level.
+        assert_eq!(shader.static_samplers.len(), 1);
+        let sampler = &shader.static_samplers[0];
+        assert_eq!((sampler.filter, sampler.address), (0, [3, 3, 3]));
+        assert!(shader.root_cbvs.is_empty() && shader.root_srvs.is_empty() && shader.root_uavs.is_empty());
+        assert!(!shader.memory && !shader.heap && !shader.view_addresses, "flags");
+        // The binding the host is given names the view.
+        let mut binding: SxVictoryComputeBinding = unsafe { std::mem::zeroed() };
+        fill_binding(&mut binding, &shader, [0, 0, 0]);
+        fill_views(&mut binding, &bytes, HwStage::Ps);
+        assert_eq!(binding.static_sampler_count, 1);
+        assert_eq!(binding.view_count, 1);
+        let view = binding.views[0];
+        assert_eq!((view.kind, view.slot, view.table_offset_dwords, view.dwords), (1, 1, 0, 8));
     }
 
     #[test]

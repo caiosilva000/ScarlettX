@@ -37,6 +37,29 @@ struct VictoryUserData {
     uint32_t dword = 0;  // dword within that parameter
 };
 
+// A static sampler a translated shader expects at s<n>, space 0 (n: its position in the list),
+// in D3D12's own values. The console program carries these samplers as immediate words.
+struct VictoryStaticSampler {
+    uint32_t filter = 0;
+    uint32_t address[3] = {0, 0, 0};
+    float mip_lod_bias = 0.0f;
+    uint32_t max_anisotropy = 0;
+    uint32_t comparison = 0;
+    uint32_t border = 0;
+    float min_lod = 0.0f;
+    float max_lod = 0.0f;
+};
+
+// A view the native program takes from a descriptor table, as its own resource list names it.
+// kind: 0 constant buffer, 1 shader resource, 2 unordered access, 3 sampler, 255 other.
+// dwords: the console descriptor it loads, 8 for a texture, 4 for a buffer.
+struct VictoryView {
+    uint32_t kind = 0;
+    uint32_t slot = 0;  // root parameter of the table
+    uint32_t table_offset_dwords = 0;
+    uint32_t dwords = 0;
+};
+
 // What the host binds for a translated compute shader. The DXIL alone is not enough to build a
 // pipeline: the root signature and the descriptor heap layout come from here.
 struct VictoryComputeBinding {
@@ -51,6 +74,9 @@ struct VictoryComputeBinding {
     // 4 heap writes, 5 view marks: each needs host tables a plain dispatch does not have.
     uint32_t flags = 0;
     uint32_t threads[3] = {0, 0, 0};
+    std::vector<VictoryStaticSampler> static_samplers;  // static_sampler_count of them (at most four are described)
+    uint32_t view_count = 0;                            // table views the program names
+    std::vector<VictoryView> views;                     // at most eight are described
 };
 
 // Translates the bridge's built-in synthetic GFX10 compute fixture (hand-assembled, no title
@@ -93,8 +119,11 @@ VictoryComputeOutcome TranslateVictoryStage(const uint8_t* data, size_t size, Vi
                                             VictoryShaderInfo& out_info, VictoryComputeBinding& out_binding,
                                             std::vector<uint8_t>& out_dxil);
 
-// Whether the first graphics route can bind this stage: its user data fed from the title's root
-// constants only. `why` names the first thing it cannot do.
+// Whether the graphics route can bind this stage. Its user data comes from the title's root
+// constants and from descriptor tables; the tables may name one view in all, a texture read as a
+// shader resource at the start of its table, taken from the title's heap by index; samplers must
+// be immediate ones (at most one), which become static samplers. `why` names the first thing it
+// cannot do.
 bool VictoryGraphicsBindingSupported(const VictoryComputeBinding& binding, std::string& why);
 
 // Whether the first host route can bind this shader: user data as root constants at b0 fed from
@@ -122,6 +151,8 @@ bool WaveLanesSupported(uint32_t expected_min, uint32_t expected_max, bool adapt
 //   descriptor table's UAV (bindings beyond root constants)
 //   13 a lane exchange in a wave of 32 (ds_bpermute_b32: the wave reversed, the halves
 //   exchanged)   14 the same in a wave of 64
+//   17 a pixel program that samples a texture taken from a descriptor table (root parameter 1)
+//   with an immediate point sampler and adds its four root constants (root parameter 0)
 //   15 the quad-read fixture's vertex program (a triangle with three diagonal edges)
 //   16 its pixel program (derivatives and quad reads of a computed value, by DPP quad_perm)
 Status BuildVictorySyntheticContainer(uint32_t variant, std::vector<uint8_t>& out_bytes);

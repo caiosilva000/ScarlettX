@@ -47,7 +47,7 @@ GPU_TESTS = {
     "test_d3d12_offscreen_probe", "test_d3d12_offscreen_clear", "test_d3d12_offscreen_indexed",
     "test_victory_compute_e2e", "test_victory_compute_guest", "test_d3d12_blend_mrt",
     "test_victory_compute_conformance", "test_victory_draw_e2e", "test_victory_draw_guest", "test_victory_draw_reuse", "test_victory_compute_remap",
-    "test_victory_wave64_exchange", "test_victory_quad_edge",
+    "test_victory_wave64_exchange", "test_victory_quad_edge", "test_victory_draw_table",
 }
 # Translated compute (tests/test_victory_compute_e2e.cpp): five dispatches of four dwords each.
 VICTORY_COMPUTE_TEST = "test_victory_compute_e2e"

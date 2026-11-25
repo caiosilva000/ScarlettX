@@ -5555,6 +5555,8 @@ int32_t D3D12XboxGetNativeObject(void* shim_object, void** out_native_object) {
         native = static_cast<XboxD3D12DescriptorHeapProxy*>(shim_object)->pc_heap;
     } else if (vtbl == kXboxCommandAllocatorProxyVtbl.data()) {
         native = static_cast<XboxD3D12CommandAllocatorProxy*>(shim_object)->pc_alloc;
+    } else if (vtbl == kXboxResourceProxyVtbl.data()) {
+        native = static_cast<XboxD3D12ResourceProxy*>(shim_object)->pc_res;
     }
     if (!native) {
         return -2;

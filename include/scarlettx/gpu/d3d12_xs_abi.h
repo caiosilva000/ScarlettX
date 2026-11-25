@@ -253,7 +253,7 @@ SCARLETTX_D3D12_API int32_t D3D12XboxGetNativeDevice(
 // The host object behind an object this shim handed to a title in real-title mode: the
 // ID3D12Device of a device, the ID3D12Object of a root signature or pipeline state, the
 // ID3D12GraphicsCommandList of a command list, the ID3D12DescriptorHeap of a descriptor heap or
-// the ID3D12CommandAllocator of an allocator. The caller owns one reference. 0 on success, -1 bad arguments, -2 not one of those objects.
+// the ID3D12CommandAllocator of an allocator, the ID3D12Resource of a resource. The caller owns one reference. 0 on success, -1 bad arguments, -2 not one of those objects.
 SCARLETTX_D3D12_API int32_t D3D12XboxGetNativeObject(
     void* shim_object,
     void** out_native_object);
