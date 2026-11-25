@@ -1753,6 +1753,17 @@ struct XboxD3D12GraphicsCommandListProxy {
     ID3D12DescriptorHeap* view_heap = nullptr;
     std::unordered_map<uint32_t, std::vector<uint32_t>> compute_constants;  // by root parameter
     std::unordered_map<uint32_t, uint64_t> compute_tables;                  // by root parameter
+    // What is on the host list for compute, as for graphics below: while `compute_host_bound` is
+    // set the host list carries that translated pipeline's root signature and the user data in
+    // `compute_bound_user_data`; the title's own compute root goes back when something needs it
+    // (EnsureTitleCompute).
+    std::shared_ptr<TranslatedComputePipeline> compute_host_bound;
+    std::vector<uint32_t> compute_bound_user_data;
+    std::vector<uint32_t> compute_scratch_user_data;
+    bool compute_arguments_changed = true;  // constants, tables or the view heap, since the user data was built
+    UINT64 view_heap_start = 0;             // of `view_heap`
+    UINT64 view_heap_count = 0;
+    UINT view_heap_increment = 0;
     // The same for the graphics side.
     std::shared_ptr<TranslatedGraphicsPipeline> graphics_translated;
     ID3D12RootSignature* title_graphics_root = nullptr;
@@ -1775,6 +1786,8 @@ void ResetComputeShadow(XboxD3D12GraphicsCommandListProxy* obj) {
     obj->view_heap = nullptr;
     obj->compute_constants.clear();
     obj->compute_tables.clear();
+    obj->compute_host_bound.reset();
+    obj->compute_arguments_changed = true;
     obj->graphics_translated.reset();
     obj->title_graphics_root = nullptr;
     obj->graphics_constants.clear();
@@ -1856,11 +1869,19 @@ void EnsureTitleGraphics(XboxD3D12GraphicsCommandListProxy* obj) {
 // title did not provide drops the dispatch with a diagnostic rather than running it on garbage.
 void DispatchTranslatedCompute(XboxD3D12GraphicsCommandListProxy* obj, UINT x, UINT y, UINT z) {
     const TranslatedComputePipeline& pipeline = *obj->compute_translated;
+    const bool same_root = obj->compute_host_bound == obj->compute_translated;
+    if (same_root && !obj->compute_arguments_changed) {
+        // The previous translated dispatch's bindings still stand.
+        obj->pc_list->Dispatch(x, y, z);
+        g_dispatches_translated.fetch_add(1, std::memory_order_relaxed);
+        return;
+    }
     auto drop = [](const std::string& why) {
         g_dispatches_skipped.fetch_add(1, std::memory_order_relaxed);
         std::cerr << "[ScarlettX][d3d12_xs] translated compute dispatch dropped: " << why << "\n";
     };
-    std::vector<uint32_t> user_data(pipeline.binding.user_data_dwords, 0);
+    std::vector<uint32_t>& user_data = obj->compute_scratch_user_data;
+    user_data.assign(pipeline.binding.user_data_dwords, 0);
     for (const auto& entry : pipeline.binding.user_data) {
         if (entry.root == 0) {  // a root constant
             const auto it = obj->compute_constants.find(entry.slot);
@@ -1875,42 +1896,53 @@ void DispatchTranslatedCompute(XboxD3D12GraphicsCommandListProxy* obj, UINT x, U
             if (it == obj->compute_tables.end()) {
                 return drop("the descriptor table of root parameter " + std::to_string(entry.slot) + " was not set");
             }
-            const UINT64 start = obj->view_heap->GetGPUDescriptorHandleForHeapStart().ptr;
-            const UINT increment =
-                obj->pc_device->GetDescriptorHandleIncrementSize(D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV);
-            const UINT64 count = obj->view_heap->GetDesc().NumDescriptors;
+            const UINT64 start = obj->view_heap_start;
+            const UINT increment = obj->view_heap_increment;
             if (it->second < start || increment == 0 || (it->second - start) % increment != 0 ||
-                (it->second - start) / increment >= count) {
+                (it->second - start) / increment >= obj->view_heap_count) {
                 return drop("the descriptor table of root parameter " + std::to_string(entry.slot) +
                             " does not point into the bound heap");
             }
             user_data[entry.index] = static_cast<uint32_t>((it->second - start) / increment) * 32u;
         }
     }
-    obj->pc_list->SetComputeRootSignature(pipeline.host_root);
-    obj->pc_list->SetComputeRoot32BitConstants(0, static_cast<UINT>(user_data.size()), user_data.data(), 0);
+    if (!same_root) {
+        obj->pc_list->SetComputeRootSignature(pipeline.host_root);
+        obj->compute_host_bound = obj->compute_translated;
+        g_compute_host_root_binds.fetch_add(1, std::memory_order_relaxed);
+    }
+    if (!same_root || user_data != obj->compute_bound_user_data) {
+        obj->pc_list->SetComputeRoot32BitConstants(0, static_cast<UINT>(user_data.size()), user_data.data(), 0);
+        obj->compute_bound_user_data = user_data;
+        g_compute_user_data_sets.fetch_add(1, std::memory_order_relaxed);
+    }
+    obj->compute_arguments_changed = false;
     obj->pc_list->Dispatch(x, y, z);
     g_dispatches_translated.fetch_add(1, std::memory_order_relaxed);
-    g_compute_host_root_binds.fetch_add(1, std::memory_order_relaxed);
-    g_compute_user_data_sets.fetch_add(1, std::memory_order_relaxed);
+}
 
-    // The title's root signature and arguments, for whatever it runs next with another pipeline.
-    if (obj->title_compute_root) {
-        obj->pc_list->SetComputeRootSignature(obj->title_compute_root);
-        uint64_t replayed = 0;
-        for (const auto& [slot, values] : obj->compute_constants) {
-            if (!values.empty()) {
-                obj->pc_list->SetComputeRoot32BitConstants(slot, static_cast<UINT>(values.size()), values.data(), 0);
-                ++replayed;
-            }
-        }
-        for (const auto& [slot, handle] : obj->compute_tables) {
-            obj->pc_list->SetComputeRootDescriptorTable(slot, D3D12_GPU_DESCRIPTOR_HANDLE{handle});
+// Puts the title's own compute root signature and arguments back on the host list, if a
+// translated dispatch left its host root signature there. Called before anything that needs the
+// title's root on the host list: a dispatch with a desktop pipeline, or a root argument that is
+// not shadowed.
+void EnsureTitleCompute(XboxD3D12GraphicsCommandListProxy* obj) {
+    if (!obj->compute_host_bound) return;
+    obj->compute_host_bound.reset();
+    if (!obj->title_compute_root) return;
+    obj->pc_list->SetComputeRootSignature(obj->title_compute_root);
+    uint64_t replayed = 0;
+    for (const auto& [slot, values] : obj->compute_constants) {
+        if (!values.empty()) {
+            obj->pc_list->SetComputeRoot32BitConstants(slot, static_cast<UINT>(values.size()), values.data(), 0);
             ++replayed;
         }
-        g_compute_title_root_restores.fetch_add(1, std::memory_order_relaxed);
-        g_compute_title_arguments_replayed.fetch_add(replayed, std::memory_order_relaxed);
     }
+    for (const auto& [slot, handle] : obj->compute_tables) {
+        obj->pc_list->SetComputeRootDescriptorTable(slot, D3D12_GPU_DESCRIPTOR_HANDLE{handle});
+        ++replayed;
+    }
+    g_compute_title_root_restores.fetch_add(1, std::memory_order_relaxed);
+    g_compute_title_arguments_replayed.fetch_add(replayed, std::memory_order_relaxed);
 }
 #endif
 intptr_t SCARLETTX_GDK_CALLBACK CmdListQueryInterface(void* self, uintptr_t, uintptr_t ppv, uintptr_t) {
@@ -2000,11 +2032,17 @@ intptr_t SCARLETTX_GDK_CALLBACK CmdListSetDescriptorHeaps(void* self, uintptr_t 
     std::vector<ID3D12DescriptorHeap*> pc_heaps;
     pc_heaps.reserve(num);
     obj->view_heap = nullptr;
+    obj->compute_arguments_changed = true;  // a table's index is relative to the heap
     for (uintptr_t i = 0; i < num; ++i) {
         if (guest_heaps[i] && guest_heaps[i]->pc_heap) {
             pc_heaps.push_back(guest_heaps[i]->pc_heap);
-            if (guest_heaps[i]->pc_heap->GetDesc().Type == D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV) {
+            const D3D12_DESCRIPTOR_HEAP_DESC heap_desc = guest_heaps[i]->pc_heap->GetDesc();
+            if (heap_desc.Type == D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV) {
                 obj->view_heap = guest_heaps[i]->pc_heap;
+                obj->view_heap_start = obj->view_heap->GetGPUDescriptorHandleForHeapStart().ptr;
+                obj->view_heap_count = heap_desc.NumDescriptors;
+                obj->view_heap_increment = obj->pc_device
+                    ? obj->pc_device->GetDescriptorHandleIncrementSize(D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV) : 0;
             }
         }
     }
@@ -2202,6 +2240,7 @@ intptr_t SCARLETTX_GDK_CALLBACK CmdListClearState(void* self, uintptr_t pPso, ui
         }
         obj->pc_list->ClearState(pc_pso);
         obj->host_bound.reset();  // the host list has no root signature now
+        obj->compute_host_bound.reset();
     }
 #endif
     return 0;
@@ -2353,6 +2392,7 @@ intptr_t SCARLETTX_GDK_CALLBACK CmdListDispatch(void* self, uintptr_t x, uintptr
     if (obj->pc_list && obj->compute_translated) {
         DispatchTranslatedCompute(obj, static_cast<UINT>(x), static_cast<UINT>(y), static_cast<UINT>(z));
     } else if (obj->pc_list) {
+        EnsureTitleCompute(obj);
         obj->pc_list->Dispatch(static_cast<UINT>(x), static_cast<UINT>(y), static_cast<UINT>(z));
     }
 #endif
@@ -2470,8 +2510,14 @@ intptr_t SCARLETTX_GDK_CALLBACK CmdListSetComputeRootSignature(void* self, uintp
             obj->compute_constants.clear();
             obj->compute_tables.clear();
             obj->title_compute_root = pc_rs;
+            obj->compute_arguments_changed = true;
         }
-        obj->pc_list->SetComputeRootSignature(pc_rs);
+        if (obj->compute_host_bound) {
+            EnsureTitleCompute(obj);  // the title's root goes back, with the arguments it still holds on it
+            if (!pc_rs) obj->pc_list->SetComputeRootSignature(nullptr);
+        } else {
+            obj->pc_list->SetComputeRootSignature(pc_rs);
+        }
     }
 #endif
     return 0;
@@ -2512,7 +2558,8 @@ intptr_t SCARLETTX_GDK_CALLBACK CmdListSetComputeRootDescriptorTable(
     if (obj->pc_list) {
         D3D12_GPU_DESCRIPTOR_HANDLE h{static_cast<UINT64>(baseDesc)};
         obj->compute_tables[static_cast<uint32_t>(rootParamIdx)] = h.ptr;
-        obj->pc_list->SetComputeRootDescriptorTable(static_cast<UINT>(rootParamIdx), h);
+        obj->compute_arguments_changed = true;
+        if (!obj->compute_host_bound) obj->pc_list->SetComputeRootDescriptorTable(static_cast<UINT>(rootParamIdx), h);
     }
 #endif
     return 0;
@@ -2545,9 +2592,14 @@ intptr_t SCARLETTX_GDK_CALLBACK CmdListSetComputeRoot32BitConstant(
         if (destOffset < 64) {
             if (shadow.size() <= destOffset) shadow.resize(destOffset + 1, 0);
             shadow[destOffset] = static_cast<uint32_t>(srcData);
+        } else {
+            EnsureTitleCompute(obj);  // not shadowed
         }
-        obj->pc_list->SetComputeRoot32BitConstant(
-            static_cast<UINT>(rootParamIdx), static_cast<UINT>(srcData), static_cast<UINT>(destOffset));
+        obj->compute_arguments_changed = true;
+        if (!obj->compute_host_bound) {
+            obj->pc_list->SetComputeRoot32BitConstant(
+                static_cast<UINT>(rootParamIdx), static_cast<UINT>(srcData), static_cast<UINT>(destOffset));
+        }
     }
 #endif
     return 0;
@@ -2581,10 +2633,15 @@ intptr_t SCARLETTX_GDK_CALLBACK CmdListSetComputeRoot32BitConstants(
             auto& shadow = obj->compute_constants[static_cast<uint32_t>(rootParamIdx)];
             if (shadow.size() < destOffset + numVals) shadow.resize(destOffset + numVals, 0);
             std::memcpy(shadow.data() + destOffset, reinterpret_cast<const void*>(pSrcData), numVals * 4);
+        } else {
+            EnsureTitleCompute(obj);  // not shadowed
         }
-        obj->pc_list->SetComputeRoot32BitConstants(
-            static_cast<UINT>(rootParamIdx), static_cast<UINT>(numVals),
-            reinterpret_cast<const void*>(pSrcData), static_cast<UINT>(destOffset));
+        obj->compute_arguments_changed = true;
+        if (!obj->compute_host_bound) {
+            obj->pc_list->SetComputeRoot32BitConstants(
+                static_cast<UINT>(rootParamIdx), static_cast<UINT>(numVals),
+                reinterpret_cast<const void*>(pSrcData), static_cast<UINT>(destOffset));
+        }
     }
 #endif
     return 0;
@@ -2614,7 +2671,10 @@ intptr_t SCARLETTX_GDK_CALLBACK CmdListSetGraphicsRoot32BitConstants(
 intptr_t SCARLETTX_GDK_CALLBACK CmdListSetComputeRootCBV(void* self, uintptr_t idx, uintptr_t loc, uintptr_t) {
 #if defined(_WIN32)
     auto* obj = static_cast<XboxD3D12GraphicsCommandListProxy*>(self);
-    if (obj->pc_list) obj->pc_list->SetComputeRootConstantBufferView(static_cast<UINT>(idx), static_cast<D3D12_GPU_VIRTUAL_ADDRESS>(loc));
+    if (obj->pc_list) {
+        EnsureTitleCompute(obj);  // root views are not shadowed
+        obj->pc_list->SetComputeRootConstantBufferView(static_cast<UINT>(idx), static_cast<D3D12_GPU_VIRTUAL_ADDRESS>(loc));
+    }
 #endif
     return 0;
 }
@@ -2631,7 +2691,10 @@ intptr_t SCARLETTX_GDK_CALLBACK CmdListSetGraphicsRootCBV(void* self, uintptr_t 
 intptr_t SCARLETTX_GDK_CALLBACK CmdListSetComputeRootSRV(void* self, uintptr_t idx, uintptr_t loc, uintptr_t) {
 #if defined(_WIN32)
     auto* obj = static_cast<XboxD3D12GraphicsCommandListProxy*>(self);
-    if (obj->pc_list) obj->pc_list->SetComputeRootShaderResourceView(static_cast<UINT>(idx), static_cast<D3D12_GPU_VIRTUAL_ADDRESS>(loc));
+    if (obj->pc_list) {
+        EnsureTitleCompute(obj);  // root views are not shadowed
+        obj->pc_list->SetComputeRootShaderResourceView(static_cast<UINT>(idx), static_cast<D3D12_GPU_VIRTUAL_ADDRESS>(loc));
+    }
 #endif
     return 0;
 }
@@ -2648,7 +2711,10 @@ intptr_t SCARLETTX_GDK_CALLBACK CmdListSetGraphicsRootSRV(void* self, uintptr_t 
 intptr_t SCARLETTX_GDK_CALLBACK CmdListSetComputeRootUAV(void* self, uintptr_t idx, uintptr_t loc, uintptr_t) {
 #if defined(_WIN32)
     auto* obj = static_cast<XboxD3D12GraphicsCommandListProxy*>(self);
-    if (obj->pc_list) obj->pc_list->SetComputeRootUnorderedAccessView(static_cast<UINT>(idx), static_cast<D3D12_GPU_VIRTUAL_ADDRESS>(loc));
+    if (obj->pc_list) {
+        EnsureTitleCompute(obj);  // root views are not shadowed
+        obj->pc_list->SetComputeRootUnorderedAccessView(static_cast<UINT>(idx), static_cast<D3D12_GPU_VIRTUAL_ADDRESS>(loc));
+    }
 #endif
     return 0;
 }
