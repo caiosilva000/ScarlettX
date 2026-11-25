@@ -441,6 +441,10 @@ if(SCARLETTX_VICTORY_SHADER_BRIDGE)
     scarlettx_add_test(test_victory_shader_bridge tests/test_victory_shader_bridge.cpp)
     # Synthetic GFX10 compute -> DXIL -> D3D12 dispatch -> exact readback.
     scarlettx_add_test(test_victory_compute_e2e tests/test_victory_compute_e2e.cpp)
+    # The same program as a console-shaped container, through the shim's pipeline creation and
+    # command list (the guest-facing route), with controls.
+    scarlettx_add_test(test_victory_compute_guest tests/test_victory_compute_guest.cpp)
+    target_link_libraries(test_victory_compute_guest PRIVATE d3d12_xs)
 endif()
 
 # Offscreen D3D12Backend probe: exact render-target clear, then an indexed draw, each with fence

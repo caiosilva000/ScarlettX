@@ -251,14 +251,24 @@ SCARLETTX_D3D12_API int32_t D3D12XboxGetNativeDevice(
     uint64_t device_handle,
     void** out_id3d12_device);
 // The host object behind an object this shim handed to a title in real-title mode: the
-// ID3D12Device of a device, or the ID3D12Object of a root signature or pipeline state. The
-// caller owns one reference. 0 on success, -1 bad arguments, -2 not one of those objects.
+// ID3D12Device of a device, the ID3D12Object of a root signature or pipeline state, the
+// ID3D12GraphicsCommandList of a command list, the ID3D12DescriptorHeap of a descriptor heap or
+// the ID3D12CommandAllocator of an allocator. The caller owns one reference. 0 on success, -1 bad arguments, -2 not one of those objects.
 SCARLETTX_D3D12_API int32_t D3D12XboxGetNativeObject(
     void* shim_object,
     void** out_native_object);
 // How many graphics pipelines this shim has created with blending switched off for a render
 // target the host cannot blend into (scarlettx/gpu/blend_normalize.h).
 SCARLETTX_D3D12_API uint64_t D3D12XboxBlendAdjustedPipelineCount(void);
+// What compute pipeline creation and dispatch did with native (console) shaders so far.
+struct D3D12XBOX_SHADER_TRANSLATION_STATS {
+    uint64_t compute_translated;      // pipelines created from translated native code
+    uint64_t compute_passed_through;  // pipelines whose shader went to the host as it was
+    uint64_t compute_rejected;        // native shaders refused, each with a diagnostic
+    uint64_t dispatches_translated;   // dispatches that ran a translated pipeline
+    uint64_t dispatches_skipped;      // dispatches dropped because a binding was missing
+};
+SCARLETTX_D3D12_API int32_t D3D12XboxGetShaderTranslationStats(D3D12XBOX_SHADER_TRANSLATION_STATS* out_stats);
 SCARLETTX_D3D12_API int32_t D3D12XboxQueryCapabilities(
     uint64_t device_handle,
     D3D12XBOX_CAPABILITIES* out_caps);

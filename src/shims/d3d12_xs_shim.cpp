@@ -22,6 +22,7 @@
 #include "scarlettx/gpu/d3d12_backend.h"
 #include "scarlettx/gpu/rt_bvh.h"
 #include "scarlettx/gpu/shader_ir.h"
+#include "scarlettx/gpu/victory_shader_bridge.h"
 
 #if defined(_WIN32)
 #include <windows.h>
@@ -212,6 +213,37 @@ bool TraceEnabled() {
 
 // Graphics pipelines created with blending switched off for an unblendable render target.
 std::atomic<uint64_t> g_blend_adjusted_pipelines{0};
+// Native (console) compute shaders: see D3D12XBOX_SHADER_TRANSLATION_STATS.
+std::atomic<uint64_t> g_compute_translated{0};
+std::atomic<uint64_t> g_compute_passed_through{0};
+std::atomic<uint64_t> g_compute_rejected{0};
+std::atomic<uint64_t> g_dispatches_translated{0};
+std::atomic<uint64_t> g_dispatches_skipped{0};
+
+#if defined(_WIN32)
+// A compute pipeline made from translated native code. The translated shader does not use the
+// title's root signature: it reads one block of user data (root constants at b0) and takes its
+// views from the descriptor heap by index. `binding` says which of the title's root arguments
+// each user-data dword comes from.
+struct TranslatedComputePipeline {
+    ID3D12RootSignature* host_root = nullptr;  // owned
+    scarlettx::VictoryComputeBinding binding;
+    ~TranslatedComputePipeline() {
+        if (host_root) host_root->Release();
+    }
+};
+const char* const kKindTranslatedCompute = "TranslatedComputePipelineState";
+std::mutex g_translated_compute_mutex;
+// By the pipeline-state object handed to the title.
+std::unordered_map<const void*, std::shared_ptr<TranslatedComputePipeline>> g_translated_compute;
+
+std::shared_ptr<TranslatedComputePipeline> FindTranslatedCompute(const void* pso_proxy) {
+    if (!pso_proxy) return nullptr;
+    std::lock_guard<std::mutex> lock(g_translated_compute_mutex);
+    const auto it = g_translated_compute.find(pso_proxy);
+    return it == g_translated_compute.end() ? nullptr : it->second;
+}
+#endif
 
 bool RealTitleMode() {
     const char* v = std::getenv("SCARLETTX_REAL_TITLE");
@@ -684,6 +716,10 @@ intptr_t SCARLETTX_GDK_CALLBACK SimpleObjRelease(void* self, uintptr_t, uintptr_
     const uint32_t rem = obj->ref_count.fetch_sub(1, std::memory_order_acq_rel) - 1;
     if (rem == 0) {
 #if defined(_WIN32)
+        if (obj->kind == kKindTranslatedCompute) {
+            std::lock_guard<std::mutex> lock(g_translated_compute_mutex);
+            g_translated_compute.erase(obj);
+        }
         if (obj->pc_obj) obj->pc_obj->Release();
 #endif
         delete obj;
@@ -1278,8 +1314,79 @@ struct XboxD3D12GraphicsCommandListProxy {
     ID3D12Resource* scratch_buf = nullptr;
     uint64_t scratch_size = 0;
     std::vector<ID3D12Resource*> retired_scratch;
+    // The compute state as the title set it. A translated pipeline is fed from it at dispatch,
+    // and it is put back afterwards. None of the pointers are owned.
+    std::shared_ptr<TranslatedComputePipeline> compute_translated;  // the current pipeline, if translated
+    ID3D12RootSignature* title_compute_root = nullptr;
+    ID3D12DescriptorHeap* view_heap = nullptr;
+    std::unordered_map<uint32_t, std::vector<uint32_t>> compute_constants;  // by root parameter
+    std::unordered_map<uint32_t, uint64_t> compute_tables;                  // by root parameter
 #endif
 };
+#if defined(_WIN32)
+void ResetComputeShadow(XboxD3D12GraphicsCommandListProxy* obj) {
+    obj->compute_translated.reset();
+    obj->title_compute_root = nullptr;
+    obj->view_heap = nullptr;
+    obj->compute_constants.clear();
+    obj->compute_tables.clear();
+}
+
+// Runs a dispatch of a translated compute pipeline: the host root signature, the user data built
+// from the title's root arguments, the dispatch, then the title's own state again. A binding the
+// title did not provide drops the dispatch with a diagnostic rather than running it on garbage.
+void DispatchTranslatedCompute(XboxD3D12GraphicsCommandListProxy* obj, UINT x, UINT y, UINT z) {
+    const TranslatedComputePipeline& pipeline = *obj->compute_translated;
+    auto drop = [](const std::string& why) {
+        g_dispatches_skipped.fetch_add(1, std::memory_order_relaxed);
+        std::cerr << "[ScarlettX][d3d12_xs] translated compute dispatch dropped: " << why << "\n";
+    };
+    std::vector<uint32_t> user_data(pipeline.binding.user_data_dwords, 0);
+    for (const auto& entry : pipeline.binding.user_data) {
+        if (entry.root == 0) {  // a root constant
+            const auto it = obj->compute_constants.find(entry.slot);
+            if (it == obj->compute_constants.end() || entry.dword >= it->second.size()) {
+                return drop("root constant " + std::to_string(entry.dword) + " of root parameter " +
+                            std::to_string(entry.slot) + " was not set");
+            }
+            user_data[entry.index] = it->second[entry.dword];
+        } else {  // a descriptor table: the byte offset of its first descriptor, 32 bytes each
+            if (!obj->view_heap) return drop("no CBV/SRV/UAV descriptor heap is bound");
+            const auto it = obj->compute_tables.find(entry.slot);
+            if (it == obj->compute_tables.end()) {
+                return drop("the descriptor table of root parameter " + std::to_string(entry.slot) + " was not set");
+            }
+            const UINT64 start = obj->view_heap->GetGPUDescriptorHandleForHeapStart().ptr;
+            const UINT increment =
+                obj->pc_device->GetDescriptorHandleIncrementSize(D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV);
+            const UINT64 count = obj->view_heap->GetDesc().NumDescriptors;
+            if (it->second < start || increment == 0 || (it->second - start) % increment != 0 ||
+                (it->second - start) / increment >= count) {
+                return drop("the descriptor table of root parameter " + std::to_string(entry.slot) +
+                            " does not point into the bound heap");
+            }
+            user_data[entry.index] = static_cast<uint32_t>((it->second - start) / increment) * 32u;
+        }
+    }
+    obj->pc_list->SetComputeRootSignature(pipeline.host_root);
+    obj->pc_list->SetComputeRoot32BitConstants(0, static_cast<UINT>(user_data.size()), user_data.data(), 0);
+    obj->pc_list->Dispatch(x, y, z);
+    g_dispatches_translated.fetch_add(1, std::memory_order_relaxed);
+
+    // The title's root signature and arguments, for whatever it runs next with another pipeline.
+    if (obj->title_compute_root) {
+        obj->pc_list->SetComputeRootSignature(obj->title_compute_root);
+        for (const auto& [slot, values] : obj->compute_constants) {
+            if (!values.empty()) {
+                obj->pc_list->SetComputeRoot32BitConstants(slot, static_cast<UINT>(values.size()), values.data(), 0);
+            }
+        }
+        for (const auto& [slot, handle] : obj->compute_tables) {
+            obj->pc_list->SetComputeRootDescriptorTable(slot, D3D12_GPU_DESCRIPTOR_HANDLE{handle});
+        }
+    }
+}
+#endif
 intptr_t SCARLETTX_GDK_CALLBACK CmdListQueryInterface(void* self, uintptr_t, uintptr_t ppv, uintptr_t) {
     auto* obj = static_cast<XboxD3D12GraphicsCommandListProxy*>(self);
     auto** out = reinterpret_cast<void**>(ppv);
@@ -1346,6 +1453,8 @@ intptr_t SCARLETTX_GDK_CALLBACK CmdListReset(void* self, uintptr_t pAlloc, uintp
         pc_pso = reinterpret_cast<ID3D12PipelineState*>(pso_proxy->pc_obj);
     }
     const HRESULT hr = obj->pc_list->Reset(alloc_proxy->pc_alloc, pc_pso);
+    ResetComputeShadow(obj);
+    obj->compute_translated = FindTranslatedCompute(reinterpret_cast<const void*>(pPso));
     if (TraceEnabled()) {
         std::cerr << "[ScarlettX][d3d12_xs] CmdList::Reset(self=" << self << ", alloc=" << alloc_proxy
                   << ", pso=" << reinterpret_cast<void*>(pPso) << ") -> 0x"
@@ -1363,8 +1472,14 @@ intptr_t SCARLETTX_GDK_CALLBACK CmdListSetDescriptorHeaps(void* self, uintptr_t 
     auto** guest_heaps = reinterpret_cast<XboxD3D12DescriptorHeapProxy**>(ppHeaps);
     std::vector<ID3D12DescriptorHeap*> pc_heaps;
     pc_heaps.reserve(num);
+    obj->view_heap = nullptr;
     for (uintptr_t i = 0; i < num; ++i) {
-        if (guest_heaps[i] && guest_heaps[i]->pc_heap) pc_heaps.push_back(guest_heaps[i]->pc_heap);
+        if (guest_heaps[i] && guest_heaps[i]->pc_heap) {
+            pc_heaps.push_back(guest_heaps[i]->pc_heap);
+            if (guest_heaps[i]->pc_heap->GetDesc().Type == D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV) {
+                obj->view_heap = guest_heaps[i]->pc_heap;
+            }
+        }
     }
     if (TraceEnabled()) {
         std::cerr << "[ScarlettX][d3d12_xs] CmdList::SetDescriptorHeaps(self=" << self
@@ -1693,7 +1808,9 @@ intptr_t SCARLETTX_GDK_CALLBACK CmdListDrawIndexedInstanced(
 intptr_t SCARLETTX_GDK_CALLBACK CmdListDispatch(void* self, uintptr_t x, uintptr_t y, uintptr_t z) {
 #if defined(_WIN32)
     auto* obj = static_cast<XboxD3D12GraphicsCommandListProxy*>(self);
-    if (obj->pc_list) {
+    if (obj->pc_list && obj->compute_translated) {
+        DispatchTranslatedCompute(obj, static_cast<UINT>(x), static_cast<UINT>(y), static_cast<UINT>(z));
+    } else if (obj->pc_list) {
         obj->pc_list->Dispatch(static_cast<UINT>(x), static_cast<UINT>(y), static_cast<UINT>(z));
     }
 #endif
@@ -1788,6 +1905,8 @@ intptr_t SCARLETTX_GDK_CALLBACK CmdListSetPipelineState(void* self, uintptr_t pP
         if (pso->pc_obj) {
             obj->pc_list->SetPipelineState(reinterpret_cast<ID3D12PipelineState*>(pso->pc_obj));
         }
+        obj->compute_translated =
+            pso->kind == kKindTranslatedCompute ? FindTranslatedCompute(pso) : nullptr;
     }
 #endif
     return 0;
@@ -1800,6 +1919,12 @@ intptr_t SCARLETTX_GDK_CALLBACK CmdListSetComputeRootSignature(void* self, uintp
         if (pRs) {
             auto* rs = reinterpret_cast<XboxD3D12SimpleObjectProxy*>(pRs);
             pc_rs = reinterpret_cast<ID3D12RootSignature*>(rs->pc_obj);
+        }
+        if (pc_rs != obj->title_compute_root) {
+            // A different root signature: its arguments start unset, as on the host.
+            obj->compute_constants.clear();
+            obj->compute_tables.clear();
+            obj->title_compute_root = pc_rs;
         }
         obj->pc_list->SetComputeRootSignature(pc_rs);
     }
@@ -1827,6 +1952,7 @@ intptr_t SCARLETTX_GDK_CALLBACK CmdListSetComputeRootDescriptorTable(
     auto* obj = static_cast<XboxD3D12GraphicsCommandListProxy*>(self);
     if (obj->pc_list) {
         D3D12_GPU_DESCRIPTOR_HANDLE h{static_cast<UINT64>(baseDesc)};
+        obj->compute_tables[static_cast<uint32_t>(rootParamIdx)] = h.ptr;
         obj->pc_list->SetComputeRootDescriptorTable(static_cast<UINT>(rootParamIdx), h);
     }
 #endif
@@ -1853,6 +1979,11 @@ intptr_t SCARLETTX_GDK_CALLBACK CmdListSetComputeRoot32BitConstant(
 #if defined(_WIN32)
     auto* obj = static_cast<XboxD3D12GraphicsCommandListProxy*>(self);
     if (obj->pc_list) {
+        auto& shadow = obj->compute_constants[static_cast<uint32_t>(rootParamIdx)];
+        if (destOffset < 64) {
+            if (shadow.size() <= destOffset) shadow.resize(destOffset + 1, 0);
+            shadow[destOffset] = static_cast<uint32_t>(srcData);
+        }
         obj->pc_list->SetComputeRoot32BitConstant(
             static_cast<UINT>(rootParamIdx), static_cast<UINT>(srcData), static_cast<UINT>(destOffset));
     }
@@ -1875,6 +2006,11 @@ intptr_t SCARLETTX_GDK_CALLBACK CmdListSetComputeRoot32BitConstants(
 #if defined(_WIN32)
     auto* obj = static_cast<XboxD3D12GraphicsCommandListProxy*>(self);
     if (obj->pc_list && pSrcData) {
+        if (destOffset < 64 && numVals <= 64 - destOffset) {
+            auto& shadow = obj->compute_constants[static_cast<uint32_t>(rootParamIdx)];
+            if (shadow.size() < destOffset + numVals) shadow.resize(destOffset + numVals, 0);
+            std::memcpy(shadow.data() + destOffset, reinterpret_cast<const void*>(pSrcData), numVals * 4);
+        }
         obj->pc_list->SetComputeRoot32BitConstants(
             static_cast<UINT>(rootParamIdx), static_cast<UINT>(numVals),
             reinterpret_cast<const void*>(pSrcData), static_cast<UINT>(destOffset));
@@ -3293,6 +3429,86 @@ intptr_t SCARLETTX_GDK_CALLBACK ProxyCreateComputePipelineState(
         desc.pRootSignature = reinterpret_cast<ID3D12RootSignature*>(
             reinterpret_cast<XboxD3D12SimpleObjectProxy*>(desc.pRootSignature)->pc_obj);
     }
+    // A console shader container carries native code the host cannot run: translate it and
+    // build the pipeline the translated shader expects. Anything else goes to the host as it is.
+    scarlettx::VictoryShaderInfo shader_info;
+    scarlettx::VictoryComputeBinding binding;
+    std::vector<uint8_t> translated;
+    const auto outcome = scarlettx::TranslateVictoryCompute(
+        static_cast<const uint8_t*>(desc.CS.pShaderBytecode), desc.CS.BytecodeLength, shader_info, binding,
+        translated);
+    auto reject = [&](HRESULT code, const std::string& why) {
+        g_compute_rejected.fetch_add(1, std::memory_order_relaxed);
+        std::cerr << "[ScarlettX][d3d12_xs] CreateComputePipelineState: native shader refused ("
+                  << scarlettx::VictoryComputeOutcomeName(outcome) << "): " << why << "\n";
+        return static_cast<intptr_t>(code);
+    };
+    switch (outcome) {
+        case scarlettx::VictoryComputeOutcome::NoNativeCompute:
+        case scarlettx::VictoryComputeOutcome::Malformed:
+            return reject(E_INVALIDARG, shader_info.message);
+        case scarlettx::VictoryComputeOutcome::Refused:
+            return reject(E_NOTIMPL, shader_info.message);
+        case scarlettx::VictoryComputeOutcome::Translated: {
+            std::string why;
+            if (!scarlettx::VictoryComputeBindingSupported(binding, why)) {
+                return reject(E_NOTIMPL, "its bindings are not supported yet: " + why);
+            }
+            // The host root signature: the user data, and views by heap index.
+            D3D12_ROOT_PARAMETER user_data{};
+            user_data.ParameterType = D3D12_ROOT_PARAMETER_TYPE_32BIT_CONSTANTS;
+            user_data.Constants.ShaderRegister = 0;
+            user_data.Constants.RegisterSpace = 0;
+            user_data.Constants.Num32BitValues = binding.user_data_dwords;
+            user_data.ShaderVisibility = D3D12_SHADER_VISIBILITY_ALL;
+            D3D12_ROOT_SIGNATURE_DESC rs_desc{};
+            rs_desc.NumParameters = 1;
+            rs_desc.pParameters = &user_data;
+            rs_desc.Flags = static_cast<D3D12_ROOT_SIGNATURE_FLAGS>(
+                D3D12_ROOT_SIGNATURE_FLAG_CBV_SRV_UAV_HEAP_DIRECTLY_INDEXED |
+                D3D12_ROOT_SIGNATURE_FLAG_SAMPLER_HEAP_DIRECTLY_INDEXED);
+            ID3DBlob* rs_blob = nullptr;
+            ID3DBlob* rs_error = nullptr;
+            HRESULT rs_hr = CallSystemD3D12SerializeRootSignature(&rs_desc, D3D_ROOT_SIGNATURE_VERSION_1, &rs_blob,
+                                                                  &rs_error);
+            if (rs_error) rs_error->Release();
+            auto pipeline = std::make_shared<TranslatedComputePipeline>();
+            if (SUCCEEDED(rs_hr)) {
+                rs_hr = obj->pc_device->CreateRootSignature(0, rs_blob->GetBufferPointer(), rs_blob->GetBufferSize(),
+                                                            IID_PPV_ARGS(&pipeline->host_root));
+            }
+            if (rs_blob) rs_blob->Release();
+            if (FAILED(rs_hr)) return reject(rs_hr, "the host root signature for the translated shader failed");
+            D3D12_COMPUTE_PIPELINE_STATE_DESC host_desc = desc;
+            host_desc.pRootSignature = pipeline->host_root;
+            host_desc.CS.pShaderBytecode = translated.data();
+            host_desc.CS.BytecodeLength = translated.size();
+            ID3D12PipelineState* host_pso = nullptr;
+            const HRESULT pso_hr = obj->pc_device->CreateComputePipelineState(&host_desc, IID_PPV_ARGS(&host_pso));
+            if (FAILED(pso_hr) || !host_pso) {
+                return reject(FAILED(pso_hr) ? pso_hr : E_FAIL, "the host refused the translated shader");
+            }
+            pipeline->binding = binding;
+            auto* translated_proxy = new XboxD3D12SimpleObjectProxy();
+            translated_proxy->lpVtbl = kXboxSimpleObjProxyVtbl.data();
+            translated_proxy->pc_obj = host_pso;
+            translated_proxy->kind = kKindTranslatedCompute;
+            {
+                std::lock_guard<std::mutex> lock(g_translated_compute_mutex);
+                g_translated_compute[translated_proxy] = std::move(pipeline);
+            }
+            g_compute_translated.fetch_add(1, std::memory_order_relaxed);
+            std::cerr << "[ScarlettX][d3d12_xs] CreateComputePipelineState: native compute translated, "
+                      << desc.CS.BytecodeLength << " -> " << translated.size() << " bytes, user data "
+                      << binding.user_data_dwords << " dwords from " << binding.user_data.size()
+                      << " root arguments\n";
+            *out = translated_proxy;
+            return 0;
+        }
+        case scarlettx::VictoryComputeOutcome::Desktop:
+        case scarlettx::VictoryComputeOutcome::Unavailable:
+            break;
+    }
     ID3D12PipelineState* pc_pso = nullptr;
     const HRESULT hr = obj->pc_device->CreateComputePipelineState(&desc, IID_PPV_ARGS(&pc_pso));
     if (TraceEnabled()) {
@@ -3300,6 +3516,7 @@ intptr_t SCARLETTX_GDK_CALLBACK ProxyCreateComputePipelineState(
                   << std::hex << static_cast<uint32_t>(hr) << std::dec << "\n";
     }
     if (FAILED(hr) || !pc_pso) return static_cast<intptr_t>(hr);
+    g_compute_passed_through.fetch_add(1, std::memory_order_relaxed);
     auto* proxy = new XboxD3D12SimpleObjectProxy();
     proxy->lpVtbl = kXboxSimpleObjProxyVtbl.data();
     proxy->pc_obj = pc_pso;
@@ -4422,6 +4639,16 @@ int32_t D3D12XboxDestroyDevice(uint64_t device_handle) {
     return 0;
 }
 
+int32_t D3D12XboxGetShaderTranslationStats(D3D12XBOX_SHADER_TRANSLATION_STATS* out_stats) {
+    if (!out_stats) return -1;
+    out_stats->compute_translated = g_compute_translated.load(std::memory_order_relaxed);
+    out_stats->compute_passed_through = g_compute_passed_through.load(std::memory_order_relaxed);
+    out_stats->compute_rejected = g_compute_rejected.load(std::memory_order_relaxed);
+    out_stats->dispatches_translated = g_dispatches_translated.load(std::memory_order_relaxed);
+    out_stats->dispatches_skipped = g_dispatches_skipped.load(std::memory_order_relaxed);
+    return 0;
+}
+
 uint64_t D3D12XboxBlendAdjustedPipelineCount(void) {
     return g_blend_adjusted_pipelines.load(std::memory_order_relaxed);
 }
@@ -4438,6 +4665,12 @@ int32_t D3D12XboxGetNativeObject(void* shim_object, void** out_native_object) {
         native = static_cast<XboxD3D12DeviceProxy*>(shim_object)->pc_device;
     } else if (vtbl == kXboxSimpleObjProxyVtbl.data()) {
         native = static_cast<XboxD3D12SimpleObjectProxy*>(shim_object)->pc_obj;
+    } else if (vtbl == kXboxCmdListProxyVtbl.data() || vtbl == kXboxCmdListProxyVtblV4.data()) {
+        native = static_cast<XboxD3D12GraphicsCommandListProxy*>(shim_object)->pc_list;
+    } else if (vtbl == kXboxD3D12DescriptorHeapProxyVtbl.data()) {
+        native = static_cast<XboxD3D12DescriptorHeapProxy*>(shim_object)->pc_heap;
+    } else if (vtbl == kXboxCommandAllocatorProxyVtbl.data()) {
+        native = static_cast<XboxD3D12CommandAllocatorProxy*>(shim_object)->pc_alloc;
     }
     if (!native) {
         return -2;

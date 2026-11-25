@@ -45,12 +45,16 @@ GPU_TESTS = {
     "test_d3d12_warp", "test_rt_pipeline", "test_shader_pipeline", "test_d3d12_xs_abi", "test_d3d12_guest_texture",
     "test_d3d12_list_layout", "test_d3d12_frame_pacing", "test_d3d12_present_window", "test_d3d12_present_frames",
     "test_d3d12_offscreen_probe", "test_d3d12_offscreen_clear", "test_d3d12_offscreen_indexed",
-    "test_victory_compute_e2e",
+    "test_victory_compute_e2e", "test_victory_compute_guest", "test_d3d12_blend_mrt",
 }
 # Translated compute (tests/test_victory_compute_e2e.cpp): five dispatches of four dwords each.
 VICTORY_COMPUTE_TEST = "test_victory_compute_e2e"
 VICTORY_COMPUTE_DISPATCHES = 5
 VICTORY_COMPUTE_DWORDS = 20
+# The same program through the shim's guest-facing route (tests/test_victory_compute_guest.cpp):
+# five translated dispatches, one dropped control dispatch, one desktop control dispatch.
+VICTORY_GUEST_TEST = "test_victory_compute_guest"
+VICTORY_GUEST_FENCES = 7
 PRESENT_TEST = "test_d3d12_present_frames"
 # Frame colours of tests/test_d3d12_present_frames.cpp, left and right half.
 PRESENT_COLOURS = {"red": (230, 30, 30), "green": (30, 200, 30), "blue": (30, 60, 230), "yellow": (240, 220, 30)}
@@ -412,6 +416,39 @@ def check_victory_compute(stdout: str) -> dict:
     return info
 
 
+def check_victory_guest(stdout: str) -> dict:
+    """The requirements of the guest-route compute test, read from its output."""
+    fences = [(int(s), int(c), int(w)) for s, c, w in
+              re.findall(r"\[victory-guest\] fence signaled=(\d+) completed=(\d+) wait_result=(\d+)", stdout)]
+    dwords = re.search(r"\[victory-guest\] dwords exact (\d+)/(\d+), translated dispatches=\+(\d+)", stdout)
+    created = re.search(r"\[victory-guest\] shim CreateComputePipelineState\(native container\) hr=(0x[0-9a-f]+) "
+                        r"translated=\+(\d+)", stdout)
+    failed = re.search(r"\[victory-guest\] FAILED api=(.*?) hr=(0x[0-9a-f]+)", stdout)
+    info = {
+        "shader_path": ("synthetic console-shaped container -> d3d12_xs CreateComputePipelineState (device object) "
+                        "-> victory-shader bridge -> DXIL -> shim command list dispatch"),
+        "native_pipeline_hresult": created.group(1) if created else None,
+        "pipelines_translated": int(created.group(2)) if created else None,
+        "fences_completed": sum(1 for s_, c, w in fences if c >= s_ >= 1 and w == 0),
+        "fences_expected": VICTORY_GUEST_FENCES,
+        "dwords_exact": int(dwords.group(1)) if dwords else None,
+        "dwords_total": int(dwords.group(2)) if dwords else None,
+        "translated_dispatches": int(dwords.group(3)) if dwords else None,
+        "checks_ok": len(re.findall(r"\[victory-guest\] ok: ", stdout)),
+        "checks_failed": len(re.findall(r"\[victory-guest\] CHECK FAILED: ", stdout)),
+        "final_line": (re.search(r"\[victory-guest\] (PASS|FAIL) \(\d+ failed checks\)", stdout) or [None])[0],
+    }
+    if failed:
+        info["first_failing_api"] = {"api": failed.group(1), "hresult": failed.group(2)}
+    info["requirements_met"] = bool(
+        created and dwords and info["native_pipeline_hresult"] == "0x00000000" and info["pipelines_translated"] == 1
+        and len(fences) == VICTORY_GUEST_FENCES and info["fences_completed"] == VICTORY_GUEST_FENCES
+        and info["dwords_exact"] == info["dwords_total"] == VICTORY_COMPUTE_DWORDS
+        and info["translated_dispatches"] == VICTORY_COMPUTE_DISPATCHES and info["checks_failed"] == 0
+        and info["final_line"] == "[victory-guest] PASS (0 failed checks)")
+    return info
+
+
 def read_build_info(build: Path) -> dict:
     """build-info.txt as tools/macos_cross_build.sh writes it: `key=value` lines."""
     info = {}
@@ -564,6 +601,14 @@ def cmd_regress(args) -> int:
             elif status == PASS:
                 note = (f"{probe['dwords_exact']}/{probe['dwords_total']} dwords exact, fences "
                         f"{probe['fences_completed']}/{probe['fences_expected']}, adapter {probe['adapter']}")
+        if name == VICTORY_GUEST_TEST:
+            probe = check_victory_guest(r["stdout"])
+            details["victory_guest"] = probe
+            if status == PASS and not probe["requirements_met"]:
+                status, note = FAIL, "exit 0 but a guest-route requirement was not met"
+            elif status == PASS:
+                note = (f"{probe['dwords_exact']}/{probe['dwords_total']} dwords exact through the shim, fences "
+                        f"{probe['fences_completed']}/{probe['fences_expected']}, {probe['checks_ok']} checks")
         # The hash of what ran, so a result can be tied to one artifact.
         details["exe_sha256"] = hashlib.sha256(exe.read_bytes()).hexdigest()
         add(name, category, status, note=note, **details)

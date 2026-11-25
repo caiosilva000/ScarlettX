@@ -58,4 +58,32 @@ struct VictoryComputeBinding {
 Status TranslateVictorySyntheticCompute(VictoryShaderInfo& out_info, VictoryComputeBinding& out_binding,
                                         std::vector<uint8_t>& out_dxil);
 
+// What a shader container is, for a compute pipeline.
+enum class VictoryComputeOutcome {
+    Translated,       // console-shaped with a native compute program: out_dxil and out_binding are set
+    Desktop,          // no console index: an ordinary host shader, to be used as it is
+    NoNativeCompute,  // console-shaped, but it carries no native compute program
+    Malformed,        // console-shaped, its native data does not parse
+    Refused,          // the translator does not handle this program
+    Unavailable,      // the bridge was not enabled at configure time
+};
+const char* VictoryComputeOutcomeName(VictoryComputeOutcome outcome) noexcept;
+
+// Looks at a shader container as a title passes it to compute pipeline creation and, when it
+// carries native code, translates it. The reason for NoNativeCompute, Malformed and Refused is
+// in out_info.message.
+VictoryComputeOutcome TranslateVictoryCompute(const uint8_t* data, size_t size, VictoryShaderInfo& out_info,
+                                              VictoryComputeBinding& out_binding,
+                                              std::vector<uint8_t>& out_dxil);
+
+// Whether the first host route can bind this shader: user data as root constants at b0 fed from
+// the title's root constants and descriptor tables, views taken from the title's heap by index.
+// `why` names the first thing it cannot do.
+bool VictoryComputeBindingSupported(const VictoryComputeBinding& binding, std::string& why);
+
+// Test fixtures: console-shaped containers written by the bridge, no title data.
+//   0 the synthetic compute fixture   1 the same, native stream cut short (malformed)
+//   2 console index without native code   3 a native program the translator refuses
+Status BuildVictorySyntheticContainer(uint32_t variant, std::vector<uint8_t>& out_bytes);
+
 }  // namespace scarlettx

@@ -72,3 +72,8 @@ adapter and the first failing API if there was one.
 Every check also records `exe_sha256`. Without `--commit`, the summary takes the source revision from the
 build's own `build-info.txt` (`commit_source` says which), and carries that file as `build_info`: for a bridge
 build it holds the Victory gitlink, the bridge's `Cargo.lock` hash and the Rust toolchain.
+
+`test_victory_compute_guest` is the same program on the guest-facing route: a console-shaped container handed to
+the shim's device object, dispatched through the shim's command list. As a GPU check it needs the native pipeline
+created and counted as translated, seven completed fences, 20 of 20 dwords, five translated dispatches and no
+failed check line (`victory_guest` block).
