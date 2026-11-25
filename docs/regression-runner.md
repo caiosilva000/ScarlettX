@@ -92,3 +92,25 @@ containers handed to the shim's device object (`CreateGraphicsPipelineState`), d
 list. As a GPU check it needs the native pipeline created and counted as translated, four translated draws with
 16384 of 16384 pixels exact, six completed fences, the desktop pass-through control exact, and no failed check
 line (`victory_draw_guest` block).
+
+## Activity log (`boot-diag --activity-log`)
+
+Off by default; a normal run sets nothing and writes nothing extra. With the option, the runner sets
+`SCARLETTX_ACTIVITY_LOG` for the boot and writes `<out>/activity.log`, one line about every two seconds
+(the idea is XCL's `XCL_ACTIVITY`; no code was taken):
+
+```
+activity t_s=4.1 stage=first_frame submits=0 draws=1306 dispatches=0 presents=1305 dstorage_requests=unavailable
+```
+
+- The counts are for that interval, from the `d3d12_xs` shim: command-list submissions, draws (the shim's
+  command-list draws and the synthetic device's own), dispatches, `PresentX` calls, and DirectStorage requests.
+- `stage` is the last boot stage the boot's own output confirms at that moment.
+- `unavailable` is not zero. It means the count could not be had: no shim line in that interval (no device
+  made yet, the process stuck before it, or the boot ended between two lines), or, for DirectStorage, no
+  DirectStorage shim loaded in the process.
+- Where the counts stay at zero and the stage stops changing is where the title stopped. `boot-diag.json` gets an
+  `activity` entry (intervals, intervals with activity, last stage, seconds since the last progress); the status
+  and the reason of the boot are decided exactly as without the log.
+- The shim writes its last line up to two seconds before the process ends, so the final part of a boot that
+  exits is not counted.

@@ -1043,6 +1043,76 @@ def manifest(root: Path) -> dict:
     return entries
 
 
+ACTIVITY_COUNTERS = ("submits", "draws", "dispatches", "presents", "dstorage_requests")
+
+
+class ActivityLog:
+    """An opt-in, low-volume record of what a boot is doing, a line about every two seconds.
+
+    The counts come from the shim (see SCARLETTX_ACTIVITY_LOG in d3d12_xs_shim.cpp); the stage is
+    the last one the boot's own output confirms so far. A counter that could not be had says
+    "unavailable", which is different from 0: no shim line in an interval (the shim has made no
+    device yet, or the process is stuck before it), or a module that is not loaded.
+    """
+
+    def __init__(self, path: Path, shim_log: Path, stdout_log: Path, stderr_log: Path, period: float = 2.0):
+        self.path, self.shim_log, self.stdout_log, self.stderr_log, self.period = path, shim_log, stdout_log, stderr_log, period
+        self.start = time.time()
+        self.next_at = self.start + period
+        self.shim_lines_seen = 0
+        self.rows = []
+        path.write_text("")
+
+    def _stage(self) -> str:
+        text = ""
+        for log in (self.stdout_log, self.stderr_log):
+            try:
+                text += log.read_text(errors="replace") + "\n"
+            except OSError:
+                pass
+        reached = ["package_inspected"] + [stage for stage, regex in BOOT_STAGES[1:] if regex and regex.search(text)]
+        order = [s for s, _ in BOOT_STAGES]
+        return max(reached, key=order.index)
+
+    def tick(self, force: bool = False):
+        now = time.time()
+        if now < self.next_at and not force:
+            return
+        self.next_at = now + self.period
+        try:
+            shim = [l for l in self.shim_log.read_text(errors="replace").splitlines() if l.startswith("activity ")]
+        except OSError:
+            shim = []
+        fresh, self.shim_lines_seen = shim[self.shim_lines_seen:], len(shim)
+        counts = {name: None for name in ACTIVITY_COUNTERS}   # None: unavailable
+        for line in fresh:                                     # usually one; summed if the runner fell behind
+            for name, value in re.findall(r"(\w+)=(\S+)", line):
+                if name in counts and value.isdigit():
+                    counts[name] = (counts[name] or 0) + int(value)
+        row = {"t_s": round(now - self.start, 1), "stage": self._stage(), "shim_lines": len(fresh), **counts}
+        self.rows.append(row)
+        text = " ".join(f"{name}={'unavailable' if row[name] is None else row[name]}" for name in ACTIVITY_COUNTERS)
+        with open(self.path, "a") as f:
+            f.write(f"activity t_s={row['t_s']} stage={row['stage']} {text}"
+                    + ("" if fresh else " (no shim line in this interval)") + "\n")
+
+    def finish(self) -> dict:
+        self.tick(force=True)
+        active = [r for r in self.rows if any(r[name] for name in ACTIVITY_COUNTERS)]
+        stage_changes = [r["t_s"] for i, r in enumerate(self.rows) if i == 0 or r["stage"] != self.rows[i - 1]["stage"]]
+        last_progress = max([r["t_s"] for r in active] + stage_changes[-1:], default=None)
+        end = self.rows[-1]["t_s"] if self.rows else 0.0
+        return {
+            "log": str(self.path),
+            "intervals": len(self.rows),
+            "intervals_with_activity": len(active),
+            "last_stage": self.rows[-1]["stage"] if self.rows else None,
+            "last_progress_s": last_progress,
+            "quiet_for_s": round(end - last_progress, 1) if last_progress is not None else None,
+            "unavailable": sorted(name for name in ACTIVITY_COUNTERS if all(r[name] is None for r in self.rows)),
+        }
+
+
 def cmd_boot_diag(args) -> int:
     out = Path(args.out).resolve()
     build = Path(args.build).resolve()
@@ -1178,14 +1248,32 @@ def cmd_boot_diag(args) -> int:
         awake = None
         if cap and shutil.which("caffeinate"):
             awake = subprocess.Popen(["caffeinate", "-d", "-u"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        activity = None
+        if args.activity_log:
+            # The shim appends a line of interval counts about every two seconds; the runner adds
+            # the last boot stage the logs confirm so far and keeps its own log beside it.
+            shim_log = logs / "shim-activity.log"
+            env["SCARLETTX_ACTIVITY_LOG"] = host.win_path(shim_log)
+            activity = ActivityLog(out / "activity.log", shim_log, logs / "boot.stdout", logs / "boot.stderr")
+
+        def while_boot_runs():
+            if cap:
+                cap.grab_guest(out / "window-captures", owners)
+            if activity:
+                activity.tick()
+            if not cap:
+                time.sleep(0.05)
+
         try:
             b = run_logged(host, exe, boot_args, env, build, logs, "boot", args.timeout,
-                           while_running=(lambda: cap.grab_guest(out / "window-captures", owners)) if cap else None,
+                           while_running=while_boot_runs if (cap or activity) else None,
                            stop_when=content_held if (cap and args.until_window is not None) else None)
         finally:
             if awake:
                 awake.terminate()
         diag["boot"] = strip_logs(b)
+        if activity:
+            diag["activity"] = activity.finish()
         all_out += b["stdout"]
         all_err += b["stderr"]
         combined = b["stdout"] + "\n" + b["stderr"]
@@ -1315,6 +1403,8 @@ def main() -> int:
     b.add_argument("--warp", action="store_true", help="ask for the software rasterizer instead of --gpu")
     b.add_argument("--trace", action="store_true", help="log shim calls (large)")
     b.add_argument("--stats", action="store_true")
+    b.add_argument("--activity-log", action="store_true",
+                   help="write activity.log: about every 2 s, what the boot did in that interval and its last stage")
     b.add_argument("--rt-dump", action="store_true", help="ask the emulator for a ray-traced frame dump in --out/frames")
     b.add_argument("--raster-dump", action="store_true", help="ask the emulator for a raster frame dump in --out/frames")
     b.add_argument("--allow-pc-target", action="store_true",

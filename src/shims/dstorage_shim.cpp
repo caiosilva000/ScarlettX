@@ -495,7 +495,13 @@ int32_t DStorageDestroyQueue(uint64_t queue) {
     return kS_OK;
 }
 
+namespace {
+std::atomic<uint64_t> g_activity_requests{0};
+}
+uint64_t DStorageXsActivityRequestCount(void) { return g_activity_requests.load(std::memory_order_relaxed); }
+
 int32_t DStorageEnqueueRequest(uint64_t queue, const DSTORAGE_REQUEST* request) {
+    g_activity_requests.fetch_add(1, std::memory_order_relaxed);
     if (!request) return kE_INVALIDARG;
     std::shared_ptr<QueueObject> q;
     {

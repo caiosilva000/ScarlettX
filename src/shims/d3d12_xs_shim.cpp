@@ -13,6 +13,7 @@
 #include <iostream>
 #include <memory>
 #include <mutex>
+#include <thread>
 #include "scarlettx/gpu/xg_layout.h"
 #include <sstream>
 #include <string>
@@ -2413,6 +2414,75 @@ std::atomic<uint64_t> g_set_vb_count{0};
 std::atomic<uint64_t> g_set_ib_count{0};
 std::atomic<uint64_t> g_set_vp_count{0};
 std::atomic<uint64_t> g_submit_count{0};
+std::atomic<uint64_t> g_present_count{0};          // PresentX, on a queue object or on a synthetic device
+std::atomic<uint64_t> g_synthetic_draw_count{0};   // draws the synthetic device API makes itself
+
+#if defined(_WIN32)
+// Opt-in activity log, after XCL's XCL_ACTIVITY: with SCARLETTX_ACTIVITY_LOG set to a file path,
+// one line about every two seconds says what the title did in that interval. Where the counts
+// stop is where the title stopped. Nothing is started, written or counted differently without
+// the variable. A count that cannot be had says "unavailable", which is not zero.
+void StartActivityLogOnce() {
+    static std::once_flag once;
+    std::call_once(once, []() {
+        const char* path_env = std::getenv("SCARLETTX_ACTIVITY_LOG");
+        if (!path_env || !path_env[0]) return;
+        std::thread([path = std::string(path_env)]() {
+            // DirectStorage requests are counted in the DirectStorage shim, another module.
+            auto dstorage_requests = [](uint64_t& out) {
+                bool have = false;
+                out = 0;
+                for (const char* module : {"dstorage.dll", "dstorage_xs.dll"}) {
+                    const HMODULE handle = GetModuleHandleA(module);
+                    if (!handle) continue;
+                    using CountFn = uint64_t (*)();
+                    if (auto fn = reinterpret_cast<CountFn>(reinterpret_cast<void*>(
+                            GetProcAddress(handle, "DStorageXsActivityRequestCount")))) {
+                        out += fn();
+                        have = true;
+                    }
+                }
+                return have;
+            };
+            const ULONGLONG start = GetTickCount64();
+            ULONGLONG last_tick = start;
+            uint64_t last[5] = {};
+            bool had_dstorage = false;
+            for (;;) {
+                Sleep(2000);
+                const ULONGLONG now = GetTickCount64();
+                uint64_t dstorage = 0;
+                const bool have_dstorage = dstorage_requests(dstorage);
+                const uint64_t cur[5] = {g_submit_count.load(std::memory_order_relaxed),
+                                         g_draw_instanced_count.load(std::memory_order_relaxed) +
+                                             g_draw_indexed_count.load(std::memory_order_relaxed) +
+                                             g_synthetic_draw_count.load(std::memory_order_relaxed),
+                                         g_dispatch_count.load(std::memory_order_relaxed),
+                                         g_present_count.load(std::memory_order_relaxed), dstorage};
+                char dstorage_text[32] = "unavailable";
+                if (have_dstorage) {
+                    std::snprintf(dstorage_text, sizeof(dstorage_text), "%llu",
+                                  static_cast<unsigned long long>(had_dstorage ? cur[4] - last[4] : cur[4]));
+                }
+                if (FILE* f = std::fopen(path.c_str(), "a")) {
+                    std::fprintf(f, "activity t_ms=%llu interval_ms=%llu submits=%llu draws=%llu dispatches=%llu presents=%llu "
+                                    "dstorage_requests=%s\n",
+                                 static_cast<unsigned long long>(now - start), static_cast<unsigned long long>(now - last_tick),
+                                 static_cast<unsigned long long>(cur[0] - last[0]), static_cast<unsigned long long>(cur[1] - last[1]),
+                                 static_cast<unsigned long long>(cur[2] - last[2]), static_cast<unsigned long long>(cur[3] - last[3]),
+                                 dstorage_text);
+                    std::fclose(f);
+                }
+                for (int i = 0; i < 5; ++i) last[i] = cur[i];
+                had_dstorage = have_dstorage;
+                last_tick = now;
+            }
+        }).detach();
+    });
+}
+#else
+void StartActivityLogOnce() {}
+#endif
 std::atomic<uint64_t> g_flush_count{0};
 std::atomic<uint64_t> g_flush_us{0};
 std::atomic<uint64_t> g_frame_epoch{0};
@@ -3709,8 +3779,7 @@ void EnsurePresentSwapChain(XboxD3D12CommandQueueProxy* obj, UINT w, UINT h, DXG
 
 intptr_t SCARLETTX_GDK_CALLBACK QueueProxyPresentX(
     void* self, uintptr_t planeCount, uintptr_t pPlaneParams, uintptr_t pPresentParams) {
-    static std::atomic<uint64_t> present_count{0};
-    const uint64_t n = present_count.fetch_add(1, std::memory_order_relaxed) + 1;
+    const uint64_t n = g_present_count.fetch_add(1, std::memory_order_relaxed) + 1;
     g_frame_epoch.fetch_add(1, std::memory_order_relaxed);
 #if defined(_WIN32)
     auto* obj = static_cast<XboxD3D12CommandQueueProxy*>(self);
@@ -5419,6 +5488,7 @@ int32_t SCARLETTX_GDK_CALLBACK D3D12XboxCreateDevice(
     const D3D12XBOX_CREATE_DEVICE_PARAMETERS* pParameters,
     const void* riid,
     void** ppvDevice) {
+    StartActivityLogOnce();
 #if defined(_WIN32)
     if (!riid || !ppvDevice) {
         return static_cast<int32_t>(E_INVALIDARG);
@@ -5697,6 +5767,7 @@ int32_t D3D12XboxCreateSyntheticDevice(const D3D12XBOX_CREATE_DEVICE_PARAMETERS*
     if (!out_device_handle) {
         return -1;
     }
+    StartActivityLogOnce();
     const bool prefer_warp = PreferWarpFromEnv(params ? (params->PreferWarp != 0) : true);
     const bool debug_layer = params ? (params->ProcessDebugFlags != 0) : false;
 
@@ -5933,6 +6004,7 @@ int32_t D3D12XboxRenderTestTriangle(uint64_t device_handle,
                                     uint32_t height,
                                     const char* optional_ppm_path,
                                     uint64_t* out_pixel_hash) {
+    g_synthetic_draw_count.fetch_add(1, std::memory_order_relaxed);
     std::lock_guard<std::mutex> lock(g_mutex);
     auto it = g_devices.find(device_handle);
     if (it == g_devices.end()) {
@@ -5969,6 +6041,7 @@ int32_t D3D12XboxPresentXParams(uint64_t device_handle, const D3D12XBOX_PRESENT_
     if (!params) {
         return -1;
     }
+    g_present_count.fetch_add(1, std::memory_order_relaxed);
     std::lock_guard<std::mutex> lock(g_mutex);
     auto it = g_devices.find(device_handle);
     if (it == g_devices.end()) {

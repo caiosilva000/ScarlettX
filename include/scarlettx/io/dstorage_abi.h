@@ -109,6 +109,8 @@ SCARLETTX_DSTORAGE_API int32_t DStorageDestroyQueue(uint64_t queue);
 SCARLETTX_DSTORAGE_API int32_t DStorageEnqueueRequest(
     uint64_t queue,
     const DSTORAGE_REQUEST* request);
+// How many requests titles have enqueued in this process since it started (for activity logs).
+SCARLETTX_DSTORAGE_API uint64_t DStorageXsActivityRequestCount(void);
 SCARLETTX_DSTORAGE_API int32_t DStorageEnqueueSignal(
     uint64_t queue,
     uint64_t* fence_value_ptr,

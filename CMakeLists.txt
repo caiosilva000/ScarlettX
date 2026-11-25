@@ -254,6 +254,19 @@ add_custom_command(TARGET hello_scarlett POST_BUILD
         "$<TARGET_FILE_DIR:hello_scarlett>/MicrosoftGame.Config"
 )
 
+# A title that renders its frames and then never exits (for runners' timeout paths).
+add_executable(stall_probe tests/synthetic_games/stall_probe/main.cpp)
+target_link_libraries(stall_probe PRIVATE d3d12_xs xgameruntime XboxBvhBuilder)
+target_include_directories(stall_probe PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/include)
+set_target_properties(stall_probe PROPERTIES
+    RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/packages/stall_probe"
+)
+add_custom_command(TARGET stall_probe POST_BUILD
+    COMMAND ${CMAKE_COMMAND} -E copy_if_different
+        "${CMAKE_CURRENT_SOURCE_DIR}/tests/synthetic_games/stall_probe/MicrosoftGame.Config"
+        "$<TARGET_FILE_DIR:stall_probe>/MicrosoftGame.Config"
+)
+
 add_executable(rt_showcase tests/synthetic_games/rt_showcase/main.cpp)
 target_link_libraries(rt_showcase PRIVATE d3d12_xs xgameruntime XboxBvhBuilder)
 target_include_directories(rt_showcase PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/include)
