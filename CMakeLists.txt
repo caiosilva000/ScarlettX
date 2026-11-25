@@ -447,6 +447,14 @@ if(SCARLETTX_BENCHMARKS AND SCARLETTX_VICTORY_SHADER_BRIDGE)
         ${CMAKE_CURRENT_SOURCE_DIR}/tests)  # the guest-route rig
 endif()
 
+# Opt-in synthetic frame-rate benchmark through the guest-facing d3d12_xs route
+# (docs/fps-benchmark.md). Desktop shader bytecode, so it does not need the bridge. Not a test.
+if(SCARLETTX_BENCHMARKS)
+    add_executable(bench_sx_fps bench/bench_sx_fps.cpp)
+    target_link_libraries(bench_sx_fps PRIVATE scarlettx_core d3d12_xs)
+    target_include_directories(bench_sx_fps PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/include)
+endif()
+
 if(SCARLETTX_VICTORY_SHADER_BRIDGE)
     scarlettx_add_test(test_victory_shader_bridge tests/test_victory_shader_bridge.cpp)
     # Synthetic GFX10 compute -> DXIL -> D3D12 dispatch -> exact readback.
