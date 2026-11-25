@@ -22,6 +22,12 @@
 //   8  one list: translated left half, a desktop pipeline's
 //      draw right half, translated again top-left quarter     -> A | colour, title root restored once
 //   9  a pixel shader whose table view is not a texture       -> pipeline refused, with the reason
+//  11  CopyDescriptorsSimple: A's view into the slot the
+//      table names, then B's view over it                     -> A, then B
+//  12  CopyDescriptors, two destination and two source
+//      ranges, into slots at nonzero offsets                  -> the copied slots and their neighbours
+//  13  a buffer's unordered access view copied over a
+//      sampled slot, by each call                             -> draw dropped, target untouched
 //  10  released in flight, each with objects of its own:
 //      the pipeline, the descriptor heap, the title's root
 //      signature, the texture                                 -> the draw still shows the texture
@@ -686,6 +692,127 @@ int main() {
         r.Check(hr == static_cast<HRESULT>(0x80004001u) && !refused && after.graphics_rejected - before.graphics_rejected == 1,
                 "9 a table view that is not a texture is refused at pipeline creation");
     }
+    // 11 to 13. Descriptor copies. The views are made in a source heap and reach the heap the
+    // table points into only through the device's CopyDescriptorsSimple (slot 24) and
+    // CopyDescriptors (slot 23). Source: 0 A, 1 B, 2 a buffer's unordered access view.
+    {
+        Rig::Heap src = r.ViewHeap(4);
+        Rig::Heap dst = r.ViewHeap(12);
+        r.TextureView(src, 0, tex_a);
+        r.TextureView(src, 1, tex_b);
+        {
+            D3D12_HEAP_PROPERTIES hp{};
+            hp.Type = D3D12_HEAP_TYPE_DEFAULT;
+            D3D12_RESOURCE_DESC bd{};
+            bd.Dimension = D3D12_RESOURCE_DIMENSION_BUFFER;
+            bd.Width = 256;
+            bd.Height = 1;
+            bd.DepthOrArraySize = 1;
+            bd.MipLevels = 1;
+            bd.SampleDesc.Count = 1;
+            bd.Layout = D3D12_TEXTURE_LAYOUT_ROW_MAJOR;
+            bd.Flags = D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS;
+            void* buffer = nullptr;
+            SX_REQUIRE(Call(r.shim_device, 27, P(&hp), uintptr_t{0}, P(&bd), static_cast<uintptr_t>(D3D12_RESOURCE_STATE_UNORDERED_ACCESS),
+                            uintptr_t{0}, uintptr_t{0}, P(&buffer)) == 0 && buffer);
+            D3D12_UNORDERED_ACCESS_VIEW_DESC view{};
+            view.Format = DXGI_FORMAT_R32_TYPELESS;
+            view.ViewDimension = D3D12_UAV_DIMENSION_BUFFER;
+            view.Buffer.NumElements = 64;
+            view.Buffer.Flags = D3D12_BUFFER_UAV_FLAG_RAW;
+            Call(r.shim_device, 19, P(buffer), uintptr_t{0}, P(&view), src.cpu + static_cast<uintptr_t>(2) * r.increment);
+        }
+        const uintptr_t kViews = static_cast<uintptr_t>(D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV);
+        auto at = [&](const Rig::Heap& h, UINT slot) { return h.cpu + static_cast<uintptr_t>(slot) * r.increment; };
+        auto copy_simple = [&](UINT dst_slot, UINT src_slot) {
+            Call(r.shim_device, 24, uintptr_t{1}, at(dst, dst_slot), at(src, src_slot), kViews);
+        };
+        // One frame: the table on `slot`, the whole target.
+        auto draw_slot = [&](UINT slot) {
+            void* list = r.NewList();
+            r.Begin(list, &dst, root);
+            r.Pipeline(list, pso);
+            r.Constants(list, zero);
+            r.Table(list, dst, slot);
+            r.DrawIn(list, kWhole);
+            return r.Wait(r.End(list));
+        };
+
+        // 11. CopyDescriptorsSimple: A's view into the slot the table names, then B's over it.
+        copy_simple(4, 0);
+        if (!draw_slot(4)) return 5;
+        frame_check({{kWhole, 0, {0, 0, 0, 0}}}, "11 CopyDescriptorsSimple put A's view in slot 4");
+        copy_simple(4, 1);
+        if (!draw_slot(4)) return 5;
+        frame_check({{kWhole, 1, {0, 0, 0, 0}}}, "11 CopyDescriptorsSimple put B's view over it");
+
+        // 12. CopyDescriptors with several ranges. The neighbours 7, 8 and 11 are written first,
+        //     directly; then destination ranges {9, 10} and {6} take source ranges {1} and {0, 1}:
+        //     9 <- B, 10 <- A, 6 <- B.
+        r.TextureView(dst, 7, tex_b);
+        r.TextureView(dst, 8, tex_a);
+        r.TextureView(dst, 11, tex_a);
+        {
+            const D3D12_CPU_DESCRIPTOR_HANDLE dst_starts[2] = {{at(dst, 9)}, {at(dst, 6)}};
+            const UINT dst_sizes[2] = {2, 1};
+            const D3D12_CPU_DESCRIPTOR_HANDLE src_starts[2] = {{at(src, 1)}, {at(src, 0)}};
+            const UINT src_sizes[2] = {1, 2};
+            Call(r.shim_device, 23, uintptr_t{2}, P(dst_starts), P(dst_sizes), uintptr_t{2}, P(src_starts), P(src_sizes), kViews);
+        }
+        {
+            // Six draws in one list, a cell of the target each: the copied slots and their neighbours.
+            struct Cell {
+                UINT slot;
+                int texture;
+            };
+            const Cell cells[6] = {{9, 1}, {10, 0}, {6, 1}, {8, 0}, {11, 0}, {7, 1}};
+            const auto stats_before = Stats();
+            void* list = r.NewList();
+            r.Begin(list, &dst, root);
+            r.Pipeline(list, pso);
+            r.Constants(list, zero);
+            std::vector<Want> wants;
+            for (int i = 0; i < 6; ++i) {
+                const Region cell{16 * (i % 4), 32 * (i / 4), 16 * (i % 4) + 16, 32 * (i / 4) + 32};
+                r.Table(list, dst, cells[i].slot);
+                r.DrawIn(list, cell);
+                wants.push_back({cell, cells[i].texture, {0, 0, 0, 0}});
+            }
+            if (!r.Wait(r.End(list))) return 5;
+            frame_check(wants, "12 CopyDescriptors, two ranges each way: slots 9, 10, 6 copied; 8, 11, 7 intact");
+            const auto stats = Stats();
+            r.Check(stats.draws_translated - stats_before.draws_translated == 6 && stats.draws_skipped == stats_before.draws_skipped,
+                    "12 six translated draws, none dropped");
+        }
+
+        // 13. A valid view of the wrong kind copied over a sampled slot: the next draw is dropped.
+        struct Wrong {
+            const char* what;
+            UINT slot;
+            bool simple;
+        };
+        for (const Wrong& w : {Wrong{"13 CopyDescriptors put a buffer's unordered access view over slot 9", 9, false},
+                               Wrong{"13 CopyDescriptorsSimple put a buffer's unordered access view over slot 4", 4, true}}) {
+            if (w.simple) {
+                copy_simple(w.slot, 2);
+            } else {
+                const D3D12_CPU_DESCRIPTOR_HANDLE dst_start{at(dst, w.slot)};
+                const D3D12_CPU_DESCRIPTOR_HANDLE src_start{at(src, 2)};
+                const UINT one = 1;
+                Call(r.shim_device, 23, uintptr_t{1}, P(&dst_start), P(&one), uintptr_t{1}, P(&src_start), P(&one), kViews);
+            }
+            const auto stats_before = Stats();
+            if (!draw_slot(w.slot)) return 5;
+            const auto stats = Stats();
+            frame_check({}, w.what);
+            r.Check(stats.draws_skipped - stats_before.draws_skipped == 1 && stats.draws_translated == stats_before.draws_translated,
+                    "13 the draw was dropped, not run");
+        }
+        // And the slot beside the overwritten one still holds its texture.
+        if (!draw_slot(10)) return 5;
+        frame_check({{kWhole, 0, {0, 0, 0, 0}}}, "13 slot 10, beside the overwritten slot 9, still views A");
+    }
+
     // 10. Objects released while the draw that uses them is in flight. Each case has objects of
     //     its own, so a failure leaves the others standing.
     for (int which = 0; which < 4 && !r.stuck; ++which) {

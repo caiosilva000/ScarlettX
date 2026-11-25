@@ -558,9 +558,9 @@ def check_victory_draw_table(stdout: str) -> dict:
         "final_line": (re.search(r"\[victory-draw-table\] (PASS|FAIL) \(\d+ failed\)", stdout) or [None])[0],
     }
     info["requirements_met"] = bool(
-        total and info["frames"] == 11 and info["pixels_exact"] == info["pixels_total"] == 11 * 4096
+        total and info["frames"] == 17 and info["pixels_exact"] == info["pixels_total"] == 17 * 4096
         and info["checks_failed"] == 0 and len(in_flight) == 4 and all(info["released_in_flight"].values())
-        and info["fences"] >= 11 and info["fences_completed"] == info["fences"]
+        and info["fences"] >= 17 and info["fences_completed"] == info["fences"]
         and info["final_line"] == "[victory-draw-table] PASS (0 failed)")
     return info
 
