@@ -107,6 +107,8 @@ bool VictoryComputeBindingSupported(const VictoryComputeBinding& binding, std::s
 //   9 the draw fixture's vertex program   10 its pixel program, each with its signature parts
 //   11 the vertex program, native stream cut short   12 a pixel program that also stores to a
 //   descriptor table's UAV (bindings beyond root constants)
+//   13 a lane exchange in a wave of 32 (ds_bpermute_b32: the wave reversed, the halves
+//   exchanged)   14 the same in a wave of 64
 Status BuildVictorySyntheticContainer(uint32_t variant, std::vector<uint8_t>& out_bytes);
 
 }  // namespace scarlettx

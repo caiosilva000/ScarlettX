@@ -47,6 +47,7 @@ GPU_TESTS = {
     "test_d3d12_offscreen_probe", "test_d3d12_offscreen_clear", "test_d3d12_offscreen_indexed",
     "test_victory_compute_e2e", "test_victory_compute_guest", "test_d3d12_blend_mrt",
     "test_victory_compute_conformance", "test_victory_draw_e2e", "test_victory_draw_guest",
+    "test_victory_wave64_exchange",
 }
 # Translated compute (tests/test_victory_compute_e2e.cpp): five dispatches of four dwords each.
 VICTORY_COMPUTE_TEST = "test_victory_compute_e2e"
@@ -488,6 +489,49 @@ def check_victory_conformance(stdout: str) -> dict:
     return info
 
 
+def check_victory_wave(stdout: str) -> dict:
+    """The lane exchange test: each case's class, and what the adapter and the shaders say about waves."""
+    caps = re.search(r"\[victory-wave\] adapter wave capability: query=(0x[0-9a-f]+) wave_ops=(\S+) lanes_min=(\d+) "
+                     r"lanes_max=(\d+)", stdout)
+    cases = {}
+    for name, lanes, lo, hi, reports, cls in re.findall(
+            r"\[victory-wave\] case=(\S+) lanes=(\d+) adapter_range=(\d+)\.\.(\d+) host_reports_wave=(\S+) "
+            r"class=(\S+)", stdout):
+        cases[name] = {"class": cls, "lanes": int(lanes), "host_reports_wave": reports == "yes"}
+    for name, exact, total, b_ok, b_total in re.findall(
+            r"\[victory-wave\] case=(\S+) dispatches=\d+ threads_per_group=\d+ dwords exact (\d+)/(\d+) "
+            r"boundary (\d+)/(\d+)", stdout):
+        cases.setdefault(name, {}).update(dwords_exact=int(exact), dwords_total=int(total),
+                                          boundary_exact=int(b_ok), boundary_total=int(b_total))
+    for name, text in re.findall(r"\[victory-wave\] case=(\S+) translated: (.*)", stdout):
+        cases.setdefault(name, {})["translated"] = text
+    fences = [(int(s_), int(c), int(w)) for s_, c, w in
+              re.findall(r"\[victory-wave\] fence signaled=(\d+) completed=(\d+) wait_result=(\d+)", stdout)]
+    info = {
+        "shader_path": ("synthetic console-shaped containers -> d3d12_xs CreateComputePipelineState (device object) "
+                        "-> victory-shader bridge -> DXIL -> shim command list dispatch"),
+        "wave_ops": caps.group(2) if caps else None,
+        "wave_lanes_min": int(caps.group(3)) if caps else None,
+        "wave_lanes_max": int(caps.group(4)) if caps else None,
+        "cases": cases,
+        "fences": len(fences),
+        "fences_completed": sum(1 for s_, c, w in fences if c >= s_ >= 1 and w == 0),
+        "final_line": (re.search(r"\[victory-wave\] (PASS|FAIL) \(\d+ failed\)", stdout) or [None])[0],
+    }
+    # Exact or cleanly refused; exact as a real wave wherever the adapter reports that wave size.
+    def acceptable(c):
+        if c.get("class") == "native_exact":
+            return c.get("host_reports_wave") and c.get("dwords_exact") == c.get("dwords_total")
+        if c.get("class") == "emulated_exact":
+            return not c.get("host_reports_wave") and c.get("dwords_exact") == c.get("dwords_total")
+        return c.get("class") == "unsupported" and not c.get("host_reports_wave")
+    info["requirements_met"] = bool(
+        caps and set(cases) == {"exchange32", "exchange64"} and all(acceptable(c) for c in cases.values())
+        and info["fences_completed"] == info["fences"]
+        and info["final_line"] == "[victory-wave] PASS (0 failed)")
+    return info
+
+
 def check_victory_draw(stdout: str) -> dict:
     """The requirements of the translated draw test: four draws, every pixel exact."""
     fences = [(int(s_), int(c), int(w)) for s_, c, w in
@@ -719,6 +763,14 @@ def cmd_regress(args) -> int:
                 verdicts = ", ".join(f"{n} {c.get('verdict')}" for n, c in probe["cases"].items())
                 note = (f"{verdicts}; adapter waves {probe['wave_lanes_min']}..{probe['wave_lanes_max']}"
                         + (f"; SKIPPED: {', '.join(probe['skipped'])}" if probe["skipped"] else ""))
+        if name == "test_victory_wave64_exchange":
+            probe = check_victory_wave(r["stdout"])
+            details["victory_wave"] = probe
+            classes = ", ".join(f"{n} {c.get('class')}" for n, c in probe["cases"].items())
+            if status == PASS and not probe["requirements_met"]:
+                status, note = FAIL, "exit 0 but a lane exchange requirement was not met"
+            elif classes:
+                note = f"{classes}; adapter waves {probe['wave_lanes_min']}..{probe['wave_lanes_max']}"
         if name == "test_victory_draw_e2e":
             probe = check_victory_draw(r["stdout"])
             details["victory_draw"] = probe

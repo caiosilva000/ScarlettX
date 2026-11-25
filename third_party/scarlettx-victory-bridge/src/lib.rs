@@ -880,6 +880,64 @@ fn synthetic_lane_mask_program(wave64: bool, count: bool) -> NativeProgram {
     constants_and_table(5, 0, [lanes, 1, 1], wave64, &w)
 }
 
+/// MUBUF `buffer_store_dword vdata, vaddr, s[srsrc:srsrc+3], 0 offen offset:byte_off`.
+const fn buffer_store_dword_at_off(vdata: u8, vaddr: u8, srsrc: u8, byte_off: u16) -> [u32; 2] {
+    [
+        0x38 << 26 | 0x1C << 18 | 1 << 12 | (byte_off as u32 & 0xFFF),
+        0x80 << 24 | (srsrc as u32 >> 2) << 16 | (vdata as u32) << 8 | vaddr as u32,
+    ]
+}
+
+/// DS `ds_bpermute_b32 vdst, vaddr, vdata`: each lane reads `vdata` of the
+/// lane its address names (bytes, four a lane, modulo the wave).
+const fn ds_bpermute_b32(vdst: u8, vaddr: u8, vdata: u8) -> [u32; 2] {
+    [
+        0x36 << 26 | 0xB3 << 18,
+        (vdst as u32) << 24 | (vdata as u32) << 8 | vaddr as u32,
+    ]
+}
+
+const V_MUL_U32_U24: u8 = 0x0B;
+const S_WAITCNT_LGKM: u32 = 0xBF8C_C07F;
+/// A literal operand: the constant is the next word.
+const LITERAL: u16 = 255;
+/// What the lane exchange multiplies a lane's number by to make its value.
+pub const LANE_EXCHANGE_MULTIPLIER: u32 = 0x0001_0203;
+
+/// A lane exchange. One group of `lanes` threads, one console wave (32, or 64
+/// with `wave64`). Lane l holds the value `(l * 0x10203) ^ c0`, different in
+/// every lane. Two permutes move the values between lanes:
+///
+/// * dword `l` takes the value of lane `lanes - 1 - l` (the wave reversed:
+///   in a wave of 64, lane 31 takes lane 32's value and lane 32 takes lane
+///   31's, and every lane reads from the other half);
+/// * dword `lanes + l` takes the value of lane `l ^ lanes/2` (the halves
+///   exchanged).
+///
+/// Nothing else is written. The exchange only works when the host runs the
+/// group as one wave of the console's size, which the translated shader
+/// declares.
+fn synthetic_lane_exchange_program(wave64: bool) -> NativeProgram {
+    let lanes: u16 = if wave64 { 64 } else { 32 };
+    let mut w = vec![s_mov_b32(5, 0x80)];
+    w.extend_from_slice(&s_load_dwordx4(8, 4));
+    w.push(vop2(V_LSHLREV_B32, 16, int(2), 0)); // v16 = 4 lane
+    w.push(vop2(V_MUL_U32_U24, 2, LITERAL, 0)); // v2 = lane * 0x10203
+    w.push(LANE_EXCHANGE_MULTIPLIER);
+    w.push(vop2(V_XOR_B32, 2, 0, 2)); // v2 ^= c0: the lane's value
+    w.push(vop2(V_XOR_B32, 1, int(lanes - 1), 0)); // v1 = lanes - 1 - lane
+    w.push(vop2(V_LSHLREV_B32, 1, int(2), 1)); // its address
+    w.extend_from_slice(&ds_bpermute_b32(3, 1, 2)); // v3 = the value of that lane
+    w.push(vop2(V_XOR_B32, 4, int(lanes / 2), 0)); // v4 = the same lane of the other half
+    w.push(vop2(V_LSHLREV_B32, 4, int(2), 4));
+    w.extend_from_slice(&ds_bpermute_b32(5, 4, 2)); // v5 = the value of that lane
+    w.push(S_WAITCNT_LGKM);
+    w.extend_from_slice(&buffer_store_dword_at(3, 16, 8));
+    w.extend_from_slice(&buffer_store_dword_at_off(5, 16, 8, lanes * 4));
+    w.push(S_ENDPGM);
+    constants_and_table(5, 0, [u32::from(lanes), 1, 1], wave64, &w)
+}
+
 // ---------------------------------------------------------------------------
 // Synthetic draw: a vertex and a pixel program
 // ---------------------------------------------------------------------------
@@ -1177,6 +1235,9 @@ fn synthetic_container(variant: u32) -> Option<Vec<u8>> {
             let native = synthetic_pixel_program_with_table();
             Some(graphics_container(&native, pixel_signatures(), xbch(&fssm_program(&native))))
         }
+        // The lane exchange (see its function): 13 in a wave of 32, 14 in a wave of 64.
+        13 => Some(console_container(&[(KIND_NATIVE, xbch(&fssm_compute(&synthetic_lane_exchange_program(false))))])),
+        14 => Some(console_container(&[(KIND_NATIVE, xbch(&fssm_compute(&synthetic_lane_exchange_program(true))))])),
         _ => None,
     }
 }
@@ -1392,6 +1453,23 @@ mod tests {
                     assert_eq!(t, threads, "variant {variant}");
                     assert_eq!(shader.user_data_dwords(), 8, "variant {variant}: {:?}", shader.user_data);
                     assert!(shader.root_cbvs.is_empty() && shader.root_srvs.is_empty() && shader.root_uavs.is_empty());
+                    assert!(!shader.memory && !shader.heap, "variant {variant}");
+                    eprintln!("variant {variant}: {} bytes of DXIL", shader.dxil.len());
+                }
+                ComputeInput::Refused(text) => panic!("variant {variant} refused: {text}"),
+                ComputeInput::Malformed(text) => panic!("variant {variant} malformed: {text}"),
+                _ => panic!("variant {variant} not translated"),
+            }
+        }
+    }
+
+    #[test]
+    fn the_lane_exchanges_translate() {
+        for (variant, threads) in [(13u32, [32u32, 1, 1]), (14, [64, 1, 1])] {
+            match translate_compute_container(&synthetic_container(variant).unwrap()) {
+                ComputeInput::Translated(shader, t) => {
+                    assert_eq!(t, threads, "variant {variant}");
+                    assert_eq!(shader.user_data_dwords(), 8, "variant {variant}: {:?}", shader.user_data);
                     assert!(!shader.memory && !shader.heap, "variant {variant}");
                     eprintln!("variant {variant}: {} bytes of DXIL", shader.dxil.len());
                 }
