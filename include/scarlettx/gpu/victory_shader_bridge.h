@@ -165,4 +165,16 @@ Status BuildVictorySyntheticContainer(uint32_t variant, std::vector<uint8_t>& ou
 // `rounds` repeats the three shift-and-xor steps (1 to 4096): the same work in a larger shader.
 Status BuildVictoryVectorKernelContainer(uint32_t k, std::vector<uint8_t>& out_bytes, uint32_t rounds = 1);
 
+// The same kernel with a branch in every round that differs from lane to lane, written as a
+// console compiler writes an if/else with the lane mask. Per round r (1 to 4096 rounds):
+//   if ((x & (1 << (r % 5))) == 0) { x ^= x << 13; [inner] } else x ^= x >> 17;
+//   x ^= x << 5
+// and out[i] = (x + c1) ^ k as before: the same kind of control flow in a shader of any size.
+// `shape` adds to every round: 0 nothing; 1 [inner], a second branch inside the first side,
+// if ((x & 1) == 0) x ^= x >> 7; 2 a store of x to out[i] on each side (the result is unchanged:
+// the store after the rounds stays); 3 as 2, with the buffer's descriptor loaded again on each
+// side, so the two loads meet where the sides join.
+Status BuildVictoryBranchKernelContainer(uint32_t k, std::vector<uint8_t>& out_bytes, uint32_t rounds = 1,
+                                         uint32_t shape = 0);
+
 }  // namespace scarlettx

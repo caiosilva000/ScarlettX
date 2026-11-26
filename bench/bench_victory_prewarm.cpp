@@ -13,7 +13,9 @@
 //   --workload cache      what a cache could save for a shader of --rounds size: the translator's
 //                         first call apart from this shader's translation, pipeline creation the
 //                         first time and again, and pipeline blobs (--corrupt-blob also offers
-//                         the host a damaged one)
+//                         the host a damaged one). --shape branch0..branch3 gives every round a
+//                         lane-divergent if/else (1 nested, 2 with stores, 3 with the descriptor
+//                         loaded again on each side); the process's working set is reported too
 //   --workload guest      guest-facing compute: the vector kernel as a console-shaped container
 //                         through the d3d12_xs shim's device object and command list (salt = k)
 //   --workload control    graphics control without translation: the existing offscreen indexed
@@ -43,6 +45,7 @@
 
 #include <windows.h>
 #include <d3d12.h>
+#include <psapi.h>
 
 #include "scarlettx/gpu/d3d12_backend.h"
 #include "scarlettx/gpu/victory_shader_bridge.h"
@@ -94,6 +97,7 @@ struct Args {
     uint32_t hold_ms = 0;
     uint32_t elements = 1u << 20;
     uint32_t rounds = 1;
+    int branch_shape = -1;  // --shape branch0..branch3: the kernel with a lane-divergent if/else in every round
     bool corrupt_blob = false;
 };
 
@@ -598,13 +602,43 @@ uint32_t VectorKernelRounds(uint32_t i, uint32_t c0, uint32_t c1, uint32_t k, ui
     return (x + c1) ^ k;
 }
 
+uint32_t BranchKernelRounds(uint32_t i, uint32_t c0, uint32_t c1, uint32_t k, uint32_t rounds, int shape) {
+    uint32_t x = i + c0;
+    for (uint32_t r = 0; r < rounds; ++r) {
+        if ((x & (1u << (r % 5))) == 0) {
+            x ^= x << 13;
+            if (shape == 1 && (x & 1u) == 0) x ^= x >> 7;
+        } else {
+            x ^= x >> 17;
+        }
+        x ^= x << 5;
+    }
+    return (x + c1) ^ k;
+}
+
+// This process's working set now and at its highest, in megabytes. Under CrossOver the host
+// compiles Metal shaders partly in a service outside this process, which this does not see.
+void WorkingSetMb(double& now_mb, double& peak_mb) {
+    PROCESS_MEMORY_COUNTERS counters{};
+    counters.cb = sizeof(counters);
+    now_mb = peak_mb = -1.0;
+    if (K32GetProcessMemoryInfo(GetCurrentProcess(), &counters, sizeof(counters))) {
+        now_mb = static_cast<double>(counters.WorkingSetSize) / (1024.0 * 1024.0);
+        peak_mb = static_cast<double>(counters.PeakWorkingSetSize) / (1024.0 * 1024.0);
+    }
+}
+
 int RunCacheAssessment(const Args& args, scarlettx::D3D12Backend& backend, Recorder& rec, double init_ms) {
     const uint32_t k = args.salt;
     const uint32_t n = 4096;
-    auto translate = [](uint32_t kk, uint32_t rounds, std::vector<uint8_t>& container,
-                        scarlettx::VictoryComputeBinding& binding, std::vector<uint8_t>& dxil, double& ms) {
+    const int shape = args.branch_shape;
+    const bool branch = shape >= 0;
+    auto translate = [branch, shape](uint32_t kk, uint32_t rounds, std::vector<uint8_t>& container,
+                              scarlettx::VictoryComputeBinding& binding, std::vector<uint8_t>& dxil, double& ms) {
         scarlettx::VictoryShaderInfo info;
-        if (!scarlettx::BuildVictoryVectorKernelContainer(kk, container, rounds).ok()) return false;
+        const auto built = branch ? scarlettx::BuildVictoryBranchKernelContainer(kk, container, rounds, static_cast<uint32_t>(shape))
+                                  : scarlettx::BuildVictoryVectorKernelContainer(kk, container, rounds);
+        if (!built.ok()) return false;
         const LARGE_INTEGER start = Now();
         const auto outcome = scarlettx::TranslateVictoryCompute(container.data(), container.size(), info, binding, dxil);
         ms = MsBetween(start, Now());
@@ -630,8 +664,15 @@ int RunCacheAssessment(const Args& args, scarlettx::D3D12Backend& backend, Recor
         return 1;
     }
     rec.shader_hash = Fnv(dxil);
-    std::printf("[bench] rounds=%u container=%zu bytes dxil=%zu bytes fnv=%016llx deterministic=yes\n", args.rounds,
-                container.size(), dxil.size(), static_cast<unsigned long long>(rec.shader_hash));
+    std::printf("[bench] shape=%s%s rounds=%u container=%zu bytes dxil=%zu bytes fnv=%016llx deterministic=yes\n",
+                branch ? "branch" : "linear", branch ? std::to_string(shape).c_str() : "", args.rounds, container.size(),
+                dxil.size(),
+                static_cast<unsigned long long>(rec.shader_hash));
+    double ws_now = 0;
+    double ws_peak = 0;
+    WorkingSetMb(ws_now, ws_peak);
+    rec.Metric("working_set_after_translate_mb", ws_now);
+    rec.Metric("peak_working_set_after_translate_mb", ws_peak);
     rec.Metric("backend_init_ms", init_ms);
     rec.Metric("rounds", static_cast<double>(args.rounds));
     rec.Metric("container_bytes", static_cast<double>(container.size()));
@@ -727,7 +768,14 @@ int RunCacheAssessment(const Args& args, scarlettx::D3D12Backend& backend, Recor
     if (!st.ok()) return Fail("dispatch", st, report);
     rec.Metric("probe_run_ms", MsBetween(start, Now()));
     uint32_t exact = 0;
-    for (uint32_t i = 0; i < n; ++i) exact += out[i] == VectorKernelRounds(i, 0x12345678u, 0x9E3779B9u, k, args.rounds);
+    for (uint32_t i = 0; i < n; ++i) {
+        const uint32_t want = branch ? BranchKernelRounds(i, 0x12345678u, 0x9E3779B9u, k, args.rounds, shape)
+                                     : VectorKernelRounds(i, 0x12345678u, 0x9E3779B9u, k, args.rounds);
+        exact += out[i] == want;
+    }
+    WorkingSetMb(ws_now, ws_peak);
+    rec.Metric("working_set_at_end_mb", ws_now);
+    rec.Metric("peak_working_set_at_end_mb", ws_peak);
     std::printf("[bench] validate: dwords exact %u/%u (fence %llu/%llu wait %u)\n", exact, n,
                 static_cast<unsigned long long>(report.fence_completed), static_cast<unsigned long long>(report.fence_signaled),
                 report.wait_result);
@@ -794,6 +842,14 @@ int main(int argc, char** argv) {
         else if (a == "--launch") args.launch = static_cast<uint32_t>(std::strtoul(next().c_str(), nullptr, 10));
         else if (a == "--elements") args.elements = static_cast<uint32_t>(std::strtoul(next().c_str(), nullptr, 10));
         else if (a == "--rounds") args.rounds = static_cast<uint32_t>(std::strtoul(next().c_str(), nullptr, 10));
+        else if (a == "--shape") {
+            const std::string s = next();
+            args.branch_shape = s.rfind("branch", 0) == 0 ? (s.size() > 6 ? std::atoi(s.c_str() + 6) : 0) : -1;
+            if (args.branch_shape > 3) {
+                std::fprintf(stderr, "bench_victory_prewarm: --shape is linear or branch0 to branch3\n");
+                return 64;
+            }
+        }
         else if (a == "--corrupt-blob") args.corrupt_blob = true;
         else if (a == "--hold-ms") args.hold_ms = static_cast<uint32_t>(std::strtoul(next().c_str(), nullptr, 10));
         else {

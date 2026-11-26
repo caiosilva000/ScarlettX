@@ -1578,6 +1578,136 @@ fn synthetic_pixel_program_with_table() -> NativeProgram {
 /// with its native stream cut short (malformed). 2: a console-shaped container
 /// whose index lists no native code (missing). 3: a compute program that reads
 /// through a root descriptor, which the translator refuses.
+/// SOP2 `op sdst, src0, src1`.
+const fn sop2(op: u8, sdst: u8, src0: u8, src1: u8) -> u32 {
+    0x8000_0000 | (op as u32) << 23 | (sdst as u32) << 16 | (src1 as u32) << 8 | src0 as u32
+}
+
+/// SOPP `s_cbranch_execz`, over the next `words` words.
+const fn s_cbranch_execz(words: u16) -> u32 {
+    0xBF88_0000 | words as u32
+}
+
+const V_CMP_EQ_U32: u16 = 0xC2;
+const S_OR_B32: u8 = 0x10;
+const S_XOR_B32: u8 = 0x12;
+const S_OR_SAVEEXEC_B32: u16 = 0x3D;
+
+/// The vector kernel with a lane-divergent branch in every round: the same
+/// kind of control flow in a shader of any size. Element i as in
+/// [`synthetic_vector_kernel_program`], and per round r:
+///
+/// ```text
+/// if x & (1 << (r % 5)) == 0 { x ^= x << 13; [inner] } else { x ^= x >> 17 }
+/// x ^= x << 5
+/// ```
+///
+/// then `out[i] = (x + c1) ^ k`. The bit differs from lane to lane, so both
+/// sides run in every wave. Each round is the if/else a console compiler
+/// writes with the lane mask: `s_and_saveexec`, the first side, `s_or_saveexec`
+/// and `s_xor` for the other lanes, the second side, `s_or` to join.
+///
+/// `shape` adds to every round, without changing the result of shapes 2 and 3:
+///
+/// * 0: nothing;
+/// * 1: `[inner]`, a second branch inside the first side:
+///   `if x & 1 == 0 { x ^= x >> 7 }`;
+/// * 2: each side also stores its x to `out[i]` (the last store, after the
+///   rounds, is the one that stays);
+/// * 3: as 2, and each side loads the buffer's descriptor again before its
+///   store, so the two loads meet where the sides join.
+fn synthetic_branch_kernel_rounds(k: u32, rounds: u32, shape: u32) -> NativeProgram {
+    const SAVED: u8 = 20;
+    const INNER: u8 = 21;
+    let mut w = vec![s_mov_b32(5, 0x80)];
+    w.extend_from_slice(&s_load_dwordx4(8, 4));
+    w.push(vop1(V_MOV_B32, 5, 6)); // v5 = group x
+    w.push(vop2(V_LSHLREV_B32, 5, int(5), 5)); // v5 *= 32
+    w.push(vop2(V_ADD_NC_U32, 5, vgpr(5), 0)); // v5 = i
+    w.push(vop2(V_LSHLREV_B32, 16, int(2), 5)); // v16 = 4 i
+    w.push(vop2(V_ADD_NC_U32, 1, 0, 5)); // x = c0 + i
+    // What a side does after its own step: nothing, or a store, or a reload and a store.
+    let mut tail: Vec<u32> = Vec::new();
+    if shape == 3 {
+        tail.extend_from_slice(&s_load_dwordx4(8, 4));
+    }
+    if shape == 2 || shape == 3 {
+        tail.extend_from_slice(&buffer_store_dword_at(1, 16, 8));
+    }
+    for r in 0..rounds.max(1) {
+        let mut first = vec![
+            vop2(V_LSHLREV_B32, 2, int(13), 1),
+            vop2(V_XOR_B32, 1, vgpr(1), 2), // x ^= x << 13
+        ];
+        if shape == 1 {
+            first.push(vop2(V_AND_B32, 2, int(1), 1)); // v2 = x & 1
+            first.push(vopc(V_CMP_EQ_U32, int(0), 2));
+            first.push(sop1(S_AND_SAVEEXEC_B32, INNER, VCC));
+            first.push(s_cbranch_execz(2));
+            first.push(vop2(V_LSHRREV_B32, 2, int(7), 1));
+            first.push(vop2(V_XOR_B32, 1, vgpr(1), 2)); // x ^= x >> 7
+            first.push(sop2(S_OR_B32, EXEC, EXEC, INNER));
+        }
+        first.extend_from_slice(&tail);
+        let mut second = vec![
+            vop2(V_LSHRREV_B32, 2, int(17), 1),
+            vop2(V_XOR_B32, 1, vgpr(1), 2), // x ^= x >> 17
+        ];
+        second.extend_from_slice(&tail);
+
+        w.push(vop2(V_AND_B32, 2, int(1 << (r % 5)), 1)); // v2 = x & bit
+        w.push(vopc(V_CMP_EQ_U32, int(0), 2)); // vcc = lanes with the bit clear
+        w.push(sop1(S_AND_SAVEEXEC_B32, SAVED, VCC)); // saved = exec; exec &= vcc
+        w.push(sop2(S_XOR_B32, SAVED, EXEC, SAVED)); // saved = the other lanes
+        w.push(s_cbranch_execz(first.len() as u16));
+        w.extend_from_slice(&first);
+        w.push(sop1(S_OR_SAVEEXEC_B32, SAVED, SAVED as u16)); // saved = exec; exec |= the other lanes
+        w.push(sop2(S_XOR_B32, EXEC, EXEC, SAVED)); // exec = the other lanes
+        w.push(s_cbranch_execz(second.len() as u16));
+        w.extend_from_slice(&second);
+        w.push(sop2(S_OR_B32, EXEC, EXEC, SAVED)); // every lane again
+        w.push(vop2(V_LSHLREV_B32, 2, int(5), 1));
+        w.push(vop2(V_XOR_B32, 1, vgpr(1), 2)); // x ^= x << 5
+    }
+    w.push(vop2(V_ADD_NC_U32, 1, 1, 1)); // x += c1
+    if k != 0 {
+        w.push(vop2(V_XOR_B32, 1, 255, 1)); // x ^= k
+        w.push(k);
+    }
+    w.extend_from_slice(&buffer_store_dword_at(1, 16, 8));
+    w.push(S_ENDPGM);
+    // Six user SGPRs, then the group id x in s6 (TGID_X_EN).
+    constants_and_table(6, 1 << 7, [32, 1, 1], false, &w)
+}
+
+/// The branch kernel ([`synthetic_branch_kernel_rounds`]) as a console-shaped
+/// container, `rounds` 1 to 4096, `shape` 0 to 3. Returns 0, 1 for a round
+/// count or shape out of range, -1 for a null argument. Release `out` with
+/// `sx_victory_buffer_free`.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn sx_victory_synthetic_branch_container(
+    k: u32,
+    rounds: u32,
+    shape: u32,
+    out: *mut SxVictoryByteBuffer,
+) -> i32 {
+    if out.is_null() {
+        return -1;
+    }
+    // SAFETY: the C++ caller passes a live, exclusive object.
+    let output = unsafe { &mut *out };
+    output.data = std::ptr::null_mut();
+    output.size = 0;
+    if rounds == 0 || rounds > 4096 || shape > 3 {
+        return 1;
+    }
+    hand_over(
+        output,
+        console_container(&[(KIND_NATIVE, xbch(&fssm_compute(&synthetic_branch_kernel_rounds(k, rounds, shape))))]),
+    );
+    0
+}
+
 fn synthetic_container(variant: u32) -> Option<Vec<u8>> {
     match variant {
         0 => Some(console_container(&[(KIND_NATIVE, xbch(&fssm_compute(&synthetic_compute_program())))])),
@@ -1881,6 +2011,38 @@ mod tests {
                 ComputeInput::Malformed(text) => panic!("variant {variant} malformed: {text}"),
                 _ => panic!("variant {variant} not translated"),
             }
+        }
+    }
+
+    #[test]
+    fn the_branch_kernel_translates_at_several_sizes() {
+        let translate = |rounds: u32, shape: u32| {
+            translate_compute_container(&console_container(&[(
+                KIND_NATIVE,
+                xbch(&fssm_compute(&synthetic_branch_kernel_rounds(7, rounds, shape))),
+            )]))
+        };
+        // Shapes 0 to 2 at any size; shape 3 while its descriptor is joined only a few times.
+        for (shape, sizes) in [(0u32, &[1u32, 5, 64][..]), (1, &[1, 64]), (2, &[1, 64]), (3, &[1, 4])] {
+            let mut last = 0;
+            for &rounds in sizes {
+                match translate(rounds, shape) {
+                    ComputeInput::Translated(shader, t) => {
+                        assert_eq!(t, [32, 1, 1], "shape {shape}, {rounds} rounds");
+                        assert!(!shader.memory && !shader.heap, "shape {shape}, {rounds} rounds");
+                        assert!(shader.dxil.len() > last, "shape {shape}, {rounds} rounds: a larger shader");
+                        last = shader.dxil.len();
+                    }
+                    ComputeInput::Refused(text) => panic!("shape {shape}, {rounds} rounds, refused: {text}"),
+                    ComputeInput::Malformed(text) => panic!("shape {shape}, {rounds} rounds, malformed: {text}"),
+                    _ => panic!("shape {shape}, {rounds} rounds, not translated"),
+                }
+            }
+        }
+        // The translator bounds how often one descriptor may be joined, and says so.
+        match translate(64, 3) {
+            ComputeInput::Refused(text) => assert!(text.contains("joined too often"), "{text}"),
+            _ => panic!("shape 3 at 64 rounds was expected to be refused"),
         }
     }
 
