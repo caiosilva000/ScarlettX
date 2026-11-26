@@ -1041,6 +1041,10 @@ int main() {
         Rig::Heap own_heap = r.ViewHeap(4);
         void* own_tex = r.Texture(which & 1);
         r.TextureView(own_heap, 1, own_tex);
+        // Read before anything is submitted, so that nothing is added between the submission and
+        // the release.
+        D3D12XBOX_RETIRED_OBJECT_STATS retired_before{};
+        SX_REQUIRE(D3D12XboxGetRetiredObjectStats(&retired_before) == 0);
         // Slow draws first, not waited for: the list under test is queued behind them.
         {
             void* busy = r.NewList();
@@ -1091,6 +1095,19 @@ int main() {
         std::printf("%s %s: Release returned %lld, list still in flight afterwards: %s\n", kTag, kNames[which],
                     static_cast<long long>(left), in_flight ? "yes" : "no");
         r.Check(in_flight, "10 the release came while the list was in flight");
+        // The host object must outlive the list: the shim hands it over for a later release
+        // and, with the list still queued, cannot let it go yet. (The descriptor heap is kept
+        // by other means and is not counted here.)
+        if (which != 1) {
+            D3D12XBOX_RETIRED_OBJECT_STATS retired_after{};
+            SX_REQUIRE(D3D12XboxGetRetiredObjectStats(&retired_after) == 0);
+            std::printf("%s %s: host objects retired +%llu, of which had to wait +%llu, waiting now %llu\n", kTag, kNames[which],
+                        static_cast<unsigned long long>(retired_after.retired - retired_before.retired),
+                        static_cast<unsigned long long>(retired_after.waited - retired_before.waited),
+                        static_cast<unsigned long long>(retired_after.pending));
+            r.Check(retired_after.retired > retired_before.retired, "10 the host object was handed over, not released at once");
+            if (in_flight) r.Check(retired_after.waited > retired_before.waited, "10 the host object waits for the list in flight");
+        }
         const bool completed_in_time = r.Wait(value);
         const long long t_wait_end = now_us();
         if (pick || gap_env) {

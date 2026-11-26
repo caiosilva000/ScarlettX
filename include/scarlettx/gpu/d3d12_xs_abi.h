@@ -302,6 +302,15 @@ struct D3D12XBOX_TRANSLATED_VIEW_CHECK_STATS {
 SCARLETTX_D3D12_API int32_t D3D12XboxGetTranslatedViewCheckStats(D3D12XBOX_TRANSLATED_VIEW_CHECK_STATS* out_stats);
 // The same counts for translated compute dispatches (the compute root signature and arguments).
 SCARLETTX_D3D12_API int32_t D3D12XboxGetTranslatedDispatchBindStats(D3D12XBOX_TRANSLATED_DRAW_BIND_STATS* out_stats);
+// Host objects whose release waited for the queues. The title's last reference to a resource,
+// pipeline, root signature, query heap or command signature does not release the host object
+// at once: it goes when everything submitted before that release has run.
+struct D3D12XBOX_RETIRED_OBJECT_STATS {
+    uint64_t retired;  // host objects handed over for a later release
+    uint64_t waited;   // of those, not released at once: a queue still had earlier work to run
+    uint64_t pending;  // waiting now
+};
+SCARLETTX_D3D12_API int32_t D3D12XboxGetRetiredObjectStats(D3D12XBOX_RETIRED_OBJECT_STATS* out_stats);
 SCARLETTX_D3D12_API int32_t D3D12XboxQueryCapabilities(
     uint64_t device_handle,
     D3D12XBOX_CAPABILITIES* out_caps);

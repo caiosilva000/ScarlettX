@@ -831,6 +831,14 @@ intptr_t SCARLETTX_GDK_CALLBACK SimpleObjAddRef(void* self, uintptr_t, uintptr_t
     return static_cast<intptr_t>(
         static_cast<XboxD3D12SimpleObjectProxy*>(self)->ref_count.fetch_add(1, std::memory_order_relaxed) + 1);
 }
+#if defined(_WIN32)
+// A title may drop its last reference to a pipeline, root signature, query heap or command
+// signature right after submitting a list that uses it. Releasing the host object then can leave
+// that submission never completing on this host (seen with pipelines: the queue's fence stops
+// one short). So these go the way resources do: when everything submitted before the release has
+// run. (Defined after the queue object, further down.)
+void RetireHostObject(IUnknown* object);
+#endif
 intptr_t SCARLETTX_GDK_CALLBACK SimpleObjRelease(void* self, uintptr_t, uintptr_t, uintptr_t) {
     auto* obj = static_cast<XboxD3D12SimpleObjectProxy*>(self);
     const uint32_t rem = obj->ref_count.fetch_sub(1, std::memory_order_acq_rel) - 1;
@@ -841,7 +849,7 @@ intptr_t SCARLETTX_GDK_CALLBACK SimpleObjRelease(void* self, uintptr_t, uintptr_
             g_translated_compute.erase(obj);
             g_translated_graphics.erase(obj);
         }
-        if (obj->pc_obj) obj->pc_obj->Release();
+        if (obj->pc_obj) RetireHostObject(obj->pc_obj);
 #endif
         delete obj;
     }
@@ -3203,9 +3211,11 @@ void StopPresentWindow(XboxD3D12CommandQueueProxy* obj);
 
 #if defined(_WIN32)
 struct RetiredHostResource {
-    ID3D12Resource* resource = nullptr;
+    IUnknown* resource = nullptr;  // a resource, or another host object a queued list may use
     std::vector<std::pair<ID3D12Fence*, uint64_t>> waits;  // one per queue alive at the release; fences referenced
 };
+std::atomic<uint64_t> g_retired_total{0};   // host objects handed over for a later release
+std::atomic<uint64_t> g_retired_waited{0};  // of those, not released at once
 std::mutex g_retire_mutex;
 std::vector<XboxD3D12CommandQueueProxy*> g_live_queues;  // under g_retire_mutex
 std::vector<RetiredHostResource> g_retired;              // under g_retire_mutex
@@ -3235,9 +3245,13 @@ void DrainRetiredHostResources() {
 }
 
 void RetireHostResource(ID3D12Resource* resource) {
+    RetireHostObject(resource);
+}
+
+void RetireHostObject(IUnknown* object) {
     std::lock_guard<std::mutex> lock(g_retire_mutex);
     RetiredHostResource retired;
-    retired.resource = resource;
+    retired.resource = object;
     for (XboxD3D12CommandQueueProxy* q : g_live_queues) {
         if (!q->retire_fence &&
             FAILED(q->pc_device->CreateFence(0, D3D12_FENCE_FLAG_NONE, IID_PPV_ARGS(&q->retire_fence)))) {
@@ -3250,6 +3264,13 @@ void RetireHostResource(ID3D12Resource* resource) {
     }
     g_retired.push_back(std::move(retired));
     DrainRetiredLocked();  // with no queue, or an idle one, it goes at once
+    g_retired_total.fetch_add(1, std::memory_order_relaxed);
+    for (const RetiredHostResource& r : g_retired) {
+        if (r.resource == object) {
+            g_retired_waited.fetch_add(1, std::memory_order_relaxed);
+            break;
+        }
+    }
 }
 #endif
 
@@ -5833,6 +5854,18 @@ int32_t D3D12XboxGetTranslatedViewCheckStats(D3D12XBOX_TRANSLATED_VIEW_CHECK_STA
     out_stats->bindings_built = g_view_bindings_built.load(std::memory_order_relaxed);
     out_stats->views_validated = g_views_validated.load(std::memory_order_relaxed);
     out_stats->slot_rechecks = g_view_slot_rechecks.load(std::memory_order_relaxed);
+    return 0;
+}
+
+int32_t D3D12XboxGetRetiredObjectStats(D3D12XBOX_RETIRED_OBJECT_STATS* out_stats) {
+    if (!out_stats) return -1;
+#if defined(_WIN32)
+    out_stats->retired = g_retired_total.load(std::memory_order_relaxed);
+    out_stats->waited = g_retired_waited.load(std::memory_order_relaxed);
+    out_stats->pending = g_retired_count.load(std::memory_order_relaxed);
+#else
+    *out_stats = {};
+#endif
     return 0;
 }
 
