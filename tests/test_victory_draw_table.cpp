@@ -1008,9 +1008,32 @@ int main() {
 
     // 10. Objects released while the draw that uses them is in flight. Each case has objects of
     //     its own, so a failure leaves the others standing.
+    // For a diagnosis, SCARLETTX_TEST_INFLIGHT picks the cases by letter: "a" to "d" release in
+    // flight as usual; a capital holds the object until the fence has completed and releases it
+    // then (the control). SCARLETTX_TEST_INFLIGHT_GAP says what happens between submitting the
+    // list under test and the release: nothing (unset), "sleep:<ms>", "query" (one read of the
+    // fence), "print" (one line to stdout), "yield", "spin:<n>" (n empty loop turns, no call at
+    // all) or "tight" (nothing, and no clock read either: the release follows the submission as
+    // closely as in the plain test). Otherwise the steps are timed and reported after the wait. A submission that does not complete in time
+    // is watched for another 20 seconds. With neither variable set the cases run as always.
+    const char* const pick = std::getenv("SCARLETTX_TEST_INFLIGHT");
+    const char* const gap_env = std::getenv("SCARLETTX_TEST_INFLIGHT_GAP");
+    const std::string gap = gap_env ? gap_env : "";
+    LARGE_INTEGER tick_rate{};
+    QueryPerformanceFrequency(&tick_rate);
+    const auto now_us = [&tick_rate]() {
+        LARGE_INTEGER t{};
+        QueryPerformanceCounter(&t);
+        return static_cast<long long>(t.QuadPart * 1000000 / tick_rate.QuadPart);
+    };
     for (int which = 0; which < 4 && !r.stuck; ++which) {
         static const char* const kNames[] = {"10a the pipeline released in flight", "10b the descriptor heap released in flight",
                                              "10c the title's root signature released in flight", "10d the texture released in flight"};
+        const bool hold = pick && std::strchr(pick, 'A' + which) != nullptr;
+        if (pick && !hold && std::strchr(pick, 'a' + which) == nullptr) continue;
+        const bool timed = (pick || gap_env) && gap != "tight" && gap.rfind("spin:", 0) != 0;
+        long long t_busy = 0;
+        uint64_t busy_value = 0;
         void* own_root = r.TitleRoot();
         void* own_pso = nullptr;
         hr = r.CreatePipeline(own_root, vs, ps, &own_pso);
@@ -1024,7 +1047,8 @@ int main() {
             r.Begin(busy, nullptr, root);
             r.Pipeline(busy, busy_pso);
             for (int i = 0; i < 24; ++i) r.DrawIn(busy, kWhole);
-            r.Submit(busy);
+            busy_value = r.Submit(busy);
+            if (timed) t_busy = now_us();
         }
         void* list = r.NewList();
         r.Begin(list, &own_heap, own_root);
@@ -1033,14 +1057,65 @@ int main() {
         r.Table(list, own_heap, 1);
         r.DrawIn(list, kWhole);
         const uint64_t value = r.End(list);
-        // The title's last reference, while the list has not run yet.
+        const long long t_list = timed ? now_us() : 0;
         void* released = which == 0 ? own_pso : which == 1 ? own_heap.proxy : which == 2 ? own_root : own_tex;
+        if (hold) {
+            // The control: nothing is released while the list is in flight.
+            const bool done = r.Wait(value);
+            const long long t_done = now_us();
+            const intptr_t left_after = done ? Call(released, 2) : -1;
+            std::printf("%s probe %s: CONTROL, held. busy list fence %llu at 0 us; list under test fence %llu at +%lld us; wait ended at "
+                        "+%lld us, %s; then Release returned %lld\n", kTag, kNames[which], static_cast<unsigned long long>(busy_value),
+                        static_cast<unsigned long long>(value), t_list - t_busy, t_done - t_busy, done ? "completed" : "DID NOT COMPLETE",
+                        static_cast<long long>(left_after));
+            if (!done) break;
+            frame_check({{kWhole, which & 1, {0, 0, 0, 0}}}, "10 control: held until the fence completed");
+            continue;
+        }
+        // Only what the diagnosis asks for happens between the submission and the release.
+        uint64_t seen_in_gap = 0;
+        if (gap.rfind("sleep:", 0) == 0) Sleep(static_cast<DWORD>(std::atoi(gap.c_str() + 6)));
+        else if (gap == "query") seen_in_gap = static_cast<uint64_t>(Call(r.fence, 8));
+        else if (gap == "print") { std::printf("%s probe gap line\n", kTag); std::fflush(stdout); }
+        else if (gap == "yield") SwitchToThread();
+        else if (gap.rfind("spin:", 0) == 0) {
+            volatile int sink = 0;
+            for (int k = 0, n = std::atoi(gap.c_str() + 5); k < n; ++k) sink = sink + 1;
+        }
+        const long long t_before_release = timed ? now_us() : 0;
+        // The title's last reference, while the list has not run yet.
         const intptr_t left = Call(released, 2);
-        const bool in_flight = static_cast<uint64_t>(Call(r.fence, 8)) < value;
+        const long long t_released = now_us();
+        const uint64_t completed_after_release = static_cast<uint64_t>(Call(r.fence, 8));
+        const bool in_flight = completed_after_release < value;
         std::printf("%s %s: Release returned %lld, list still in flight afterwards: %s\n", kTag, kNames[which],
                     static_cast<long long>(left), in_flight ? "yes" : "no");
         r.Check(in_flight, "10 the release came while the list was in flight");
-        if (!r.Wait(value)) {
+        const bool completed_in_time = r.Wait(value);
+        const long long t_wait_end = now_us();
+        if (pick || gap_env) {
+            std::printf("%s probe %s: gap=%s. busy list signalled fence %llu, list under test fence %llu; fence right after the "
+                        "release: %llu (read in the gap: %llu); wait for %llu %s, fence then %llu\n", kTag, kNames[which],
+                        gap.empty() ? "none" : gap.c_str(), static_cast<unsigned long long>(busy_value),
+                        static_cast<unsigned long long>(value), static_cast<unsigned long long>(completed_after_release),
+                        static_cast<unsigned long long>(seen_in_gap), static_cast<unsigned long long>(value),
+                        completed_in_time ? "completed" : "TIMED OUT (15000 ms)", static_cast<unsigned long long>(Call(r.fence, 8)));
+            if (timed) {
+                std::printf("%s probe %s: times from the busy list's submission: list under test submitted at +%lld us; Release began "
+                            "at +%lld us and took %lld us; the wait ended at +%lld us\n", kTag, kNames[which], t_list - t_busy,
+                            t_before_release - t_busy, t_released - t_before_release, t_wait_end - t_busy);
+            }
+            for (int second = 1; !completed_in_time && second <= 20; ++second) {
+                Sleep(1000);
+                const uint64_t now = static_cast<uint64_t>(Call(r.fence, 8));
+                if (now >= value || second % 10 == 0) {
+                    std::printf("%s probe %s: %d s after the timeout the fence is at %llu of %llu\n", kTag, kNames[which], second,
+                                static_cast<unsigned long long>(now), static_cast<unsigned long long>(value));
+                }
+                if (now >= value) break;
+            }
+        }
+        if (!completed_in_time) {
             r.Check(false, kNames[which]);
             std::printf("%s %s: the submission did not complete; the remaining cases are not run\n", kTag, kNames[which]);
             break;
