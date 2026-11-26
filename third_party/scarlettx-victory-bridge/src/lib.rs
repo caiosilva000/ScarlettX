@@ -975,7 +975,8 @@ const fn buffer_store_dword_at_off(vdata: u8, vaddr: u8, srsrc: u8, byte_off: u1
 }
 
 /// DS `ds_bpermute_b32 vdst, vaddr, vdata`: each lane reads `vdata` of the
-/// lane its address names (bytes, four a lane, modulo the wave).
+/// lane its address names (bytes, four a lane), within its own half of 32
+/// lanes: a wave of 64 permutes lanes 0..31 and 32..63 independently.
 const fn ds_bpermute_b32(vdst: u8, vaddr: u8, vdata: u8) -> [u32; 2] {
     [
         0x36 << 26 | 0xB3 << 18,
@@ -992,13 +993,16 @@ pub const LANE_EXCHANGE_MULTIPLIER: u32 = 0x0001_0203;
 
 /// A lane exchange. One group of `lanes` threads, one console wave (32, or 64
 /// with `wave64`). Lane l holds the value `(l * 0x10203) ^ c0`, different in
-/// every lane. Two permutes move the values between lanes:
+/// every lane. Two permutes ask for the value of another lane:
 ///
-/// * dword `l` takes the value of lane `lanes - 1 - l` (the wave reversed:
-///   in a wave of 64, lane 31 takes lane 32's value and lane 32 takes lane
-///   31's, and every lane reads from the other half);
-/// * dword `lanes + l` takes the value of lane `l ^ lanes/2` (the halves
-///   exchanged).
+/// * dword `l` asks for lane `lanes - 1 - l` (the wave reversed);
+/// * dword `lanes + l` asks for lane `l ^ lanes/2` (the same lane of the
+///   other half).
+///
+/// A permute reads within the reading lane's own half of 32 lanes, so in a
+/// wave of 32 every read lands on the lane asked for, and in a wave of 64 no
+/// read crosses between lanes 31 and 32: each half is reversed in place, and
+/// the second permute hands every lane its own value.
 ///
 /// Nothing else is written. The exchange only works when the host runs the
 /// group as one wave of the console's size, which the translated shader

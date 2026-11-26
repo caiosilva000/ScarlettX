@@ -1,17 +1,25 @@
-// A lane exchange across the halves of a console wave, synthetic only, on the guest-facing
-// route (a console-shaped container handed to the d3d12_xs shim's device object, dispatched
-// through its command list).
+// A lane exchange in a console wave, synthetic only, on the guest-facing route (a console-shaped
+// container handed to the d3d12_xs shim's device object, dispatched through its command list).
 //
 // The program (the bridge's synthetic_lane_exchange_program) runs one group of L threads as one
 // console wave. Lane l holds (l * 0x10203) ^ c0, different in every lane, and two
-// ds_bpermute_b32 move the values between lanes:
+// ds_bpermute_b32 ask for the value of another lane:
 //
-//   dword l       the value of lane L - 1 - l   (the wave reversed)
-//   dword L + l   the value of lane l ^ L/2     (the halves exchanged)
+//   dword l       asks for lane L - 1 - l   (the wave reversed)
+//   dword L + l   asks for lane l ^ L/2     (the same lane of the other half)
 //
-//   exchange32    L = 32: the control. The halves are lanes 0..15 and 16..31.
-//   exchange64    L = 64: lane 31 takes lane 32's value and lane 32 takes lane 31's, and every
-//                 lane reads from the other half of the wave.
+// ds_bpermute_b32 reads within the reading lane's own half of 32 lanes: a wave of 64 is two
+// halves that permute independently (RDNA 2 ISA, section 10.4.4). The lane a read lands on is
+// the asked lane's position in a half (its low five bits), in the reader's half. The translator
+// has done this since VIctory 0665a0e; before that it read across the whole wave of 64, and this
+// test expected that.
+//
+//   exchange32    L = 32: one half, so every read lands on the lane asked for. The wave is
+//                 reversed (lane 15 takes lane 16's value and lane 16 takes lane 15's), and
+//                 lanes 0..15 and 16..31 exchange their values.
+//   exchange64    L = 64: no read crosses lane 31 | 32. Each half is reversed in place (lane 31
+//                 takes lane 0's value, lane 32 takes lane 63's), and a lane that asks for its
+//                 opposite number in the other half gets its own value back.
 //
 // The expected values are calculated here, on the CPU, from the description above. Every dword
 // of the buffer is checked: what the program does not write must still hold the sentinel.
@@ -52,6 +60,10 @@ struct Case {
 };
 
 uint32_t LaneValue(uint32_t lane, uint32_t c0) { return (lane * kMultiplier) ^ c0; }
+
+// The lane a ds_bpermute_b32 in `lane` reads when it asks for `asked`: that lane's position in a
+// half of 32, in the reader's own half.
+uint32_t PermuteSource(uint32_t lane, uint32_t asked) { return (lane & ~31u) | (asked & 31u); }
 
 uint32_t Read32(const std::vector<uint8_t>& bytes, size_t at) {
     uint32_t v = 0;
@@ -173,8 +185,8 @@ DWORD WINAPI RunCase(void* raw) {
         // Expected, from the program's description alone.
         std::vector<uint32_t> want(kDwords, sxrig::kSentinel);
         for (uint32_t l = 0; l < lanes; ++l) {
-            want[l] = LaneValue(lanes - 1 - l, c0);
-            want[lanes + l] = LaneValue(l ^ (lanes / 2), c0);
+            want[l] = LaneValue(PermuteSource(l, lanes - 1 - l), c0);
+            want[lanes + l] = LaneValue(PermuteSource(l, l ^ (lanes / 2)), c0);
         }
         uint32_t ok = 0;
         uint32_t sentinels_ok = 0;
@@ -189,7 +201,8 @@ DWORD WINAPI RunCase(void* raw) {
         }
         exact += ok;
         total += kDwords;
-        // The two lanes either side of the middle of the wave, in both exchanges.
+        // The two lanes either side of the middle of the wave, in both exchanges: in a wave of 64
+        // these are the last lane of one half and the first of the other.
         const uint32_t lo = lanes / 2 - 1;
         const uint32_t hi = lanes / 2;
         for (const uint32_t at : {lo, hi, lanes + lo, lanes + hi}) {
@@ -198,8 +211,10 @@ DWORD WINAPI RunCase(void* raw) {
         }
         std::printf("[victory-wave] case=%s c0=%08x dwords exact %u/%u sentinels untouched %u/%u\n", test.name, c0, ok,
                     kDwords, sentinels_ok, kDwords - 2 * lanes);
-        std::printf("[victory-wave] case=%s c0=%08x lane %u took %08x (lane %u holds %08x); lane %u took %08x (lane %u holds %08x)\n",
-                    test.name, c0, lo, out[lo], hi, LaneValue(hi, c0), hi, out[hi], lo, LaneValue(lo, c0));
+        const uint32_t lo_from = PermuteSource(lo, lanes - 1 - lo);
+        const uint32_t hi_from = PermuteSource(hi, lanes - 1 - hi);
+        std::printf("[victory-wave] case=%s c0=%08x reversed: lane %u took %08x (lane %u holds %08x); lane %u took %08x (lane %u holds %08x)\n",
+                    test.name, c0, lo, out[lo], lo_from, LaneValue(lo_from, c0), hi, out[hi], hi_from, LaneValue(hi_from, c0));
         if (first_bad >= 0) {
             std::printf("[victory-wave] case=%s c0=%08x first mismatch at dword %ld: got %08x want %08x\n", test.name, c0,
                         first_bad, out[first_bad], want[first_bad]);
