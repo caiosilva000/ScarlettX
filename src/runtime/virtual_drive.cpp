@@ -4,6 +4,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <string>
 
 #if defined(_WIN32)
 #  include <windows.h>
@@ -166,6 +167,38 @@ bool MapPackageDrive(char letter, const std::string& target) {
     return true;
 }
 
+bool DriveReaches(char letter, const std::string& target) {
+    if (target.empty() || target.size() > MAX_PATH || letter < 'A' || letter > 'Z') {
+        return false;
+    }
+    const std::string root = std::string(1, letter) + ":\\";
+    const DWORD root_attributes = GetFileAttributesA(root.c_str());
+    if (root_attributes == INVALID_FILE_ATTRIBUTES || !(root_attributes & FILE_ATTRIBUTE_DIRECTORY)) {
+        return false;
+    }
+    const std::string base = target.back() == '\\' || target.back() == '/' ? target : target + "\\";
+    WIN32_FIND_DATAA entry{};
+    const HANDLE find = FindFirstFileA((base + "*").c_str(), &entry);
+    if (find == INVALID_HANDLE_VALUE) {
+        return false;
+    }
+    bool same = true;
+    int compared = 0;
+    do {
+        if (std::strcmp(entry.cFileName, ".") == 0 || std::strcmp(entry.cFileName, "..") == 0) {
+            continue;
+        }
+        WIN32_FILE_ATTRIBUTE_DATA seen{};
+        const bool directory = (entry.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) != 0;
+        same = GetFileAttributesExA((root + entry.cFileName).c_str(), GetFileExInfoStandard, &seen) != 0 &&
+               ((seen.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) != 0) == directory &&
+               (directory || (seen.nFileSizeLow == entry.nFileSizeLow && seen.nFileSizeHigh == entry.nFileSizeHigh));
+        ++compared;
+    } while (same && compared < 8 && FindNextFileA(find, &entry));
+    FindClose(find);
+    return same;
+}
+
 void UnmapPackageDrive() {
     if (!g_mapped.exchange(false)) {
         return;
@@ -179,6 +212,7 @@ void UnmapPackageDrive() {
 #else  // !_WIN32
 
 bool MapPackageDrive(char, const std::string&) { return false; }
+bool DriveReaches(char, const std::string&) { return false; }
 void UnmapPackageDrive() {}
 bool RecoverStaleDrive(char) { return false; }
 

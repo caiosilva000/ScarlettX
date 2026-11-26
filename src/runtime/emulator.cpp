@@ -141,7 +141,15 @@ Status Emulator::BootPackage(const std::string& package_dir) {
     struct VirtualDriveGuard {
         ~VirtualDriveGuard() { vfs::UnmapPackageDrive(); }
     } g_drive_guard;
-    const bool drive_mapped = vfs::MapPackageDrive('G', abs_pkg_dir);
+    bool drive_mapped = vfs::MapPackageDrive('G', abs_pkg_dir);
+    if (drive_mapped && !vfs::DriveReaches('G', abs_pkg_dir)) {
+        // The host took the mapping and does not serve it (CrossOver lists the drive and cannot
+        // open it), or G: leads somewhere else. A title sent there would find nothing.
+        vfs::UnmapPackageDrive();
+        drive_mapped = false;
+        std::cout << "[ScarlettX][vfs] G:\\ was mapped but does not reach " << abs_pkg_dir
+                  << " on this host; the package is used at its own path\n";
+    }
     if (drive_mapped) {
         std::cout << "[ScarlettX][vfs] Mapped virtual G:\\ -> " << abs_pkg_dir << "\n";
     }
@@ -197,7 +205,10 @@ Status Emulator::BootPackage(const std::string& package_dir) {
         // directory is the emulator's until it is moved here.) Put back when the guest returns.
         char previous_dir[MAX_PATH + 1] = {};
         const DWORD previous_len = GetCurrentDirectoryA(sizeof(previous_dir), previous_dir);
-        const char* const title_dir = drive_mapped ? "G:\\" : abs_pkg_dir.c_str();
+        const char* title_dir = drive_mapped ? "G:\\" : abs_pkg_dir.c_str();
+        if (drive_mapped && !SetCurrentDirectoryA(title_dir)) {
+            title_dir = abs_pkg_dir.c_str();  // the package's own path is the same place
+        }
         if (!SetCurrentDirectoryA(title_dir)) {
             std::cerr << "[ScarlettX][loader] The working directory could not be moved to the package root " << title_dir
                       << " (error " << GetLastError() << "); the title's relative paths will not resolve\n";

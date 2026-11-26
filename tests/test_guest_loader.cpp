@@ -2,6 +2,7 @@
 // images: implicit TLS, module queries and the package drive mapping.
 #include <atomic>
 #include <cstdint>
+#include <cctype>
 #include <cstdio>
 #include <cstring>
 #include <filesystem>
@@ -220,9 +221,31 @@ void TestPackageDrive(const char* self_path) {
         (target.size() > 3 && (target.back() == '/' || target.back() == 92))
             ? target.substr(0, target.size() - 1) : target;
 
-    // Normal lifetime.
+    // A drive reaches the folder it shows and no other: the temporary folder's own drive reaches
+    // its root and not the temporary folder, and a letter nothing is mapped to reaches nothing.
+    {
+        const char own = static_cast<char>(std::toupper(static_cast<unsigned char>(trimmed[0])));
+        SX_REQUIRE(trimmed.size() > 3 && trimmed[1] == ':');
+        const std::string probe = trimmed + "\\scarlettx_reach_probe";
+        std::filesystem::create_directories(probe);
+        SX_REQUIRE(vfs::DriveReaches(own, std::string(1, own) + ":\\"));
+        SX_REQUIRE(!vfs::DriveReaches(own, trimmed));
+        SX_REQUIRE(!vfs::DriveReaches(letter, trimmed));
+        std::filesystem::remove(probe);
+    }
+
+    // Normal lifetime. A host may list the new drive and still not serve it (CrossOver): the
+    // mapping is made either way, and DriveReaches says which it was.
     SX_REQUIRE(vfs::MapPackageDrive(letter, trimmed));
     SX_REQUIRE(DriveExists(letter));
+    {
+        const std::string root = std::string(1, letter) + ":\\";
+        const bool opens = GetFileAttributesA(root.c_str()) != INVALID_FILE_ATTRIBUTES;
+        const bool reaches = vfs::DriveReaches(letter, trimmed);
+        std::printf("[test_guest_loader] drive %c: mapped; its root opens: %s; reaches its target: %s\n", letter,
+                    opens ? "yes" : "no", reaches ? "yes" : "no");
+        SX_REQUIRE(reaches == opens);
+    }
     vfs::UnmapPackageDrive();
     vfs::UnmapPackageDrive();
     SX_REQUIRE(!DriveExists(letter));

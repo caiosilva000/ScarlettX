@@ -11,6 +11,13 @@ namespace vfs {
 // by a process that was killed. Returns false if the letter is in use.
 bool MapPackageDrive(char letter, const std::string& target);
 
+// Whether the root of drive `letter` can be opened and shows `target`'s contents: each of the
+// first few entries of `target` is there under the same name, with the same size. Reads only.
+// A host may accept a mapping and still not serve it (CrossOver does: the drive is listed, and
+// opening it fails), or the letter may already lead somewhere else. Either way the drive is of
+// no use to a title.
+bool DriveReaches(char letter, const std::string& target);
+
 // Removes the mapping made by MapPackageDrive. Safe to call more than once.
 void UnmapPackageDrive();
 
