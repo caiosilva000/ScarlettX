@@ -29,6 +29,9 @@ jobs:
             ref: ""
             cmake_args: "-DSCARLETTX_VICTORY_SHADER_BRIDGE=ON"
             submodules: true
+            # After its tests this leg also builds the opt-in benchmarks and runs the bridge
+            # crate's own unit tests.
+            bridge_extras: true
     name: ${{ matrix.name }}
     steps:
       - uses: actions/checkout@v4
@@ -133,6 +136,29 @@ jobs:
           Copy-Item build\*.exe, build\*.dll, build\*.lib, build\CTestTestfile.cmake, build\CMakeCache.txt dist\ -ErrorAction SilentlyContinue
           foreach ($d in 'packages','dummy_import_libs','dummy_import_dlls') { if (Test-Path "build\$d") { Copy-Item "build\$d" dist\ -Recurse } }
           Get-ChildItem dist -Recurse -File | Get-FileHash -Algorithm SHA256 | ForEach-Object { "$($_.Hash.ToLower())  $((Resolve-Path -Relative $_.Path))" } | Set-Content out\dist-sha256.txt
+
+      # The two steps below come after the tests and the collected binaries, so a benchmark that
+      # does not build cannot hide what the tests said.
+      - name: Build the benchmarks (bridge leg)
+        if: matrix.bridge_extras
+        shell: cmd
+        run: |
+          cmake -S . -B build -DSCARLETTX_BENCHMARKS=ON > out\configure-bench.log 2>&1 || (type out\configure-bench.log & exit /b 1)
+          cmake --build build --parallel --target bench_victory_prewarm bench_sx_fps > out\build-bench.log 2>&1 || (type out\build-bench.log & exit /b 1)
+          certutil -hashfile build\bench_victory_prewarm.exe SHA256 > out\bench-sha256.txt
+          certutil -hashfile build\bench_sx_fps.exe SHA256 >> out\bench-sha256.txt
+          type out\bench-sha256.txt
+
+      - name: Bridge unit tests (bridge leg)
+        # Whether or not the benchmarks built.
+        if: ${{ !cancelled() && matrix.bridge_extras }}
+        shell: cmd
+        run: |
+          cd third_party\scarlettx-victory-bridge
+          cargo test --release --locked --target x86_64-pc-windows-msvc > ..\..\out\cargo-test.log 2>&1
+          set RC=%ERRORLEVEL%
+          type ..\..\out\cargo-test.log
+          exit /b %RC%
 
       - uses: actions/upload-artifact@v4
         if: always()
