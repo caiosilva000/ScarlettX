@@ -633,8 +633,10 @@ int RunCacheAssessment(const Args& args, scarlettx::D3D12Backend& backend, Recor
     const uint32_t n = 4096;
     const int shape = args.branch_shape;
     const bool branch = shape >= 0;
-    auto translate = [branch, shape](uint32_t kk, uint32_t rounds, std::vector<uint8_t>& container,
-                              scarlettx::VictoryComputeBinding& binding, std::vector<uint8_t>& dxil, double& ms) {
+    std::string refusal;  // why the last translation that failed did
+    auto translate = [branch, shape, &refusal](uint32_t kk, uint32_t rounds, std::vector<uint8_t>& container,
+                                                scarlettx::VictoryComputeBinding& binding, std::vector<uint8_t>& dxil,
+                                                double& ms) {
         scarlettx::VictoryShaderInfo info;
         const auto built = branch ? scarlettx::BuildVictoryBranchKernelContainer(kk, container, rounds, static_cast<uint32_t>(shape))
                                   : scarlettx::BuildVictoryVectorKernelContainer(kk, container, rounds);
@@ -642,6 +644,9 @@ int RunCacheAssessment(const Args& args, scarlettx::D3D12Backend& backend, Recor
         const LARGE_INTEGER start = Now();
         const auto outcome = scarlettx::TranslateVictoryCompute(container.data(), container.size(), info, binding, dxil);
         ms = MsBetween(start, Now());
+        if (outcome != scarlettx::VictoryComputeOutcome::Translated) {
+            refusal = std::string(scarlettx::VictoryComputeOutcomeName(outcome)) + ": " + info.message;
+        }
         return outcome == scarlettx::VictoryComputeOutcome::Translated;
     };
     std::vector<uint8_t> container;
@@ -653,7 +658,7 @@ int RunCacheAssessment(const Args& args, scarlettx::D3D12Backend& backend, Recor
     // A different, small shader first: the translator's first call in this process.
     if (!translate(k ^ 0x5A5A5A5Au, 1, container, binding, dxil, first_call_ms) ||
         !translate(k, args.rounds, container, binding, dxil, target_ms)) {
-        std::printf("[bench] translate FAILED\n");
+        std::printf("[bench] translate FAILED: %s\n", refusal.c_str());
         return 4;
     }
     std::vector<uint8_t> again;

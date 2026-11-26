@@ -160,6 +160,45 @@ jobs:
           type ..\..\out\cargo-test.log
           exit /b %RC%
 
+      # A bounded run of the benchmark's kernels on this runner's adapter: small sizes, every
+      # output checked against the CPU model, a timeout per launch. Correctness only; the runner's
+      # timings are not comparable with any other machine's.
+      - name: Run the kernel shapes (bridge leg)
+        if: ${{ !cancelled() && matrix.bridge_extras }}
+        shell: pwsh
+        run: |
+          if (-not (Test-Path build\bench_victory_prewarm.exe)) { "bench_victory_prewarm.exe was not built" ; exit 1 }
+          New-Item -ItemType Directory -Force out\bench-sweep | Out-Null
+          $csv = (Resolve-Path out\bench-sweep).Path + '\metrics.csv'
+          'series,launch,workload,shader_path,condition,salt,shader_fnv,metric,value' | Set-Content $csv
+          # shape, rounds, the exit code expected, and for a refusal the reason expected
+          $cases = @(
+            @('linear', 256, 0, ''), @('branch0', 256, 0, ''), @('branch1', 256, 0, ''), @('branch2', 256, 0, ''),
+            @('branch3', 4, 0, ''), @('branch3', 5, 4, 'joined too often'))
+          $bad = 0; $n = 0
+          "shape`trounds`tverdict`texit`texpected`tseconds`tdetail" | Tee-Object out\bench-sweep\results.tsv
+          foreach ($c in $cases) {
+            $n++; $name = "$($c[0])-r$($c[1])"
+            $argv = @('--workload','cache','--condition','cold','--series',$name,'--launch',"$n",'--salt',"$(424200 + $n)",
+                      '--rounds',"$($c[1])",'--shape',$c[0],'--csv',$csv)
+            $sw = [Diagnostics.Stopwatch]::StartNew()
+            $p = Start-Process -FilePath build\bench_victory_prewarm.exe -ArgumentList $argv -WorkingDirectory build -NoNewWindow -PassThru `
+                   -RedirectStandardOutput "out\bench-sweep\$name.stdout" -RedirectStandardError "out\bench-sweep\$name.stderr"
+            $h = $p.Handle
+            if ($p.WaitForExit(300 * 1000)) { $rc = $p.ExitCode } else { Stop-Process -Id $p.Id -Force; $rc = 'timeout' }
+            $text = Get-Content "out\bench-sweep\$name.stdout" -Raw -ErrorAction SilentlyContinue
+            $exact = if ($text -match 'validate: dwords exact (\d+)/(\d+)') { "$($Matches[1])/$($Matches[2])" } else { '-' }
+            $why = if ($text -match 'translate FAILED: (.*)') { $Matches[1].Trim() } else { '' }
+            if ($c[2] -eq 0) { $ok = ("$rc" -eq '0') -and ($exact -eq '4096/4096'); $detail = "exact $exact" }
+            else { $ok = ("$rc" -eq "$($c[2])") -and ($why -like "*$($c[3])*"); $detail = "refused: $why" }
+            if (-not $ok) { $bad++ }
+            "$($c[0])`t$($c[1])`t$(if ($ok) { 'PASS' } else { 'FAIL' })`t$rc`t$($c[2])`t$([int]$sw.Elapsed.TotalSeconds)`t$detail" | Tee-Object -Append out\bench-sweep\results.tsv
+            "---- $name stdout"; $text
+            "---- $name stderr"; Get-Content "out\bench-sweep\$name.stderr" -ErrorAction SilentlyContinue
+          }
+          "---- results"; Get-Content out\bench-sweep\results.tsv
+          if ($bad -gt 0) { exit 1 }
+
       - uses: actions/upload-artifact@v4
         if: always()
         with:
